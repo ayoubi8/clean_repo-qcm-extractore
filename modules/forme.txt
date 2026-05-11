@@ -1,0 +1,15 @@
+hey i have some sugestions about your plan  and some edits , ┌─────────────────────────────────────────────────────┐
+│  STAGE 1: OCR (Unchanged)                           │
+│  → Persistent storage                               │
+└─────────────────────────────────────────────────────┘
+                    ↓ is good now its stor icr of every page in txt file for it , and (Page 2 extracted 10 QCMs:
+  Q10: Une thrombopénie périphérique... ✓
+  Q11: La découverte d'une anémie... ✓
+  ...
+  Q19: Les éléments suivants... ✓
+[A]ccept all | [V]iew details | [R]e-extract this page | [S]kip page
+Your choice:) is so good just when i choose [R]e-extract this page i should have the abitlity to add guid prompt spesific to re extract this page as i have one in begining of extraction ,
+ also i should have the (its correction page ) , so i have ([A]ccept all | [V]iew details | [R]e-extract this page | [S]kip page) +  guid prompt spesific to re extract this page ,
+ we need to change  Domain-First Module Selection logic by forc the user to select Select Domain or select a default module for all qcms , or writ list of modules for this exam , now the script move directly to 5. Page-Specific Re-processing  ,
+ then the step of detecting the others metadata based on the deepseek  llm based on user selection (metadata general for all the qcms \ metadata based on every qcm ) when user select for all suget ,
+ he get an input to put guid prompt , the llm return the

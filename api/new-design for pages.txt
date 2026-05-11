@@ -1,0 +1,746 @@
+<!-- Request Access - QCM Extractor -->
+<!DOCTYPE html>
+
+<html class="dark" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>Request Access | QCM Extractor</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+      tailwind.config = {
+        darkMode: "class",
+        theme: {
+          extend: {
+            "colors": {
+                    "on-tertiary": "#4b2800",
+                    "on-surface-variant": "#bcc9cd",
+                    "secondary-fixed-dim": "#a1cedb",
+                    "on-surface": "#e5e2e1",
+                    "tertiary-container": "#e89337",
+                    "on-primary-fixed-variant": "#004e5c",
+                    "on-background": "#e5e2e1",
+                    "surface-container-highest": "#353534",
+                    "surface-container-high": "#2a2a2a",
+                    "error": "#ffb4ab",
+                    "background": "#131313",
+                    "primary-fixed": "#acedff",
+                    "surface-container-low": "#1c1b1b",
+                    "surface-dim": "#131313",
+                    "on-tertiary-fixed-variant": "#6a3b00",
+                    "tertiary": "#ffb873",
+                    "surface-bright": "#3a3939",
+                    "outline-variant": "#3d494c",
+                    "on-secondary-fixed-variant": "#1e4d58",
+                    "surface-tint": "#4cd7f6",
+                    "error-container": "#93000a",
+                    "on-secondary": "#003640",
+                    "primary-container": "#06b6d4",
+                    "outline": "#869397",
+                    "on-error": "#690005",
+                    "inverse-on-surface": "#313030",
+                    "on-primary": "#003640",
+                    "primary": "#4cd7f6",
+                    "on-primary-fixed": "#001f26",
+                    "on-secondary-fixed": "#001f26",
+                    "inverse-primary": "#00687a",
+                    "on-primary-container": "#00424f",
+                    "surface-container-lowest": "#0e0e0e",
+                    "secondary-fixed": "#bceaf7",
+                    "secondary": "#a1cedb",
+                    "on-error-container": "#ffdad6",
+                    "inverse-surface": "#e5e2e1",
+                    "surface-container": "#201f1f",
+                    "primary-fixed-dim": "#4cd7f6",
+                    "tertiary-fixed-dim": "#ffb873",
+                    "surface-variant": "#353534",
+                    "on-tertiary-fixed": "#2d1600",
+                    "surface": "#131313",
+                    "secondary-container": "#1e4d58",
+                    "on-secondary-container": "#90bcc9",
+                    "tertiary-fixed": "#ffdcbf",
+                    "on-tertiary-container": "#5b3200"
+            },
+            "borderRadius": {
+                    "DEFAULT": "0.125rem",
+                    "lg": "0.25rem",
+                    "xl": "0.5rem",
+                    "full": "0.75rem"
+            },
+            "fontFamily": {
+                    "headline": ["Inter"],
+                    "display": ["Inter"],
+                    "body": ["Inter"],
+                    "label": ["Inter"]
+            }
+          }
+        }
+      }
+    </script>
+<style>
+        body { font-family: 'Inter', sans-serif; }
+        .material-symbols-outlined {
+            font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+        }
+    </style>
+</head>
+<body class="bg-background text-on-surface min-h-screen flex flex-col items-center justify-center p-6 selection:bg-primary selection:text-on-primary">
+<!-- TopAppBar Suppressed based on "Transactional" rule in Semantic Shell Mandate -->
+<main class="w-full max-w-[420px] z-10">
+<!-- Brand Header Section -->
+<header class="flex items-center justify-between mb-8 px-1">
+<div class="flex items-center gap-2.5">
+<div class="w-8 h-8 rounded flex items-center justify-center bg-primary-container/10 border border-primary/20 shadow-[0_0_15px_rgba(76,215,246,0.15)]">
+<span class="material-symbols-outlined text-primary text-xl" data-icon="terminal">terminal</span>
+</div>
+<div class="flex flex-col leading-none">
+<span class="text-primary font-bold text-sm tracking-widest uppercase">QCM Extractor</span>
+<span class="text-on-surface-variant text-[10px] font-medium uppercase tracking-[0.2em] opacity-60">v5.0</span>
+</div>
+</div>
+</header>
+<!-- Main Registration Card -->
+<div class="bg-surface-container-low border border-outline-variant/10 rounded-lg p-8 shadow-2xl relative overflow-hidden">
+<h1 class="text-on-surface text-[28px] font-bold tracking-tight mb-3">Request Access</h1>
+<!-- Admin Notice -->
+<div class="flex items-start gap-3 p-3.5 bg-tertiary/5 border border-tertiary/10 rounded mb-8">
+<span class="material-symbols-outlined text-tertiary text-lg mt-0.5" data-icon="warning">warning</span>
+<p class="text-on-surface-variant text-[12px] leading-relaxed">New accounts require admin approval before access is granted.</p>
+</div>
+<!-- Registration Form -->
+<form class="space-y-6" onsubmit="return false;">
+<!-- Email Field -->
+<div class="space-y-2">
+<label class="block text-[11px] font-semibold text-on-surface-variant uppercase tracking-wider ml-0.5">Email Address</label>
+<div class="relative">
+<input class="w-full bg-surface-container-lowest border border-outline-variant px-4 py-3 rounded text-sm text-on-surface placeholder:text-outline/40 focus:outline-none focus:ring-1 focus:ring-primary focus:border-primary transition-all" placeholder="name@medical-institution.org" type="email"/>
+</div>
+</div>
+<!-- Password Field -->
+<div class="space-y-2">
+<label class="block text-[11px] font-semibold text-on-surface-variant uppercase tracking-wider ml-0.5">Password</label>
+<div class="relative">
+<input class="w-full bg-surface-container-lowest border border-outline-variant px-4 py-3 rounded text-sm text-on-surface placeholder:text-outline/40 focus:outline-none focus:ring-1 focus:ring-primary focus:border-primary transition-all" placeholder="••••••••••••" type="password"/>
+<button class="absolute right-3 top-1/2 -translate-y-1/2 text-outline-variant hover:text-on-surface-variant transition-colors" type="button">
+<span class="material-symbols-outlined text-xl" data-icon="visibility">visibility</span>
+</button>
+</div>
+</div>
+<!-- Confirm Password Field -->
+<div class="space-y-2">
+<label class="block text-[11px] font-semibold text-on-surface-variant uppercase tracking-wider ml-0.5">Confirm Password</label>
+<input class="w-full bg-surface-container-lowest border border-outline-variant px-4 py-3 rounded text-sm text-on-surface placeholder:text-outline/40 focus:outline-none focus:ring-1 focus:ring-primary focus:border-primary transition-all" placeholder="••••••••••••" type="password"/>
+</div>
+<!-- Submit Button -->
+<button class="w-full bg-primary hover:bg-primary-fixed-dim text-on-primary font-bold py-3.5 rounded shadow-lg shadow-primary/10 active:scale-[0.98] transition-all flex items-center justify-center gap-2" type="submit">
+<span>Create Account</span>
+</button>
+</form>
+<!-- Bottom Redirect -->
+<div class="mt-8 pt-6 border-t border-outline-variant/10 text-center">
+<p class="text-on-surface-variant text-[13px]">
+                    Already have an account? 
+                    <a class="text-primary hover:text-primary-fixed-dim transition-colors font-medium inline-flex items-center gap-1" href="#">
+                        Sign in <span class="material-symbols-outlined text-[16px]" data-icon="arrow_forward">arrow_forward</span>
+</a>
+</p>
+</div>
+</div>
+<!-- Hidden Success State Template -->
+<div class="hidden mt-12 bg-surface-container-low border border-primary/20 rounded-lg p-10 text-center shadow-2xl">
+<div class="w-16 h-16 bg-primary/10 border border-primary/30 rounded-full flex items-center justify-center mx-auto mb-6">
+<span class="material-symbols-outlined text-primary text-4xl" data-icon="check_circle" style="font-variation-settings: 'FILL' 1;">check_circle</span>
+</div>
+<h2 class="text-2xl font-bold text-on-surface mb-2">Request Submitted!</h2>
+<p class="text-on-surface-variant text-sm mb-8 leading-relaxed">
+                Your application has been logged to the clinical monolith. Please wait for an administrator to verify your credentials.
+            </p>
+<a class="text-primary hover:underline text-sm font-semibold tracking-wide" href="#">Back to Login</a>
+</div>
+</main>
+<!-- Footer Component Integration from JSON -->
+<footer class="fixed bottom-0 w-full flex justify-between items-center px-8 py-4 w-full bg-transparent">
+<div class="text-slate-600 font-['Inter'] text-[10px] uppercase tracking-widest font-semibold">
+            v1.0.4-beta | Clinical Monolith Architecture
+        </div>
+<nav class="flex gap-6">
+<a class="text-slate-600 hover:text-cyan-500 transition-all duration-300 font-['Inter'] text-[10px] uppercase tracking-widest font-semibold" href="#">Support</a>
+<a class="text-slate-600 hover:text-cyan-500 transition-all duration-300 font-['Inter'] text-[10px] uppercase tracking-widest font-semibold" href="#">Privacy Policy</a>
+<a class="text-slate-600 hover:text-cyan-500 transition-all duration-300 font-['Inter'] text-[10px] uppercase tracking-widest font-semibold" href="#">Admin Access</a>
+</nav>
+</footer>
+<!-- Aesthetic Decorative Element -->
+<div class="fixed inset-0 pointer-events-none z-0">
+<div class="absolute top-0 right-0 w-[500px] h-[500px] bg-primary/5 rounded-full blur-[120px] opacity-20 translate-x-1/2 -translate-y-1/2"></div>
+<div class="absolute bottom-0 left-0 w-[500px] h-[500px] bg-primary-container/5 rounded-full blur-[120px] opacity-20 -translate-x-1/2 translate-y-1/2"></div>
+</div>
+</body></html>
+
+<!-- Admin Panel - QCM Extractor -->
+<!DOCTYPE html>
+
+<html class="dark" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>QCM Extractor Admin Panel</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+        tailwind.config = {
+            darkMode: "class",
+            theme: {
+                extend: {
+                    "colors": {
+                        "surface-variant": "#353534",
+                        "on-error-container": "#ffdad6",
+                        "tertiary-container": "#e89337",
+                        "surface": "#131313",
+                        "on-tertiary": "#4b2800",
+                        "on-tertiary-fixed-variant": "#6a3b00",
+                        "on-tertiary-fixed": "#2d1600",
+                        "on-secondary-fixed": "#001f26",
+                        "on-error": "#690005",
+                        "tertiary-fixed": "#ffdcbf",
+                        "surface-container-highest": "#353534",
+                        "inverse-primary": "#00687a",
+                        "on-tertiary-container": "#5b3200",
+                        "primary-fixed": "#acedff",
+                        "secondary-fixed": "#bceaf7",
+                        "primary-fixed-dim": "#4cd7f6",
+                        "error-container": "#93000a",
+                        "on-secondary-container": "#90bcc9",
+                        "primary-container": "#06b6d4",
+                        "surface-tint": "#4cd7f6",
+                        "outline": "#869397",
+                        "on-secondary-fixed-variant": "#1e4d58",
+                        "secondary-container": "#1e4d58",
+                        "on-primary-fixed": "#001f26",
+                        "inverse-surface": "#e5e2e1",
+                        "tertiary": "#ffb873",
+                        "on-primary-fixed-variant": "#004e5c",
+                        "surface-dim": "#131313",
+                        "surface-container-low": "#1c1b1b",
+                        "surface-container": "#201f1f",
+                        "secondary-fixed-dim": "#a1cedb",
+                        "error": "#ffb4ab",
+                        "on-primary-container": "#00424f",
+                        "surface-container-lowest": "#0e0e0e",
+                        "outline-variant": "#3d494c",
+                        "inverse-on-surface": "#313030",
+                        "on-background": "#e5e2e1",
+                        "background": "#131313",
+                        "surface-container-high": "#2a2a2a",
+                        "on-primary": "#003640",
+                        "tertiary-fixed-dim": "#ffb873",
+                        "on-surface": "#e5e2e1",
+                        "secondary": "#a1cedb",
+                        "primary": "#4cd7f6",
+                        "on-surface-variant": "#bcc9cd",
+                        "on-secondary": "#003640",
+                        "surface-bright": "#3a3939"
+                    },
+                    "borderRadius": {
+                        "DEFAULT": "0.125rem",
+                        "lg": "0.25rem",
+                        "xl": "0.5rem",
+                        "full": "0.75rem"
+                    },
+                    "fontFamily": {
+                        "headline": ["Inter"],
+                        "display": ["Inter"],
+                        "body": ["Inter"],
+                        "label": ["Inter"]
+                    }
+                }
+            }
+        }
+    </script>
+<style>
+        body { font-family: 'Inter', sans-serif; }
+        .glass-panel {
+            background: rgba(53, 53, 52, 0.4);
+            backdrop-filter: blur(24px);
+            border: 1px solid rgba(61, 73, 76, 0.1);
+        }
+        .material-symbols-outlined {
+            font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+        }
+        .tab-active {
+            color: #4cd7f6;
+            border-bottom: 2px solid #4cd7f6;
+            padding-bottom: 8px;
+            font-weight: 600;
+        }
+        .tab-inactive {
+            color: #869397;
+            padding-bottom: 8px;
+            transition: color 150ms ease;
+        }
+        .tab-inactive:hover {
+            color: #e5e2e1;
+        }
+    </style>
+</head>
+<body class="bg-background text-on-surface min-h-screen selection:bg-primary/30">
+<!-- TopAppBar from JSON Authority -->
+<header class="fixed top-0 z-50 w-full flex items-center justify-between px-6 py-3 bg-[#0e0e0e] border-b border-[#3d494c]/20 shadow-[0px_24px_48px_rgba(0,0,0,0.4)] h-16" id="admin-header">
+<div class="flex items-center gap-4">
+<span class="material-symbols-outlined text-primary" data-icon="settings">settings</span>
+<div class="flex flex-col leading-tight">
+<span class="text-lg font-bold tracking-tighter text-primary">Admin Panel</span>
+<span class="text-[10px] uppercase tracking-widest text-outline">System Control</span>
+</div>
+</div>
+<div class="flex items-center gap-6">
+<div class="flex items-center gap-3">
+<img alt="Administrator Avatar" class="w-8 h-8 rounded-full border border-outline-variant/30" data-alt="A professional, high-contrast studio portrait of a system administrator in a high-tech medical data center. The lighting is dominated by clinical teal and deep charcoal tones, creating a moody yet precise atmosphere. The background features blurred server racks and holographic data displays, consistent with a futuristic monolith design system. The overall aesthetic is clean, sophisticated, and authoritative." src="https://lh3.googleusercontent.com/aida-public/AB6AXuBZRCgM_eQi6z4EOQVq3kl837PqX3idIxdRBk0sC_6ST_Q2j4ZXa8uR_bjUc6eQLcDApfmZVvYoD5-PT0LuOUqzcBvT0mEulJcJJZ2xZEMrAn37-mMIEhTGUkDisjS6EliaHDotwlK2A6OgWDNTh6q6v62oWETkZnsKTXP-dQ54ha4GUjvRrSRTDLjeKZxO_AHUXSfg_fYkFaaky5bkNrBFskFzw_fbZMLonYSIKVXbLdDwrdBqHdbn7crCCPy3BmiS9jBz8OajifU"/>
+<span class="text-sm font-medium text-on-surface-variant">admin@qcmextractor.ai</span>
+</div>
+<button class="flex items-center gap-2 px-4 py-1.5 bg-surface-container-high hover:bg-surface-container-highest text-on-surface text-sm font-medium rounded-lg transition-all active:scale-95 border border-outline-variant/20" id="btn-logout">
+<span class="material-symbols-outlined text-sm" data-icon="logout">logout</span>
+                Logout
+            </button>
+</div>
+</header>
+<main class="pt-16 max-w-[1600px] mx-auto px-6">
+<!-- Tab Navigation -->
+<nav class="flex gap-8 mt-8 border-b border-outline-variant/10" id="tabs-nav">
+<button class="tab-active text-sm" onclick="console.log('Switching to Users')">Users</button>
+<button class="tab-inactive text-sm" onclick="console.log('Switching to Statistics')">Statistics</button>
+<button class="tab-inactive text-sm" onclick="console.log('Switching to Projects')">Projects</button>
+</nav>
+<!-- View 1: Users (Active) -->
+<section class="mt-8" id="view-users">
+<div class="bg-surface-container-low rounded-xl overflow-hidden border border-outline-variant/10">
+<div class="overflow-x-auto">
+<table class="w-full text-left border-collapse">
+<thead>
+<tr class="bg-surface-container-lowest text-outline text-[11px] uppercase tracking-widest font-semibold border-b border-outline-variant/10">
+<th class="px-6 py-4">User Email</th>
+<th class="px-6 py-4">Joined</th>
+<th class="px-6 py-4">Status</th>
+<th class="px-6 py-4">API Key</th>
+<th class="px-6 py-4 text-center">Projects</th>
+<th class="px-6 py-4 text-right">Tokens</th>
+<th class="px-6 py-4 text-right">Cost</th>
+<th class="px-6 py-4 text-right">Actions</th>
+</tr>
+</thead>
+<tbody class="text-sm">
+<!-- User Row 1 -->
+<tr class="border-b border-outline-variant/5 hover:bg-surface-container/50 transition-colors group">
+<td class="px-6 py-4 font-medium text-on-surface">dr.smith@medical-center.org</td>
+<td class="px-6 py-4 text-on-surface-variant">Oct 24, 2023</td>
+<td class="px-6 py-4">
+<span class="px-2.5 py-1 rounded-full bg-secondary-container text-on-secondary-container text-[10px] font-bold uppercase tracking-wider">Approved</span>
+</td>
+<td class="px-6 py-4 font-mono text-outline text-xs">sk_••••••••4f2a</td>
+<td class="px-6 py-4 text-center">14</td>
+<td class="px-6 py-4 text-right">1.2M</td>
+<td class="px-6 py-4 text-right text-primary font-semibold">$142.50</td>
+<td class="px-6 py-4 text-right space-x-2">
+<button class="p-1.5 hover:bg-surface-container-highest rounded-lg transition-all text-on-surface-variant hover:text-primary">
+<span class="material-symbols-outlined text-lg" data-icon="edit">edit</span>
+</button>
+<button class="p-1.5 hover:bg-surface-container-highest rounded-lg transition-all text-on-surface-variant hover:text-primary" onclick="document.getElementById('row-model-config').classList.toggle('hidden')">
+<span class="material-symbols-outlined text-lg" data-icon="unfold_more">unfold_more</span>
+</button>
+</td>
+</tr>
+<!-- Collapsible Model Config Row -->
+<tr class="hidden bg-surface-container-lowest/50" id="row-model-config">
+<td class="p-6" colspan="8">
+<div class="grid grid-cols-6 gap-4">
+<div class="col-span-6 mb-2">
+<h4 class="text-xs font-bold text-primary uppercase tracking-widest">Model Configuration Slots</h4>
+</div>
+<div class="space-y-1">
+<label class="text-[10px] text-outline uppercase font-semibold">Slot 1 (Primary)</label>
+<input class="w-full bg-surface-container border-b border-outline-variant focus:border-primary text-xs px-2 py-1.5 outline-none transition-all" type="text" value="gpt-4-turbo"/>
+</div>
+<div class="space-y-1">
+<label class="text-[10px] text-outline uppercase font-semibold">Slot 2 (Fallbck)</label>
+<input class="w-full bg-surface-container border-b border-outline-variant focus:border-primary text-xs px-2 py-1.5 outline-none transition-all" type="text" value="claude-3-opus"/>
+</div>
+<div class="space-y-1">
+<label class="text-[10px] text-outline uppercase font-semibold">Slot 3</label>
+<input class="w-full bg-surface-container border-b border-outline-variant focus:border-primary text-xs px-2 py-1.5 outline-none transition-all" type="text" value="gemini-pro"/>
+</div>
+<div class="space-y-1">
+<label class="text-[10px] text-outline uppercase font-semibold">Slot 4</label>
+<input class="w-full bg-surface-container border-b border-outline-variant focus:border-primary text-xs px-2 py-1.5 outline-none transition-all" placeholder="Not set" type="text"/>
+</div>
+<div class="space-y-1">
+<label class="text-[10px] text-outline uppercase font-semibold">Slot 5</label>
+<input class="w-full bg-surface-container border-b border-outline-variant focus:border-primary text-xs px-2 py-1.5 outline-none transition-all" placeholder="Not set" type="text"/>
+</div>
+<div class="space-y-1">
+<label class="text-[10px] text-outline uppercase font-semibold">Slot 6</label>
+<input class="w-full bg-surface-container border-b border-outline-variant focus:border-primary text-xs px-2 py-1.5 outline-none transition-all" placeholder="Not set" type="text"/>
+</div>
+</div>
+</td>
+</tr>
+<!-- User Row 2 (Pending) -->
+<tr class="border-b border-outline-variant/5 hover:bg-surface-container/50 transition-colors group">
+<td class="px-6 py-4 font-medium text-on-surface">research@lab-delta.tech</td>
+<td class="px-6 py-4 text-on-surface-variant">Oct 28, 2023</td>
+<td class="px-6 py-4">
+<span class="px-2.5 py-1 rounded-full bg-tertiary-container/20 text-tertiary text-[10px] font-bold uppercase tracking-wider">Pending</span>
+</td>
+<td class="px-6 py-4 font-mono text-outline text-xs">Not Issued</td>
+<td class="px-6 py-4 text-center">0</td>
+<td class="px-6 py-4 text-right">0</td>
+<td class="px-6 py-4 text-right text-outline">$0.00</td>
+<td class="px-6 py-4 text-right space-x-2">
+<button class="px-3 py-1 bg-primary text-on-primary text-[10px] font-bold uppercase rounded hover:shadow-[0_0_15px_rgba(76,215,246,0.3)] transition-all">Approve</button>
+<button class="px-3 py-1 bg-error-container text-on-error-container text-[10px] font-bold uppercase rounded hover:bg-error transition-all">Reject</button>
+</td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+</section>
+<!-- View 2: Statistics (Hidden example for structure) -->
+<section class="mt-8 hidden" id="view-stats">
+<div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-10">
+<div class="bg-surface-container p-6 rounded-xl border border-outline-variant/10">
+<span class="text-[10px] text-outline uppercase font-bold tracking-widest block mb-2">Total Users</span>
+<div class="text-3xl font-bold text-on-surface">1,284</div>
+<div class="text-xs text-primary mt-2 flex items-center gap-1">
+<span class="material-symbols-outlined text-xs" data-icon="trending_up">trending_up</span>
+                        +12% this month
+                    </div>
+</div>
+<div class="bg-surface-container p-6 rounded-xl border border-outline-variant/10">
+<span class="text-[10px] text-outline uppercase font-bold tracking-widest block mb-2">Total Projects</span>
+<div class="text-3xl font-bold text-on-surface">4,592</div>
+<div class="text-xs text-on-surface-variant mt-2">Active extraction tasks</div>
+</div>
+<div class="bg-surface-container p-6 rounded-xl border border-outline-variant/10">
+<span class="text-[10px] text-outline uppercase font-bold tracking-widest block mb-2">Total Tokens</span>
+<div class="text-3xl font-bold text-on-surface">84.2M</div>
+<div class="text-xs text-on-surface-variant mt-2">Processed volume</div>
+</div>
+<div class="bg-surface-container p-6 rounded-xl border border-outline-variant/10">
+<span class="text-[10px] text-outline uppercase font-bold tracking-widest block mb-2">Total Cost</span>
+<div class="text-3xl font-bold text-primary">$12,482</div>
+<div class="text-xs text-on-surface-variant mt-2">API overhead</div>
+</div>
+</div>
+<div class="bg-surface-container rounded-xl border border-outline-variant/10 p-1">
+<div class="bg-surface-container-lowest rounded-lg p-6">
+<h3 class="text-lg font-bold mb-4">User Usage Breakdown</h3>
+<div class="h-64 bg-surface-container rounded flex items-end justify-between p-4 gap-2">
+<div class="w-full bg-primary/20 hover:bg-primary/40 rounded-t h-[30%] transition-all"></div>
+<div class="w-full bg-primary/20 hover:bg-primary/40 rounded-t h-[45%] transition-all"></div>
+<div class="w-full bg-primary/20 hover:bg-primary/40 rounded-t h-[80%] transition-all"></div>
+<div class="w-full bg-primary/20 hover:bg-primary/40 rounded-t h-[60%] transition-all"></div>
+<div class="w-full bg-primary/20 hover:bg-primary/40 rounded-t h-[90%] transition-all"></div>
+<div class="w-full bg-primary/20 hover:bg-primary/40 rounded-t h-[40%] transition-all"></div>
+<div class="w-full bg-primary/20 hover:bg-primary/40 rounded-t h-[55%] transition-all"></div>
+</div>
+</div>
+</div>
+</section>
+<!-- View 3: Projects (Hidden example for structure) -->
+<section class="mt-8 hidden" id="view-projects">
+<div class="flex items-center justify-between mb-8">
+<div class="flex flex-col">
+<h2 class="text-2xl font-bold">Project Audit</h2>
+<p class="text-sm text-outline">Monitoring clinical extraction pipelines across all users.</p>
+</div>
+<select class="bg-surface-container text-on-surface border-outline-variant/30 rounded-lg px-4 py-2 text-sm focus:ring-primary focus:border-primary outline-none">
+<option>All Users</option>
+<option>dr.smith@medical-center.org</option>
+<option>research@lab-delta.tech</option>
+</select>
+</div>
+<div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+<!-- Project Card 1 -->
+<div class="bg-surface-container rounded-xl border border-outline-variant/10 p-6 flex flex-col justify-between hover:border-primary/30 transition-all group">
+<div>
+<div class="flex justify-between items-start mb-4">
+<span class="material-symbols-outlined text-primary bg-primary/10 p-2 rounded-lg" data-icon="description">description</span>
+<span class="text-[10px] text-outline-variant font-mono">ID: PX-9283</span>
+</div>
+<h3 class="font-bold text-on-surface mb-1">Radiology Report Batch B</h3>
+<p class="text-xs text-on-surface-variant line-clamp-2">Extraction of primary diagnostic outcomes from 400 unstructured radiology PDFs.</p>
+</div>
+<div class="mt-6 pt-6 border-t border-outline-variant/5">
+<div class="flex justify-between text-xs mb-4">
+<span class="text-outline">Processed: <b class="text-on-surface">Oct 12</b></span>
+<span class="text-outline">Cost: <b class="text-primary">$24.12</b></span>
+</div>
+<button class="w-full py-2 bg-surface-container-high hover:bg-primary hover:text-on-primary rounded text-xs font-bold uppercase tracking-wider transition-all">View Pipeline</button>
+</div>
+</div>
+<!-- Project Card 2 -->
+<div class="bg-surface-container rounded-xl border border-outline-variant/10 p-6 flex flex-col justify-between hover:border-primary/30 transition-all group">
+<div>
+<div class="flex justify-between items-start mb-4">
+<span class="material-symbols-outlined text-primary bg-primary/10 p-2 rounded-lg" data-icon="clinical_notes">clinical_notes</span>
+<span class="text-[10px] text-outline-variant font-mono">ID: PX-1102</span>
+</div>
+<h3 class="font-bold text-on-surface mb-1">Patient History Synthesis</h3>
+<p class="text-xs text-on-surface-variant line-clamp-2">Aggregating longitudinal patient data from disparate EHR records for research analysis.</p>
+</div>
+<div class="mt-6 pt-6 border-t border-outline-variant/5">
+<div class="flex justify-between text-xs mb-4">
+<span class="text-outline">Processed: <b class="text-on-surface">Oct 14</b></span>
+<span class="text-outline">Cost: <b class="text-primary">$8.40</b></span>
+</div>
+<button class="w-full py-2 bg-surface-container-high hover:bg-primary hover:text-on-primary rounded text-xs font-bold uppercase tracking-wider transition-all">View Pipeline</button>
+</div>
+</div>
+<!-- Project Card 3 -->
+<div class="bg-surface-container rounded-xl border border-outline-variant/10 p-6 flex flex-col justify-between hover:border-primary/30 transition-all group">
+<div>
+<div class="flex justify-between items-start mb-4">
+<span class="material-symbols-outlined text-primary bg-primary/10 p-2 rounded-lg" data-icon="lab_research">lab_research</span>
+<span class="text-[10px] text-outline-variant font-mono">ID: PX-4421</span>
+</div>
+<h3 class="font-bold text-on-surface mb-1">Drug Interaction Scan</h3>
+<p class="text-xs text-on-surface-variant line-clamp-2">High-velocity extraction of potential contraindications from pharmacopeia datasets.</p>
+</div>
+<div class="mt-6 pt-6 border-t border-outline-variant/5">
+<div class="flex justify-between text-xs mb-4">
+<span class="text-outline">Processed: <b class="text-on-surface">Oct 15</b></span>
+<span class="text-outline">Cost: <b class="text-primary">$156.00</b></span>
+</div>
+<button class="w-full py-2 bg-surface-container-high hover:bg-primary hover:text-on-primary rounded text-xs font-bold uppercase tracking-wider transition-all">View Pipeline</button>
+</div>
+</div>
+</div>
+</section>
+</main>
+<!-- Bottom Decorative Glow -->
+<div class="fixed bottom-0 left-0 w-full h-1 bg-gradient-to-r from-transparent via-primary/20 to-transparent opacity-50"></div>
+<script>
+        // Simple View Switching logic as requested
+        function switchAdminTab(view) {
+            const views = ['view-users', 'view-stats', 'view-projects'];
+            const buttons = document.querySelectorAll('#tabs-nav button');
+            
+            views.forEach((v, index) => {
+                const el = document.getElementById(v);
+                if (v === 'view-' + view.toLowerCase()) {
+                    el.classList.remove('hidden');
+                    buttons[index].className = 'tab-active text-sm';
+                } else {
+                    el.classList.add('hidden');
+                    buttons[index].className = 'tab-inactive text-sm';
+                }
+            });
+        }
+
+        // Hook up navigation buttons
+        document.querySelectorAll('#tabs-nav button').forEach(btn => {
+            btn.onclick = () => switchAdminTab(btn.innerText);
+        });
+
+        // Specific toggle function for model config row
+        function toggleModelConfig(rowId) {
+            const row = document.getElementById(rowId);
+            if (row) {
+                row.classList.toggle('hidden');
+            }
+        }
+    </script>
+</body></html>
+
+<!-- Login - QCM Extractor -->
+<!DOCTYPE html>
+
+<html class="dark" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<script id="tailwind-config">
+        tailwind.config = {
+            darkMode: "class",
+            theme: {
+                extend: {
+                    "colors": {
+                        "tertiary-fixed-dim": "#ffb873",
+                        "on-tertiary-fixed": "#2d1600",
+                        "on-tertiary-container": "#5b3200",
+                        "tertiary-container": "#e89337",
+                        "on-error-container": "#ffdad6",
+                        "surface-variant": "#353534",
+                        "tertiary": "#ffb873",
+                        "on-background": "#e5e2e1",
+                        "surface": "#131313",
+                        "on-error": "#690005",
+                        "surface-tint": "#4cd7f6",
+                        "primary": "#4cd7f6",
+                        "surface-container-high": "#2a2a2a",
+                        "primary-container": "#06b6d4",
+                        "outline-variant": "#3d494c",
+                        "surface-container-highest": "#353534",
+                        "on-secondary-fixed-variant": "#1e4d58",
+                        "surface-container-low": "#1c1b1b",
+                        "on-secondary": "#003640",
+                        "on-primary-fixed": "#001f26",
+                        "on-surface": "#e5e2e1",
+                        "secondary-fixed": "#bceaf7",
+                        "background": "#131313",
+                        "secondary": "#a1cedb",
+                        "inverse-surface": "#e5e2e1",
+                        "inverse-primary": "#00687a",
+                        "surface-dim": "#131313",
+                        "primary-fixed-dim": "#4cd7f6",
+                        "on-primary-fixed-variant": "#004e5c",
+                        "tertiary-fixed": "#ffdcbf",
+                        "primary-fixed": "#acedff",
+                        "surface-container": "#201f1f",
+                        "on-primary": "#003640",
+                        "secondary-fixed-dim": "#a1cedb",
+                        "outline": "#869397",
+                        "error-container": "#93000a",
+                        "on-secondary-container": "#90bcc9",
+                        "error": "#ffb4ab",
+                        "inverse-on-surface": "#313030",
+                        "secondary-container": "#1e4d58",
+                        "on-secondary-fixed": "#001f26",
+                        "on-surface-variant": "#bcc9cd",
+                        "on-primary-container": "#00424f",
+                        "surface-bright": "#3a3939",
+                        "surface-container-lowest": "#0e0e0e",
+                        "on-tertiary": "#4b2800",
+                        "on-tertiary-fixed-variant": "#6a3b00"
+                    },
+                    "borderRadius": {
+                        "DEFAULT": "0.125rem",
+                        "lg": "0.25rem",
+                        "xl": "0.5rem",
+                        "full": "0.75rem"
+                    },
+                    "fontFamily": {
+                        "headline": ["Inter"],
+                        "display": ["Inter"],
+                        "body": ["Inter"],
+                        "label": ["Inter"]
+                    }
+                }
+            }
+        }
+    </script>
+<style>
+        body { font-family: 'Inter', sans-serif; background-color: #131313; }
+        .glass-glow {
+            box-shadow: 0 0 20px -5px rgba(76, 215, 246, 0.15);
+        }
+        .material-symbols-outlined {
+            font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+        }
+    </style>
+</head>
+<body class="bg-surface min-h-screen flex flex-col">
+<!-- TopNavBar (Shared Component JSON Mapping) -->
+<header class="fixed top-0 w-full z-50 bg-[#131313]/60 backdrop-blur-xl font-['Inter'] antialiased tracking-tight shadow-2xl shadow-black/40">
+<div class="flex justify-between items-center px-6 py-4 w-full max-w-none">
+<div class="text-lg font-bold tracking-tighter text-slate-100 uppercase">
+                Clinical Monolith AI
+            </div>
+<div class="flex items-center gap-6">
+<nav class="hidden md:flex gap-4 text-slate-500">
+<span class="cursor-pointer active:scale-95 transition-transform hover:text-cyan-300 transition-colors duration-200">Docs</span>
+<span class="cursor-pointer active:scale-95 transition-transform hover:text-cyan-300 transition-colors duration-200">API</span>
+<span class="cursor-pointer active:scale-95 transition-transform text-cyan-400 font-semibold">Support</span>
+</nav>
+</div>
+</div>
+<div class="bg-gradient-to-b from-white/5 to-transparent h-[1px]"></div>
+</header>
+<main class="flex-grow flex items-center justify-center px-4 pt-20 pb-12">
+<div class="w-full max-w-[420px] bg-surface-container-low border border-outline-variant/10 glass-glow rounded-lg p-8 flex flex-col gap-6">
+<!-- Branding Header -->
+<div class="flex items-center gap-3">
+<div class="w-10 h-10 bg-surface-container-lowest border border-primary/20 rounded flex items-center justify-center shadow-[0_0_15px_rgba(76,215,246,0.1)]">
+<span class="material-symbols-outlined text-primary text-xl" style="font-variation-settings: 'FILL' 1;">terminal</span>
+</div>
+<div class="flex flex-col">
+<span class="text-primary font-extrabold uppercase tracking-widest text-sm">QCM Extractor</span>
+<span class="text-[10px] text-outline font-mono opacity-60">v5.0</span>
+</div>
+</div>
+<!-- Title Section -->
+<div class="space-y-1">
+<h1 class="text-2xl font-bold text-on-surface tracking-tight">Welcome back</h1>
+<p class="text-[13px] text-on-surface-variant opacity-80">Sign in to your account</p>
+</div>
+<!-- Pending Status Bar -->
+<div class="bg-tertiary-container/10 border border-tertiary/20 px-4 py-3 rounded flex items-center gap-3">
+<span class="material-symbols-outlined text-tertiary text-lg">lock</span>
+<span class="text-[12px] text-tertiary font-medium">Your account is pending admin approval</span>
+</div>
+<!-- Login Form -->
+<form class="space-y-5" onsubmit="return false;">
+<!-- Email Input -->
+<div class="space-y-1.5">
+<label class="text-[10px] uppercase tracking-wider font-bold text-on-surface-variant/70 ml-1">Email Address</label>
+<div class="relative group">
+<input class="w-full bg-surface-container-lowest border border-outline-variant px-4 py-3 text-on-surface text-sm rounded focus:ring-1 focus:ring-primary focus:border-primary outline-none transition-all placeholder:text-outline/30" placeholder="dev@qcm-extractor.ai" type="email"/>
+</div>
+</div>
+<!-- Password Input -->
+<div class="space-y-1.5">
+<div class="flex justify-between items-center px-1">
+<label class="text-[10px] uppercase tracking-wider font-bold text-on-surface-variant/70">Password</label>
+<span class="text-[10px] text-primary cursor-pointer hover:underline">Forgot?</span>
+</div>
+<div class="relative group">
+<input class="w-full bg-surface-container-lowest border border-outline-variant px-4 py-3 text-on-surface text-sm rounded focus:ring-1 focus:ring-primary focus:border-primary outline-none transition-all" type="password" value="••••••••••••"/>
+<button class="absolute right-3 top-1/2 -translate-y-1/2 text-outline-variant hover:text-primary transition-colors" type="button">
+<span class="material-symbols-outlined text-lg">visibility_off</span>
+</button>
+</div>
+</div>
+<!-- Sign In Button -->
+<button class="w-full bg-primary hover:bg-surface-tint text-on-primary font-bold py-3.5 px-4 rounded flex items-center justify-center gap-2 group transition-all active:scale-[0.98] shadow-lg shadow-primary/10">
+                    SIGN IN
+                    <span class="material-symbols-outlined text-lg group-hover:translate-x-1 transition-transform">arrow_forward</span>
+</button>
+</form>
+<!-- Error Status Bar -->
+<div class="bg-error-container/20 border border-error/30 px-4 py-3 rounded flex items-center gap-3">
+<span class="material-symbols-outlined text-error text-lg">warning</span>
+<span class="text-[12px] text-error font-medium">Invalid credentials. Please verify your access.</span>
+</div>
+<!-- Divider -->
+<div class="h-[1px] bg-outline-variant/10 w-full my-2"></div>
+<!-- Footer Link -->
+<div class="text-center">
+<a class="text-[12px] text-on-surface-variant hover:text-primary transition-colors group" href="#">
+                    Don't have an account? <span class="font-semibold">Request access <span class="inline-block group-hover:translate-x-1 transition-transform">-&gt;</span></span>
+</a>
+</div>
+</div>
+</main>
+<!-- Visual Element: Monolith Accent -->
+<div class="fixed bottom-0 right-0 p-12 opacity-5 pointer-events-none hidden lg:block">
+<span class="text-[12rem] font-black tracking-tighter text-primary-container leading-none">QCM</span>
+</div>
+<!-- Footer (Shared Component JSON Mapping) -->
+<footer class="w-full py-8 border-t border-white/5 bg-[#131313]">
+<div class="flex flex-col md:flex-row justify-between items-center px-8 gap-4">
+<div class="text-[10px] uppercase tracking-[0.2em] font-medium text-slate-500">
+                © 2024 Clinical Monolith. Precision Diagnostic Systems.
+            </div>
+<div class="flex gap-6">
+<a class="text-[10px] uppercase tracking-[0.2em] font-medium text-slate-500 hover:text-slate-300 transition-colors opacity-80 hover:opacity-100" href="#">Privacy Policy</a>
+<a class="text-[10px] uppercase tracking-[0.2em] font-medium text-slate-500 hover:text-slate-300 transition-colors opacity-80 hover:opacity-100" href="#">Terms of Service</a>
+<a class="text-[10px] uppercase tracking-[0.2em] font-medium text-slate-500 hover:text-slate-300 transition-colors opacity-80 hover:opacity-100" href="#">Security Audit</a>
+</div>
+</div>
+</footer>
+</body></html>

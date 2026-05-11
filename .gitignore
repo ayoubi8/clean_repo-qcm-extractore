@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Environment / secrets — NEVER push these
+.env
+api/.env
+api/admin.env
+*.env.local
+google_client_secret.json
+client_secret_sheet-featur.json
+api/google_client_secret.json
+
+# Local auth data (migrated to Supabase)
+auth/users.db
+auth/users.json
+auth/users.json.migrated
+
+# Pipeline output (ephemeral, stored in Supabase Storage)
+output/
+api/output/
+*.output/
+
+# Frontend build artifacts
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.local
+
+# IDE / OS
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+*.log.*
+
+# Temp files
+tmp/
+*.tmp
+api/.cache/
+.cache/
+
+
+# Large data files — keep out of HF repo
+excel_files_found.txt
+pdf_splits/
+ocr_output/
+matching files/
+"matching files/"
+llamaindex_version/
+new (trach)/
+stitch_medical_document_analytics_hub/
+design-results/
+
+

@@ -1,0 +1,35 @@
+services:
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules        # anonymous volume prevents node_modules override
+    environment:
+      - VITE_API_BASE_URL=http://localhost:8000
+    depends_on:
+      - api
+
+  api:
+    build: ./api
+    working_dir: /app
+    volumes:
+      - ./api:/app
+      - ./modules:/app/modules
+      - ./output:/app/output
+      - ./.env:/app/.env
+      - ./batch_config.yaml:/app/batch_config.yaml
+      - "C:\\Users\\ayoub\\Downloads:/app/ref_data"
+      - ./admin.env:/app/admin.env
+      - ./client_secret_sheet-featur.json:/app/google_client_secret.json
+      - ./auth:/app/auth
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONPATH=/app
+      - GOOGLE_REDIRECT_URI=http://localhost:8000/oauth2callback
+      - JWT_SECRET=qcm-extractor-super-secret-2024-changeme
+      - ADMIN_EMAIL=ayoubdjelti02@gmail.com
+      - ADMIN_PASSWORD=AyouB987
+    command: uvicorn real_api:app --host 0.0.0.0 --port 8000

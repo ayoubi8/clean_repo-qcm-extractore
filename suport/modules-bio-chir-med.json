@@ -1,0 +1,479 @@
+{
+    "system_context": "You are an expert classifier for the Algerian Medical Residency (Residanat) exam. Your task is to assign the correct module to a Multiple Choice Question (QCM). Use the specific distinctions below, as many modules overlap.",
+    "medecine": {
+        "Cardiologie": {
+            "focus": "Diseases of the heart and blood vessels, ECG interpretation, and hemodynamic management.",
+            "keywords": [
+                "HTA (Hypertension)",
+                "IDM (Infarctus)",
+                "Insuffisance cardiaque",
+                "ECG",
+                "Valvulopathie",
+                "RAA (Rhumatismes Articulaire Aigu)",
+                "Douleur thoracique",
+                "Souffle cardiaque"
+            ],
+            "differentiation": "If the dyspnea is cardiac (orthopnea/crepitants) -> Cardiologie. If pulmonary (wheezing) -> Pneumologie. If generic 'Shock' state -> Reanimation."
+        },
+        "Dermatologie": {
+            "focus": "Skin, hair, nails, and sexually transmitted infections (STIs) presenting with cutaneous signs.",
+            "keywords": [
+                "Psoriasis",
+                "Eczéma",
+                "Mélanome",
+                "Carcinome",
+                "Lésion élémentaire",
+                "Macule/Papule",
+                "Syphilis",
+                "Pemphigus"
+            ],
+            "differentiation": "Focuses on the visual aspect of the lesion. If the patient has systemic sepsis/meningitis -> Maladies infectieuses."
+        },
+        "Endocrinologie": {
+            "focus": "Hormonal disorders, diabetes, and metabolic glands.",
+            "keywords": [
+                "Diabète (Type 1/2)",
+                "Thyroïde",
+                "Goitre",
+                "Surrénale",
+                "Cushing",
+                "Hypophyse",
+                "Calcium",
+                "TSH",
+                "Insuline"
+            ],
+            "differentiation": "Focuses on the gland function. If the context is 'Autoimmune' mechanism specifically -> Immunologie (rarely). If management of diabetic coma -> Reanimation."
+        },
+        "Epidemiologie": {
+            "focus": "Statistical methods, study designs, and population health metrics.",
+            "keywords": [
+                "Étude cas-témoins",
+                "Cohorte",
+                "Biais",
+                "Prévalence",
+                "Incidence",
+                "Sensibilité",
+                "Spécificité",
+                "Risque relatif"
+            ],
+            "differentiation": "Distinct from 'Sante Publique' by its focus on math/methodology rather than policy."
+        },
+        "Hematologie": {
+            "focus": "Clinical blood diseases, cancers of the blood, and bleeding disorders.",
+            "keywords": [
+                "Anémie",
+                "Leucémie (LAM, LAL, LMC, LLC)",
+                "Lymphome",
+                "Myélome",
+                "Hémophilie",
+                "Adénopathie",
+                "NFS (CBC)"
+            ],
+            "differentiation": "Focuses on symptoms/diagnosis. If asking about the Coagulation Cascade mechanism or Blood Grouping rules -> Hemobiologie."
+        },
+        "Hepato gastro enterologie": {
+            "focus": "Digestive tract pathologies, liver diseases, and endoscopy.",
+            "keywords": [
+                "Ulcère",
+                "Hépatite (B/C)",
+                "Cirrhose",
+                "MICI (Crohn/RCH)",
+                "Pancréatite",
+                "Ictère",
+                "Diarrhée chronique"
+            ],
+            "differentiation": "If the treatment is explicitly surgical (e.g., Appendectomy, Cholecystectomy) -> Chirurgie Generale."
+        },
+        "Maladies infectieuses": {
+            "focus": "Systemic infections, fevers, and antibiotic therapy choices.",
+            "keywords": [
+                "Méningite",
+                "Sepsis",
+                "Fièvre typhoïde",
+                "Tuberculose (Miliaire/Méningée)",
+                "HIV/SIDA",
+                "Brucellose",
+                "Antibiotique"
+            ],
+            "differentiation": "Focuses on the Patient (Fever/Treatment). If asking about the Germ's shape/culture -> Microbiologie. If Pulmonary TB -> Pneumologie."
+        },
+        "Medecine de travail": {
+            "focus": "Occupational health, professional diseases, and work legislation.",
+            "keywords": [
+                "Maladie professionnelle",
+                "Accident de travail",
+                "Exposition (Plomb, Amiante)",
+                "Ergonomie",
+                "Aptitude"
+            ],
+            "differentiation": "Look for specific jobs (miner, painter) or legal terms."
+        },
+        "Medecine legale": {
+            "focus": "Intersection of medicine and law, death, and ethics.",
+            "keywords": [
+                "Certificat de décès",
+                "Autopsie",
+                "Déontologie",
+                "Secret médical",
+                "Responsabilité",
+                "Violences",
+                "Thanatologie"
+            ],
+            "differentiation": "Distinct due to legal vocabulary."
+        },
+        "Nephrologie": {
+            "focus": "Kidney function, filtration failures, and dialysis.",
+            "keywords": [
+                "Insuffisance rénale",
+                "Syndrome néphrotique",
+                "Glomérulonéphrite",
+                "Créatinine",
+                "Dialyse",
+                "Potassium (Hyperkaliémie)"
+            ],
+            "differentiation": "Focuses on the 'Filter'. If the issue is plumbing (Stones, Obstruction, Prostate) -> Urologie."
+        },
+        "Neurologie": {
+            "focus": "Medical management of nervous system disorders.",
+            "keywords": [
+                "AVC (Stroke)",
+                "Épilepsie",
+                "Sclérose en plaques (SEP)",
+                "Parkinson",
+                "Migraine",
+                "Neuropathie",
+                "Guillain-Barré"
+            ],
+            "differentiation": "If it is a Tumor, Hematoma, or Trauma requiring operation -> Neurochirurgie."
+        },
+        "Pediatrie": {
+            "focus": "Medicine for infants and children (<16 years).",
+            "keywords": [
+                "Nouveau-né",
+                "Nourrisson",
+                "Allaitement",
+                "Vaccination",
+                "Croissance",
+                "Rachitisme",
+                "Déshydratation aigüe"
+            ],
+            "differentiation": "Prioritize this if the patient is a baby, even if the pathology exists in adults (e.g., Asthma in a child is usually Pediatrie)."
+        },
+        "Pneumologie": {
+            "focus": "Lungs, bronchi, and respiratory diseases.",
+            "keywords": [
+                "Asthme",
+                "BPCO",
+                "Tuberculose pulmonaire",
+                "Cancer du poumon",
+                "Pleurésie",
+                "Hémoptysie",
+                "Radio thorax"
+            ],
+            "differentiation": "Tuberculosis is the biggest overlap. Pulmonary TB -> Pneumologie. Extrapulmonary TB -> Infectio/Ortho/etc."
+        },
+        "Psychiatrie": {
+            "focus": "Mental health and behavioral disorders.",
+            "keywords": [
+                "Schizophrénie",
+                "Dépression",
+                "Trouble bipolaire",
+                "Anxiété",
+                "Délire",
+                "Hallucination",
+                "Psychotrope"
+            ],
+            "differentiation": "Look for behavioral symptoms and DSM criteria."
+        },
+        "Radiologie": {
+            "focus": "Imaging techniques and physical principles.",
+            "keywords": [
+                "IRM",
+                "Scanner (TDM)",
+                "Échographie",
+                "Rayons X",
+                "Opacité",
+                "Clarté",
+                "Contraste"
+            ],
+            "differentiation": "Questions asking 'What is the best exam?' or describing an image."
+        },
+        "Reanimation": {
+            "focus": "Life support, organ failure management, and shock states.",
+            "keywords": [
+                "Choc (Septique/Hémorragique)",
+                "Coma",
+                "Intubation",
+                "Ventilation",
+                "Gaz du sang",
+                "Déséquilibre acido-basique"
+            ],
+            "differentiation": "Focuses on Vital Distress. Differentiated from Urgences by the depth of management (ICU vs ER)."
+        },
+        "Rhumatologie": {
+            "focus": "Joint diseases, autoimmune arthritis, and bone density.",
+            "keywords": [
+                "Polyarthrite rhumatoïde",
+                "Spondylarthrite",
+                "Arthrose",
+                "Ostéoporose",
+                "Goutte",
+                "Lupus",
+                "Douleur articulaire"
+            ],
+            "differentiation": "Non-surgical, inflammatory/degenerative. If traumatic (Fracture) -> Orthopedie."
+        },
+        "Sante publique": {
+            "focus": "Health systems, policy, and national programs.",
+            "keywords": [
+                "Programme national",
+                "Système de santé",
+                "Prévention",
+                "Démographie",
+                "Économie de la santé"
+            ],
+            "differentiation": "Focuses on Organization/Policy rather than Math (Epidemio)."
+        },
+        "Therapeutique": {
+            "focus": "Pharmacology applied to clinical practice.",
+            "keywords": [
+                "Prescription",
+                "Interaction médicamenteuse",
+                "Pharmacocinétique",
+                "Effets indésirables",
+                "Posologie"
+            ],
+            "differentiation": "Focuses on the 'Drug' rules rather than the 'Disease'."
+        }
+    },
+    "chirurgie": {
+        "Chirurgie generale": {
+            "focus": "Abdominal and digestive surgery.",
+            "keywords": [
+                "Appendicite",
+                "Péritonite",
+                "Hernie",
+                "Vésicule biliaire (Lithiase)",
+                "Kyste hydatique (Foie)",
+                "Laparotomie"
+            ],
+            "differentiation": "Vs Gastro: Includes mechanical obstruction and operative techniques."
+        },
+        "Chirurgie infantile": {
+            "focus": "Surgical pathologies specific to children.",
+            "keywords": [
+                "Sténose du pylore",
+                "Invagination intestinale",
+                "Ectopie testiculaire",
+                "Malformation congénitale"
+            ],
+            "differentiation": "Surgery + Child age group."
+        },
+        "Gynecologie": {
+            "focus": "Women's reproductive health and obstetrics.",
+            "keywords": [
+                "Grossesse",
+                "Accouchement",
+                "Césarienne",
+                "Cancer du sein",
+                "Cancer du col",
+                "Contraception",
+                "Hémorragie de la délivrance"
+            ],
+            "differentiation": "Includes Breast pathologies."
+        },
+        "Neurochirurgie": {
+            "focus": "Surgical nervous system pathologies.",
+            "keywords": [
+                "Traumatisme crânien",
+                "Hématome (HED/HSD)",
+                "Tumeur cérébrale",
+                "Hernie discale",
+                "HIC (Hypertension intracrânienne)"
+            ],
+            "differentiation": "Includes Trauma and Compression. Degenerative diseases -> Neurologie."
+        },
+        "Ophtalmologie": {
+            "focus": "Eye and vision.",
+            "keywords": [
+                "Cataracte",
+                "Glaucome",
+                "Rétine",
+                "Oeil rouge",
+                "Conjonctivite",
+                "Acuité visuelle"
+            ],
+            "differentiation": "Specific organ: Eye."
+        },
+        "ORL": {
+            "focus": "Ear, Nose, and Throat.",
+            "keywords": [
+                "Otite",
+                "Angine",
+                "Cancer du cavum",
+                "Vertige",
+                "Surdité",
+                "Larynx",
+                "Amygdale"
+            ],
+            "differentiation": "Nasopharyngeal cancer is very common in Algerian QCMs under ORL."
+        },
+        "Orthopedie Traumatologie": {
+            "focus": "Musculoskeletal system trauma and mechanical correction.",
+            "keywords": [
+                "Fracture",
+                "Luxation",
+                "Entorse",
+                "Plâtre",
+                "Ostéosynthèse",
+                "Tumeur osseuse",
+                "Prothèse"
+            ],
+            "differentiation": "Vs Rhumato: Ortho is traumatic/mechanical. Rhumato is inflammatory."
+        },
+        "Urologie": {
+            "focus": "Male reproductive system and urinary tract surgery.",
+            "keywords": [
+                "Prostate (HBP/Cancer)",
+                "Lithiase urinaire (Calcul)",
+                "Tumeur de vessie",
+                "Torsion testiculaire",
+                "Rétention d'urine"
+            ],
+            "differentiation": "Vs Nephro: Uro treats the 'Pipes' (obstruction), Nephro treats the 'Filter' (cellular)."
+        },
+        "Les Urgences-Medico-Chirurgicals": {
+            "focus": "Immediate care, triage, and acute toxicity.",
+            "keywords": [
+                "Polytraumatisé",
+                "Brûlure",
+                "Intoxication (CO, Organophosphorés)",
+                "Tri",
+                "Détresse vitale"
+            ],
+            "differentiation": "Focuses on the first few hours of care."
+        }
+    },
+    "biologie": {
+        "Anapathologie": {
+            "focus": "Microscopic diagnosis of tissues.",
+            "keywords": [
+                "Biopsie",
+                "Histologie pathologique",
+                "Granulome",
+                "Carcinome",
+                "Métastase",
+                "Examen macroscopique"
+            ],
+            "differentiation": "The diagnosis gold standard. Mentions cellular architecture changes."
+        },
+        "Biochimie": {
+            "focus": "Chemical processes within the body.",
+            "keywords": [
+                "Cycle de Krebs",
+                "Enzyme",
+                "Lipide/Glucide/Protéine",
+                "Métabolisme",
+                "Vitamine",
+                "Glycolyse"
+            ],
+            "differentiation": "Focuses on the molecule/reaction."
+        },
+        "Embryologie": {
+            "focus": "Development from fertilization to fetus.",
+            "keywords": [
+                "Gamétogenèse",
+                "Fécondation",
+                "Semaine de développement",
+                "Feuillet",
+                "Arc branchial",
+                "Embryon"
+            ],
+            "differentiation": "Timeframe: Pre-birth development."
+        },
+        "Genetique": {
+            "focus": "Heredity and DNA.",
+            "keywords": [
+                "Caryotype",
+                "Trisomie 21",
+                "ADN/ARN",
+                "Mutation",
+                "Mendélien",
+                "Autosomique",
+                "Récessif/Dominant"
+            ],
+            "differentiation": "Focuses on the gene/chromosome."
+        },
+        "Hemobiologie": {
+            "focus": "Biological mechanisms of blood.",
+            "keywords": [
+                "Cascade de coagulation",
+                "Groupe sanguin (ABO/Rh)",
+                "Hémostase",
+                "Facteur de coagulation",
+                "Hématopoïèse"
+            ],
+            "differentiation": "Vs Hematologie: Hemobio asks 'How does Factor VIII work?' Hemato asks 'How to treat Hemophilia?'"
+        },
+        "Histologie": {
+            "focus": "Normal microscopic anatomy.",
+            "keywords": [
+                "Épithélium",
+                "Tissu conjonctif",
+                "Fibre musculaire",
+                "Neurone",
+                "Microscope",
+                "Cellule"
+            ],
+            "differentiation": "Description of NORMAL tissues."
+        },
+        "Immunologie": {
+            "focus": "Immune system mechanisms.",
+            "keywords": [
+                "Anticorps (IgG, IgM)",
+                "Antigène",
+                "Lymphocyte T/B",
+                "Complément",
+                "Allergie (Type I-IV)",
+                "CMH/HLA"
+            ],
+            "differentiation": "Focuses on the defense mechanism logic."
+        },
+        "Microbiologie": {
+            "focus": "The pathogens themselves (Lab view).",
+            "keywords": [
+                "Bactérie",
+                "Virus",
+                "Gram +/Gram -",
+                "Gélose/Culture",
+                "Cocci/Bacille",
+                "Résistance aux antibiotiques"
+            ],
+            "differentiation": "Vs Infectio: Microbio asks about the germ's shape/properties. Infectio asks about the patient's cure."
+        },
+        "Parasitologie": {
+            "focus": "Parasites, vectors, and life cycles.",
+            "keywords": [
+                "Leishmaniose",
+                "Kyste hydatique (Cycle)",
+                "Paludisme (Plasmodium)",
+                "Amibe",
+                "Hôte intermédiaire",
+                "Vecteur"
+            ],
+            "differentiation": "Cycle of the parasite is key here."
+        },
+        "Physiologie": {
+            "focus": "Normal function of body systems.",
+            "keywords": [
+                "Potentiel d'action",
+                "Débit cardiaque",
+                "Filtration glomérulaire",
+                "Ventilation",
+                "Hormone (Mécanisme)",
+                "Pression artérielle (Régulation)"
+            ],
+            "differentiation": "Focuses on 'How it works normally'."
+        }
+    }
+}

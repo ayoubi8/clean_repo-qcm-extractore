@@ -1,0 +1,45 @@
+{
+    "medecine": [
+        "Cardiologie",
+        "Dermatologie",
+        "Endocrinologie",
+        "Epidemiologie",
+        "Hematologie",
+        "Hepato gastro enterologie",
+        "Maladies infectieuses",
+        "Medecine de travail",
+        "Medecine legale",
+        "Nephrologie",
+        "Neurologie",
+        "Pediatrie",
+        "Pneumologie",
+        "Psychiatrie",
+        "Radiologie",
+        "Reanimation",
+        "Rhumatologie",
+        "Sante publique",
+        "Therapeutique"
+    ],
+    "chirurgie": [
+        "Chirurgie generale",
+        "Chirurgie infantile",
+        "Gynecologie",
+        "Neurochirurgie",
+        "Ophtalmologie",
+        "ORL",
+        "Orthopedie Traumatologie",
+        "Urologie"
+    ],
+    "biologie": [
+        "Anapathologie",
+        "Biochimie",
+        "Embryologie",
+        "Genetique",
+        "Hemobiologie",
+        "Histologie",
+        "Immunologie",
+        "Microbiologie",
+        "Parasitologie",
+        "Physiologie"
+    ]
+}

@@ -1,0 +1,101 @@
+# Batch Processing Configuration
+batch_mode:
+  enabled: true
+  pause_for_verification: false
+  
+# Step 1: Text Extraction qwen/qwen3-vl-8b-instruct
+extraction:
+  method: "vision_ocr"  # or "pypdfium2"
+  ocr_guidance: "Two-column layout. PRESERVE ALL TABLES as markdown (| pipes). Correction/answer-key tables with X marks are especially important — never skip them. Only ignore pure decorative page borders."
+  model: "google/gemini-2.0-flash-lite-001"
+# google/gemini-2.5-flash-lite-preview-09-2025
+# nvidia/nemotron-nano-12b-v2-vl:free
+
+# Step 1.6: Intelligent Text Fixing
+text_fixing:
+  enabled: true
+  model: "meta-llama/llama-3.3-70b-instruct"
+  guidance: "Focus on medical French terminology. l/I confusion, missing accents."
+  skip_if_pypdfium2: true  # Only run when vision OCR was used
+  
+# Step 2: QCM Extraction
+qcm_extraction:
+  page_range: "all"  # or "1-5", "1,3,5"
+  model_primary: "google/gemini-2.5-flash-lite-preview-09-2025"
+  model_fallback: "google/gemini-2.0-flash-lite-001"
+  extraction_guidance: "If metadata markers (e.g. year ->YYYY, subcategory **bold**) appear before a question, extract them into 'year' and 'subcategory' fields."
+  # Phase 2: emit lightweight 'clinical_case_hint' field when a Cas Clinique header precedes a QCM
+  clinical_case_hints: false  # set to true to enable (Step 3 uses this to skip a redundant LLM call)
+  
+# Step 3: Metadata
+metadata:
+  detection_mode: "ai_auto"
+  ai_guidance: "Extract medical module, year, course name , source from page headers or question context."
+  fields:
+    year:
+      strategy: "per_qcm"  # "global", "per_qcm", "ai_detect", "skip"
+      value: null
+      fallback_value: 2024
+    source:
+      strategy: "skip"
+      value: "Externat"
+      fallback_value: "Unknown"
+    category:
+      strategy: "global"  # AI auto-detection with confidence threshold
+      value: null
+      fallback_value: "Endocrinologie"
+    subcategory:
+      strategy: "per_qcm"
+      value: null
+      fallback_value: null
+    # Clinical case (Cas Clinique) detection — NEW
+    clinical_case:
+      strategy: "per_group"  # "skip" | "per_group" (detect per page) | "global" (one case for all)
+      fallback_value: null
+  global_pages: [1]  # Pages to extract global metadata from
+  
+# Step 4: Format Template
+template:
+  auto_select: true
+  name: "pediat"  # or null for prompt
+  
+# Step 5: JSON Building
+json_building:
+  auto_proceed: true
+  
+# Step 6: Corrections
+corrections:
+  source: "page_text"  # Use "page_text" to extract from pages with AI
+  # --- Scan Mode ---
+  # "specific_pages" (default): reads only the pages listed in `pages`
+  # "all_pages": scans EVERY extracted page automatically — no page numbers needed.
+  #              Handles interleaved corrections (corrections mixed with new QCMs on same page).
+  correction_search_mode: "all_pages"
+  pages: [4, 5, 6, 7]  # Only used when correction_search_mode is "specific_pages"
+  ai_mode: "batch"  # or "sequential"
+  model: "google/gemini-2.5-flash-lite-preview-09-2025"
+  page_text:
+    extraction_guidance: "Look for Answer Key tables with X marks or correction lists like '1: BCE'."
+  vision:
+    custom_prompt: "Detect circled propositions or checkmarks. Look for any visual marks (circles, ticks, highlights) next to correct answers."
+  all_pages_scan:
+    # Minimum heuristic score for a page to be considered a correction candidate.
+    # Lower = more pages included (safer). Higher = fewer API calls (faster).
+    # Score is computed from keyword presence + table signatures + answer patterns.
+    candidate_threshold: 15
+    # If true, include 1 neighboring page on each side of a candidate page.
+    # Useful when a correction table bleeds across a page break.
+    include_neighbors: true
+  
+# Step 7: Categorization
+categorization:
+  enabled: false
+  model: "meta-llama/llama-3.3-70b-instruct"
+
+# Folder Batch Processing
+folder_batch:
+  enabled: true  # Process entire folder of PDFs
+  input_folder: "C:/Users/ayoub/OneDrive/Documents/ayoub/banque charaque/New folder/resi2016/qcm_extractor/pdf_splits/QUIZZY Endo"
+  file_pattern: "*.pdf"  # or "PEDIATRIE*.pdf" to filter specific files
+  output_base: "output/batch_results"
+  parallel_processing: false

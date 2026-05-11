@@ -1,0 +1,14 @@
+pypdfium2
+Pillow
+httpx
+python-dotenv
+pydantic
+pdf2image
+openai
+# Step 8 & XLSX export
+openpyxl
+rapidfuzz
+tqdm
+numpy
+pandas
+PyYAML
