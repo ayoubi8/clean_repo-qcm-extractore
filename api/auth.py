@@ -137,6 +137,38 @@ def delete_user(uid: str):
     sb.table("users").delete().eq("id", uid).execute()
 
 
+def ensure_admin_exists() -> None:
+    """
+    Seed the admin user into Supabase on startup if not already present.
+    Safe to call on every restart (idempotent).
+    """
+    try:
+        existing = find_user_by_email(ADMIN_EMAIL)
+        if existing:
+            # Make sure the admin flag is set correctly
+            if not existing.get("is_admin"):
+                update_user_field(existing["id"], "is_admin", True)
+                update_user_field(existing["id"], "is_approved", True)
+            print(f"[AUTH] Admin user already exists: {ADMIN_EMAIL}")
+            return
+
+        # Create admin user with bcrypt-hashed password
+        admin_user = {
+            "id":             str(uuid.uuid4()),
+            "email":          ADMIN_EMAIL,
+            "password_hash":  hash_password(ADMIN_PASSWORD),
+            "is_approved":    True,
+            "is_admin":       True,
+            "api_key":        None,
+            "allowed_models": [],
+            "created_at":     datetime.utcnow().isoformat(),
+        }
+        add_user(admin_user)
+        print(f"[AUTH] Admin user created: {ADMIN_EMAIL}")
+    except Exception as e:
+        print(f"[AUTH] Warning: could not seed admin user: {e}")
+
+
 # ---------------------------------------------------------------------------
 # JWT Helpers
 # ---------------------------------------------------------------------------

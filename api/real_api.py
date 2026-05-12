@@ -35,7 +35,7 @@ from auth import (get_current_user, require_admin, load_users,
                      create_access_token, add_user, update_user_field, delete_user,
                      check_rate_limit,
                      create_refresh_token, verify_and_rotate_refresh_token, revoke_all_refresh_tokens,
-                     ADMIN_EMAIL, ADMIN_PASSWORD)
+                     ADMIN_EMAIL, ADMIN_PASSWORD, ensure_admin_exists)
 import uuid
 from storage_client import (
     write_file, write_bytes_file, read_file, read_bytes_file,
@@ -45,6 +45,12 @@ from storage_client import (
 
 app = FastAPI(title="QCM Extractor API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+@app.on_event("startup")
+async def _startup():
+    """Seed admin user into Supabase on every container start."""
+    ensure_admin_exists()
+
 
 def _migrate_legacy_projects():
     """Move folders from /app/output/ to /app/output/admin_email/ if they aren't isolated yet."""
