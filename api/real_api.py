@@ -141,19 +141,8 @@ def register(body: dict, request: Request):
 @app.post("/auth/login")
 def login(body: dict, request: Request):
     check_rate_limit(request.client.host, "login")
-    email = body.get("email")
-    password = body.get("password")
-    
-    if email == ADMIN_EMAIL and password == ADMIN_PASSWORD:
-        token         = create_access_token("admin", email, True)
-        refresh_token = create_refresh_token("admin")
-        return {
-            "access_token":  token,
-            "refresh_token": refresh_token,
-            "token_type":    "bearer",
-            "is_admin":      True,
-            "email":         email
-        }
+    email    = body.get("email", "").strip().lower()
+    password = body.get("password", "")
 
     user = find_user_by_email(email)
     if not user or not verify_password(password, user["password_hash"]):
@@ -167,21 +156,19 @@ def login(body: dict, request: Request):
     if not user.get("is_approved"):
         raise HTTPException(status_code=403, detail="PENDING_APPROVAL")
 
-    token         = create_access_token(user["id"], user["email"], user.get("is_admin", False))
+    is_admin      = user.get("is_admin", False) or (email == ADMIN_EMAIL)
+    token         = create_access_token(user["id"], user["email"], is_admin)
     refresh_token = create_refresh_token(user["id"])
     return {
         "access_token":  token,
         "refresh_token": refresh_token,
         "token_type":    "bearer",
-        "is_admin":      user.get("is_admin", False),
+        "is_admin":      is_admin,
         "email":         user["email"]
     }
 
 @app.get("/auth/me")
 def get_me(user: dict = Depends(get_current_user)):
-    if user.get("email") == ADMIN_EMAIL:
-        return {"email": ADMIN_EMAIL, "is_admin": True, "is_approved": True}
-
     # Return user info without password hash
     return {k: v for k, v in user.items() if k != "password_hash"}
 
