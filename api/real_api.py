@@ -447,18 +447,35 @@ def serve_project_pdf(name: str, user: dict = Depends(get_current_user)):
     return FileResponse(str(pdf_path), media_type="application/pdf")
 
 @app.get("/auth/google")
-def start_google_auth(project: str = "", step: str = "", filename: str = "", user: dict = Depends(get_current_user)):
-    """Redirect user to Google consent screen."""
+def start_google_auth(
+    project: str = "", step: str = "", filename: str = "",
+    token: str = "",          # JWT passed as query param from browser redirects
+    authorization: str = Header(None),
+):
+    """Redirect user to Google consent screen. Accepts JWT via header OR ?token= query param."""
+    from auth import decode_token, find_user_by_id
+    # Resolve JWT — prefer header, fall back to query param
+    raw_token = None
+    if authorization and authorization.startswith("Bearer "):
+        raw_token = authorization.split(" ")[1]
+    elif token:
+        raw_token = token
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="Missing or invalid authorization header")
+    payload = decode_token(raw_token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    user_id = payload.get("sub", "admin")
+
     flow = Flow.from_client_secrets_file(
         GOOGLE_CLIENT_SECRET_PATH,
         scopes=GOOGLE_SCOPES,
         redirect_uri=GOOGLE_REDIRECT_URI
     )
-    # Store user id in state so the callback knows where to save the token
     auth_url, _ = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
-        state=f"{project}||{step}||{filename}||{user['id']}"
+        state=f"{project}||{step}||{filename}||{user_id}"
     )
     return RedirectResponse(auth_url)
 
@@ -492,8 +509,10 @@ def google_oauth_callback(code: str, state: str = ""):
     with open(token_path, "wb") as f:
         pickle.dump(creds, f)
 
+    # Redirect back to the frontend — use FRONTEND_URL env var (set on HF Spaces)
+    frontend_url = os.environ.get("FRONTEND_URL", "http://localhost:3000")
     return RedirectResponse(
-        f"http://localhost:3000/pipeline?sheets_pending=1&project={project}&step={step}&filename={filename}"
+        f"{frontend_url}/pipeline?sheets_pending=1&project={project}&step={step}&filename={filename}"
     )
 
 @app.post("/projects/{name}/pdf")
