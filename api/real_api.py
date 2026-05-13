@@ -8,7 +8,8 @@ from datetime import datetime
 import yaml
 from pathlib import Path
 from dotenv import load_dotenv
-from fastapi import FastAPI, WebSocket, BackgroundTasks, HTTPException, UploadFile, File, Depends, Request
+from fastapi import FastAPI, WebSocket, BackgroundTasks, HTTPException, UploadFile, File, Depends, Request, Header
+
 from fastapi.responses import FileResponse, RedirectResponse
 import shutil
 import mimetypes
