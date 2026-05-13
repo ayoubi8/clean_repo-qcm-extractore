@@ -48,8 +48,19 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.on_event("startup")
 async def _startup():
-    """Seed admin user into Supabase on every container start."""
+    """Seed admin user and decode Google credentials on every container start."""
     ensure_admin_exists()
+
+    # Decode Google OAuth client secret from base64 env var → write to disk
+    google_secret_b64 = os.environ.get("GOOGLE_CLIENT_SECRET_B64", "")
+    if google_secret_b64:
+        import base64
+        try:
+            secret_bytes = base64.b64decode(google_secret_b64)
+            Path("/app/google_client_secret.json").write_bytes(secret_bytes)
+            print("[STARTUP] Google client secret written to /app/google_client_secret.json")
+        except Exception as e:
+            print(f"[STARTUP] Warning: could not decode GOOGLE_CLIENT_SECRET_B64: {e}")
 
 
 def _migrate_legacy_projects():
