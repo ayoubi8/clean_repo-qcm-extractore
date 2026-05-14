@@ -504,6 +504,7 @@ def google_oauth_callback(code: str, state: str = ""):
     """Handle Google OAuth callback, save token, redirect back to frontend."""
     print(f"[OAUTH] Callback received. redirect_uri={GOOGLE_REDIRECT_URI}")
     try:
+        os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"  # Allow Google to grant extra scopes
         flow = Flow.from_client_secrets_file(
             GOOGLE_CLIENT_SECRET_PATH,
             scopes=GOOGLE_SCOPES,

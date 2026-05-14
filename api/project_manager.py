@@ -36,13 +36,13 @@ def get_or_create(project_name: str, email: str) -> dict:
 def list_projects(email: str) -> list:
     projects = []
     output_dir = Path(f"/app/output/{email}")
-    if not output_dir.exists():
-        return []
-    
-    # Iterate through project folders in output/{email}/
-    for d in sorted(output_dir.iterdir()):
-        if d.is_dir() and d.name != "global":
-            # Determine last step by checking which stepN folders exist
+
+    # ── Local filesystem (fast path) ────────────────────────────────────────
+    if output_dir.exists():
+        for d in sorted(output_dir.iterdir()):
+            if not d.is_dir() or d.name.startswith(("_", ".", "global")):
+                continue
+
             last_step = 0
             STEP_ORDER = [
                 (8, "step8_matcher"), (7, "step7_categories"), (6, "step6_corrections"),
@@ -54,20 +54,17 @@ def list_projects(email: str) -> list:
                 if folder_path.exists() and any(folder_path.iterdir()):
                     last_step = step_num
                     break
-            
-            # Read total_costs.json if it exists
+
             total_tokens = 0
             cost_file = d / "total_costs.json"
             if cost_file.exists():
                 try:
                     data = json.loads(cost_file.read_text())
-                    # Support both new format {models, steps, summary} and old flat format
                     summary = data.get("summary", data)
                     total_tokens = summary.get("total_tokens", 0)
                 except:
                     pass
 
-            # Read pdf_path from project.json if it exists
             pdf_path = ""
             project_json = d / "project.json"
             if project_json.exists():
@@ -84,7 +81,54 @@ def list_projects(email: str) -> list:
                 "total_tokens": total_tokens,
                 "pdf_path": pdf_path
             })
+
+    # ── Supabase Storage fallback (container restarted — local FS is empty) ─
+    if not projects:
+        try:
+            from storage_client import list_files, read_file
+            items = list_files(f"{email}/")
+            project_names: set = set()
+            for item in items:
+                name = item.get("name", "")
+                parts = name.split("/")
+                if parts and parts[0] and not parts[0].startswith(("_", ".", "global")):
+                    project_names.add(parts[0])
+
+            for pname in sorted(project_names):
+                proj: dict = {
+                    "name": pname, "last_step": 0,
+                    "last_modified": "", "total_tokens": 0, "pdf_path": ""
+                }
+                # Restore project.json locally so subsequent ops work
+                try:
+                    pjson_text = read_file(f"{email}/{pname}/project.json")
+                    local_pdir = Path(f"/app/output/{email}/{pname}")
+                    local_pdir.mkdir(parents=True, exist_ok=True)
+                    (local_pdir / "project.json").write_text(pjson_text)
+                    pdata = json.loads(pjson_text)
+                    proj["pdf_path"] = pdata.get("pdf_path", "")
+                except Exception:
+                    pass
+                # Restore costs locally
+                try:
+                    costs_text = read_file(f"{email}/{pname}/total_costs.json")
+                    local_pdir = Path(f"/app/output/{email}/{pname}")
+                    local_pdir.mkdir(parents=True, exist_ok=True)
+                    (local_pdir / "total_costs.json").write_text(costs_text)
+                    costs = json.loads(costs_text)
+                    summary = costs.get("summary", costs)
+                    proj["total_tokens"] = summary.get("total_tokens", 0)
+                except Exception:
+                    pass
+                projects.append(proj)
+            if projects:
+                print(f"[list_projects] Restored {len(projects)} project(s) from Supabase for {email}")
+        except Exception as e:
+            print(f"[list_projects] Supabase fallback error: {e}")
+
     return projects
+
+
 
 def step_output_exists(project_name: str, step_id: str, email: str) -> bool:
     folder_name = STEP_FOLDER_MAP.get(str(step_id), f"step{step_id}")
