@@ -398,8 +398,16 @@ def create_project(body: dict, user: dict = Depends(get_current_user)):
 
 # --- Google Sheets Config ---
 GOOGLE_CLIENT_SECRET_PATH = "/app/google_client_secret.json"
-GOOGLE_SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive.file"]
-GOOGLE_REDIRECT_URI = os.environ.get("GOOGLE_REDIRECT_URI", "http://localhost:8000/oauth2callback")
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/drive",
+]
+GOOGLE_REDIRECT_URI = os.environ.get(
+    "GOOGLE_REDIRECT_URI",
+    "https://ayoubi8-qcm-extractor.hf.space/oauth2callback"   # production default
+)
+
 
 def _get_google_creds(user_id: str):
     """Load saved token from Supabase Storage or local FS. Returns None if not authorized."""
@@ -494,13 +502,19 @@ def start_google_auth(
 @app.get("/oauth2callback")
 def google_oauth_callback(code: str, state: str = ""):
     """Handle Google OAuth callback, save token, redirect back to frontend."""
-    flow = Flow.from_client_secrets_file(
-        GOOGLE_CLIENT_SECRET_PATH,
-        scopes=GOOGLE_SCOPES,
-        redirect_uri=GOOGLE_REDIRECT_URI
-    )
-    flow.fetch_token(code=code)
-    creds = flow.credentials
+    print(f"[OAUTH] Callback received. redirect_uri={GOOGLE_REDIRECT_URI}")
+    try:
+        flow = Flow.from_client_secrets_file(
+            GOOGLE_CLIENT_SECRET_PATH,
+            scopes=GOOGLE_SCOPES,
+            redirect_uri=GOOGLE_REDIRECT_URI
+        )
+        flow.fetch_token(code=code)
+        creds = flow.credentials
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Google token exchange failed: {str(e)}")
 
     # Parse state: project||step||filename||user_id
     parts = state.split("||")
@@ -512,20 +526,26 @@ def google_oauth_callback(code: str, state: str = ""):
     # Save to Supabase Storage (primary — survives restarts)
     try:
         write_pickle(f"{user_id}/.google_token.pickle", creds)
+        print(f"[OAUTH] Token saved to Supabase for user {user_id}")
     except Exception as e:
         print(f"[STORAGE] Google token Supabase upload failed: {e}")
 
     # Also save to local filesystem (fallback for pipeline compatibility)
-    token_path = Path(f"/app/output/{user_id}/.google_token.pickle")
-    token_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(token_path, "wb") as f:
-        pickle.dump(creds, f)
+    try:
+        token_path = Path(f"/app/output/{user_id}/.google_token.pickle")
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(token_path, "wb") as f:
+            pickle.dump(creds, f)
+    except Exception as e:
+        print(f"[OAUTH] Local token save failed: {e}")
 
     # Redirect back to the frontend — use FRONTEND_URL env var (set on HF Spaces)
     frontend_url = os.environ.get("FRONTEND_URL", "http://localhost:3000")
     return RedirectResponse(
         f"{frontend_url}/pipeline?sheets_pending=1&project={project}&step={step}&filename={filename}"
     )
+
+
 
 @app.post("/projects/{name}/pdf")
 async def upload_project_pdf(name: str, file: UploadFile = File(...), user: dict = Depends(get_current_user)):
