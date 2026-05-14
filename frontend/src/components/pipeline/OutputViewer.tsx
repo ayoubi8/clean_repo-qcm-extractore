@@ -129,17 +129,40 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
         headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
         body: JSON.stringify({ filename: file.name })
       });
+
       if (res.status === 401) {
-        // Not authorized for Google yet — redirect to OAuth consent
-        const encodedFile = encodeURIComponent(file.name);
-        window.location.href = `${BASE}/auth/google?project=${encodeURIComponent(projectName)}&step=${stepId}&filename=${encodedFile}`;
+        // Read the body to distinguish JWT-expired vs Google-creds-missing
+        let detail = '';
+        try { detail = (await res.json()).detail || ''; } catch {}
+
+        if (detail === 'NOT_AUTHORIZED') {
+          // No Google OAuth token — redirect to Google consent
+          const encodedFile = encodeURIComponent(file.name);
+          const jwt = localStorage.getItem('qcm_token') || '';
+          window.location.href = `${BASE}/auth/google?project=${encodeURIComponent(projectName)}&step=${stepId}&filename=${encodedFile}&token=${encodeURIComponent(jwt)}`;
+        } else {
+          // App JWT expired — ask user to re-login
+          alert('Session expired. Please log in again.');
+        }
         return;
       }
-      if (!res.ok) throw new Error('Upload failed');
+
+      if (!res.ok) {
+        let errMsg = 'Upload to Google Sheets failed';
+        try { errMsg = (await res.json()).detail || errMsg; } catch {}
+        alert(errMsg);
+        return;
+      }
+
       const data = await res.json();
-      window.open(data.url, '_blank');
-    } catch (e) {
+      if (data.url) {
+        window.open(data.url, '_blank');
+      } else {
+        alert('Google Sheets upload succeeded but no URL was returned.');
+      }
+    } catch (e: any) {
       console.error('Google Sheets error:', e);
+      alert(`Google Sheets error: ${e.message || 'Unknown error'}`);
     } finally {
       setSheetsLoading(null);
     }
@@ -233,19 +256,7 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
                   {file.created_at && <span className="text-outline/40 ml-2">{file.created_at}</span>}
                 </span>
 
-                {file.name.endsWith('.xlsx') && (
-                  <button
-                    onClick={() => openInSheets(file)}
-                    title="Open in Google Sheets"
-                    className="w-7 h-7 rounded-lg flex items-center justify-center text-outline hover:text-[#34A853] hover:bg-[#34A853]/10 transition-colors"
-                    disabled={sheetsLoading === file.name}
-                  >
-                    {sheetsLoading === file.name
-                      ? <span className="material-symbols-outlined text-[14px] animate-spin">refresh</span>
-                      : <span className="material-symbols-outlined text-[14px]">table_chart</span>
-                    }
-                  </button>
-                )}
+
 
                 {!file.name.endsWith('.xlsx') && (
                   <button
@@ -275,6 +286,10 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
 
                 <button
                   onClick={async () => {
+                    if (file.name.endsWith('.xlsx')) {
+                      openInSheets(file);
+                      return;
+                    }
                     const url = showHistory
                       ? getHistoryViewUrl(selectedRun!, file.name)
                       : (file.name.endsWith('.json') || file.name.endsWith('.pdf')
@@ -286,10 +301,18 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
                       setTimeout(() => URL.revokeObjectURL(blobUrl), 30000);
                     } catch { alert('Could not open file.'); }
                   }}
-                  title="Open in new tab"
-                  className="w-7 h-7 rounded-lg flex items-center justify-center text-outline hover:text-primary hover:bg-primary/10 transition-colors"
+                  title={file.name.endsWith('.xlsx') ? 'Open in Google Sheets' : 'Open in new tab'}
+                  disabled={file.name.endsWith('.xlsx') && sheetsLoading === file.name}
+                  className={`w-7 h-7 rounded-lg flex items-center justify-center transition-colors ${
+                    file.name.endsWith('.xlsx')
+                      ? 'text-outline hover:text-[#34A853] hover:bg-[#34A853]/10'
+                      : 'text-outline hover:text-primary hover:bg-primary/10'
+                  }`}
                 >
-                  <span className="material-symbols-outlined text-[16px]">open_in_new</span>
+                  {file.name.endsWith('.xlsx') && sheetsLoading === file.name
+                    ? <span className="material-symbols-outlined text-[14px] animate-spin">refresh</span>
+                    : <span className="material-symbols-outlined text-[16px]">open_in_new</span>
+                  }
                 </button>
               </div>
             </div>

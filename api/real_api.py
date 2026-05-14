@@ -59,9 +59,18 @@ async def _startup():
         try:
             secret_bytes = base64.b64decode(google_secret_b64)
             Path("/app/google_client_secret.json").write_bytes(secret_bytes)
-            print("[STARTUP] Google client secret written to /app/google_client_secret.json")
+            print("[STARTUP] ✅ Google client secret written to /app/google_client_secret.json")
         except Exception as e:
-            print(f"[STARTUP] Warning: could not decode GOOGLE_CLIENT_SECRET_B64: {e}")
+            print(f"[STARTUP] ❌ Could not decode GOOGLE_CLIENT_SECRET_B64: {e}")
+    else:
+        print("[STARTUP] ⚠️ GOOGLE_CLIENT_SECRET_B64 not set — Google Sheets integration will NOT work")
+
+    # Log Google Sheets readiness
+    print(f"[STARTUP] Google OAuth redirect URI: {GOOGLE_REDIRECT_URI}")
+    if Path(GOOGLE_CLIENT_SECRET_PATH).exists():
+        print(f"[STARTUP] ✅ Google client secret file exists at {GOOGLE_CLIENT_SECRET_PATH}")
+    else:
+        print(f"[STARTUP] ❌ Google client secret file MISSING at {GOOGLE_CLIENT_SECRET_PATH}")
 
 
 def _migrate_legacy_projects():
@@ -417,16 +426,20 @@ def _get_google_creds(user_id: str):
     try:
         creds = read_pickle(storage_path)
         if creds and creds.valid:
+            print(f"[GOOGLE] Valid creds loaded from Supabase for {user_id}")
             return creds
         if creds and creds.expired and creds.refresh_token:
+            print(f"[GOOGLE] Creds expired for {user_id}, refreshing...")
             creds.refresh(GoogleAuthRequest())
             try:
                 write_pickle(storage_path, creds)
             except Exception:
                 pass
+            print(f"[GOOGLE] Creds refreshed successfully for {user_id}")
             return creds
-    except Exception:
-        pass
+        print(f"[GOOGLE] Creds from Supabase exist but not valid/refreshable for {user_id}")
+    except Exception as e:
+        print(f"[GOOGLE] Supabase token load failed for {user_id}: {e}")
 
     # Fallback to local filesystem
     token_path = Path(f"/app/output/{user_id}/.google_token.pickle")
@@ -435,14 +448,19 @@ def _get_google_creds(user_id: str):
             try:
                 creds = pickle.load(f)
                 if creds and creds.valid:
+                    print(f"[GOOGLE] Valid creds loaded from local FS for {user_id}")
                     return creds
                 if creds and creds.expired and creds.refresh_token:
+                    print(f"[GOOGLE] Local creds expired for {user_id}, refreshing...")
                     creds.refresh(GoogleAuthRequest())
                     with open(token_path, "wb") as f2:
                         pickle.dump(creds, f2)
+                    print(f"[GOOGLE] Local creds refreshed successfully for {user_id}")
                     return creds
             except Exception as e:
-                print(f"Error loading google token: {e}")
+                print(f"[GOOGLE] Error loading local google token for {user_id}: {e}")
+    else:
+        print(f"[GOOGLE] No token found (Supabase or local) for {user_id}")
     return None
 
 # --- PDF Upload & View Endpoints ---
@@ -1451,6 +1469,7 @@ def get_history_file(name: str, step_id: str, run_id: str, filename: str, user: 
 def open_in_google_sheets(name: str, step_id: str, body: dict, user: dict = Depends(get_current_user)):
     """Upload XLSX to Google Sheets — resolves file from local FS or Supabase Storage."""
     filename = body.get("filename", "")
+    print(f"[SHEETS] Request: project={name}, step={step_id}, file={filename}, user={user['id']}")
     _SFMAP = {
         "1": "step1_extraction", "1.5": "step1_extraction", "1.6": "step1_extraction",
         "2": "step2_qcm", "3": "step3_metadata", "4": "step4_format",
@@ -1461,6 +1480,7 @@ def open_in_google_sheets(name: str, step_id: str, body: dict, user: dict = Depe
 
     # If not local, download from Supabase to a temp file
     if not file_path.exists():
+        print(f"[SHEETS] File not local, downloading from Supabase...")
         import tempfile
         storage_path = f"{user['id']}/{name}/{folder}/{filename}"
         try:
@@ -1469,14 +1489,25 @@ def open_in_google_sheets(name: str, step_id: str, body: dict, user: dict = Depe
             tmp.write(data)
             tmp.close()
             file_path = Path(tmp.name)
-        except Exception:
+            print(f"[SHEETS] Downloaded {len(data)} bytes to {file_path}")
+        except Exception as e:
+            print(f"[SHEETS] File not found in Supabase either: {e}")
             raise HTTPException(status_code=404, detail="File not found")
+    else:
+        print(f"[SHEETS] File found locally: {file_path} ({file_path.stat().st_size} bytes)")
+
+    # Check Google client secret exists
+    if not Path(GOOGLE_CLIENT_SECRET_PATH).exists():
+        print(f"[SHEETS] ERROR: Google client secret not found at {GOOGLE_CLIENT_SECRET_PATH}")
+        raise HTTPException(status_code=500, detail="Google client secret not configured on server")
 
     creds = _get_google_creds(user["id"])
     if not creds:
+        print(f"[SHEETS] No Google creds for user {user['id']} — returning 401 NOT_AUTHORIZED")
         raise HTTPException(status_code=401, detail="NOT_AUTHORIZED")
     try:
         from googleapiclient.http import MediaFileUpload
+        print(f"[SHEETS] Uploading to Google Drive...")
         drive_service = build("drive", "v3", credentials=creds)
         file_metadata = {"name": file_path.stem, "mimeType": "application/vnd.google-apps.spreadsheet"}
         media = MediaFileUpload(str(file_path),
@@ -1484,8 +1515,13 @@ def open_in_google_sheets(name: str, step_id: str, body: dict, user: dict = Depe
                                 resumable=True)
         uploaded = drive_service.files().create(body=file_metadata, media_body=media,
                                                 fields="id,webViewLink").execute()
-        return {"url": uploaded.get("webViewLink"), "id": uploaded.get("id")}
+        sheets_url = uploaded.get("webViewLink")
+        print(f"[SHEETS] Success! URL={sheets_url}")
+        return {"url": sheets_url, "id": uploaded.get("id")}
     except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"[SHEETS] Upload failed: {e}")
         raise HTTPException(status_code=500, detail=f"Google Sheets upload failed: {str(e)}")
 
 @app.post("/projects/{name}/step8/export-existing")

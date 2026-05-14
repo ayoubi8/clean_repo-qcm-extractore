@@ -5,32 +5,46 @@ import { TerminalLog } from '../components/pipeline/TerminalLog'
 import { AutoRunPanel } from '../components/autorun/AutoRunPanel'
 import { useEffect } from 'react'
 import { useSearchParams } from 'react-router-dom'
+import { useAppStore } from '../store/appStore'
 
 import { createPortal } from 'react-dom'
 
 export function Pipeline() {
   const [showAutoRun, setShowAutoRun] = useState(false)
-  const [searchParams] = useSearchParams()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const setActiveProject = useAppStore((s) => s.setActiveProject)
 
   useEffect(() => {
-    if (searchParams.get('sheets_pending') === '1') {
-      const project = searchParams.get('project') || ''
-      const step = searchParams.get('step') || ''
-      const filename = searchParams.get('filename') || ''
-      const BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
-      
-      if (project && step && filename) {
-        // Auto-retry the upload now that we have a token
-        fetch(`${BASE}/projects/${encodeURIComponent(project)}/steps/${step}/open-sheets`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ filename })
-        }).then(r => r.json()).then(data => {
-          if (data.url) window.open(data.url, '_blank')
-        }).catch(err => console.error('Auto-retry sheets upload failed:', err))
-      }
+    const sheetsPending = searchParams.get('sheets_pending') === '1'
+    const project      = searchParams.get('project') || ''
+    const step         = searchParams.get('step') || ''
+    const filename     = searchParams.get('filename') || ''
+    const BASE         = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
+    const token        = localStorage.getItem('qcm_token') || ''
+
+    // If project is in URL, activate it in the store so the sidebar shows it
+    if (project && setActiveProject) {
+      setActiveProject(project)
+    }
+
+    if (sheetsPending && project && step && filename) {
+      // Clear the URL params so a refresh doesn't re-trigger
+      setSearchParams({})
+      // Auto-retry the upload now that we have a Google token
+      fetch(`${BASE}/projects/${encodeURIComponent(project)}/steps/${step}/open-sheets`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { 'Authorization': `Bearer ${token}` } : {})
+        },
+        body: JSON.stringify({ filename })
+      }).then(r => r.json()).then(data => {
+        if (data.url) window.open(data.url, '_blank')
+        else console.error('Sheets upload succeeded but no URL returned:', data)
+      }).catch(err => console.error('Auto-retry sheets upload failed:', err))
     }
   }, [searchParams])
+
 
   return (
     <div className="flex flex-col h-[calc(100vh-64px)] overflow-hidden relative">
