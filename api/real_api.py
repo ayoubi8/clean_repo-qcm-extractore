@@ -540,11 +540,55 @@ def google_oauth_callback(code: str, state: str = ""):
     except Exception as e:
         print(f"[OAUTH] Local token save failed: {e}")
 
-    # Redirect back to the frontend — use FRONTEND_URL env var (set on HF Spaces)
+    # ── Immediately upload the file to Google Sheets ──────────────────────
     frontend_url = os.environ.get("FRONTEND_URL", "http://localhost:3000")
-    return RedirectResponse(
-        f"{frontend_url}/pipeline?sheets_pending=1&project={project}&step={step}&filename={filename}"
-    )
+    fallback_url = f"{frontend_url}/pipeline?project={project}&step={step}"
+
+    if project and filename and step:
+        try:
+            _SFMAP = {
+                "1": "step1_extraction", "1.5": "step1_extraction", "1.6": "step1_extraction",
+                "2": "step2_qcm", "3": "step3_metadata", "4": "step4_format",
+                "5": "step5_json", "6": "step6_corrections", "7": "step7_categories", "8": "step8_matches",
+            }
+            folder = _SFMAP.get(step, f"step{step}")
+            file_path = Path(f"/app/output/{user_id}/{project}/{folder}") / filename
+
+            # If not local, download from Supabase
+            if not file_path.exists():
+                import tempfile
+                storage_path = f"{user_id}/{project}/{folder}/{filename}"
+                data = read_bytes_file(storage_path)
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+                tmp.write(data); tmp.close()
+                file_path = Path(tmp.name)
+
+            from googleapiclient.http import MediaFileUpload
+            drive_service = build("drive", "v3", credentials=creds)
+            file_metadata = {
+                "name": Path(filename).stem,
+                "mimeType": "application/vnd.google-apps.spreadsheet"
+            }
+            media = MediaFileUpload(
+                str(file_path),
+                mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                resumable=True
+            )
+            uploaded = drive_service.files().create(
+                body=file_metadata, media_body=media, fields="id,webViewLink"
+            ).execute()
+            sheets_url = uploaded.get("webViewLink", "")
+            print(f"[OAUTH] File uploaded to Sheets: {sheets_url}")
+            if sheets_url:
+                return RedirectResponse(sheets_url)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"[OAUTH] Auto-upload failed: {e} — redirecting to pipeline")
+
+    return RedirectResponse(fallback_url)
+
+
 
 
 
