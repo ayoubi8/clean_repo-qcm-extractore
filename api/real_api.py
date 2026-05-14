@@ -542,7 +542,13 @@ def google_oauth_callback(code: str, state: str = ""):
 
     # ── Immediately upload the file to Google Sheets ──────────────────────
     frontend_url = os.environ.get("FRONTEND_URL", "http://localhost:3000")
-    fallback_url = f"{frontend_url}/pipeline?project={project}&step={step}"
+    fallback_url = (
+        f"{frontend_url}/pipeline"
+        f"?sheets_pending=1"
+        f"&project={project}"
+        f"&step={step}"
+        f"&filename={filename}"
+    )
 
     if project and filename and step:
         try:
