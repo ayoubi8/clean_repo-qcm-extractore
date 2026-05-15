@@ -558,9 +558,9 @@ def google_oauth_callback(code: str, state: str = ""):
     except Exception as e:
         print(f"[OAUTH] Local token save failed: {e}")
 
-    # ── Immediately upload the file to Google Sheets ──────────────────────
+    # Token saved — redirect back to frontend to retry the upload via /open-sheets
     frontend_url = os.environ.get("FRONTEND_URL", "http://localhost:3000")
-    fallback_url = (
+    return RedirectResponse(
         f"{frontend_url}/pipeline"
         f"?sheets_pending=1"
         f"&project={project}"
@@ -568,49 +568,7 @@ def google_oauth_callback(code: str, state: str = ""):
         f"&filename={filename}"
     )
 
-    if project and filename and step:
-        try:
-            _SFMAP = {
-                "1": "step1_extraction", "1.5": "step1_extraction", "1.6": "step1_extraction",
-                "2": "step2_qcm", "3": "step3_metadata", "4": "step4_format",
-                "5": "step5_json", "6": "step6_corrections", "7": "step7_categories", "8": "step8_matches",
-            }
-            folder = _SFMAP.get(step, f"step{step}")
-            file_path = Path(f"/app/output/{user_id}/{project}/{folder}") / filename
 
-            # If not local, download from Supabase
-            if not file_path.exists():
-                import tempfile
-                storage_path = f"{user_id}/{project}/{folder}/{filename}"
-                data = read_bytes_file(storage_path)
-                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
-                tmp.write(data); tmp.close()
-                file_path = Path(tmp.name)
-
-            from googleapiclient.http import MediaFileUpload
-            drive_service = build("drive", "v3", credentials=creds)
-            file_metadata = {
-                "name": Path(filename).stem,
-                "mimeType": "application/vnd.google-apps.spreadsheet"
-            }
-            media = MediaFileUpload(
-                str(file_path),
-                mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                resumable=True
-            )
-            uploaded = drive_service.files().create(
-                body=file_metadata, media_body=media, fields="id,webViewLink"
-            ).execute()
-            sheets_url = uploaded.get("webViewLink", "")
-            print(f"[OAUTH] File uploaded to Sheets: {sheets_url}")
-            if sheets_url:
-                return RedirectResponse(sheets_url)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            print(f"[OAUTH] Auto-upload failed: {e} — redirecting to pipeline")
-
-    return RedirectResponse(fallback_url)
 
 
 
@@ -1482,7 +1440,10 @@ def open_in_google_sheets(name: str, step_id: str, body: dict, user: dict = Depe
     if not file_path.exists():
         print(f"[SHEETS] File not local, downloading from Supabase...")
         import tempfile
-        storage_path = f"{user['id']}/{name}/{folder}/{filename}"
+        from urllib.parse import quote
+        # URL-encode path segments to handle special chars (parentheses, spaces, etc.)
+        storage_path = f"{user['id']}/{quote(name, safe='')}/{folder}/{quote(filename, safe='')}"
+        print(f"[SHEETS] Supabase path: {storage_path}")
         try:
             data = read_bytes_file(storage_path)
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
@@ -1493,6 +1454,7 @@ def open_in_google_sheets(name: str, step_id: str, body: dict, user: dict = Depe
         except Exception as e:
             print(f"[SHEETS] File not found in Supabase either: {e}")
             raise HTTPException(status_code=404, detail="File not found")
+
     else:
         print(f"[SHEETS] File found locally: {file_path} ({file_path.stat().st_size} bytes)")
 
