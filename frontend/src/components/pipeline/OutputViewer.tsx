@@ -133,17 +133,24 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
       });
 
       if (res.status === 401) {
-        if (newTab) newTab.close();
         // Read the body to distinguish JWT-expired vs Google-creds-missing
         let detail = '';
         try { detail = (await res.json()).detail || ''; } catch {}
 
         if (detail === 'NOT_AUTHORIZED') {
-          // No Google OAuth token — redirect to Google consent
+          // No Google OAuth token — redirect the pre-opened tab to Google consent
+          // so the main app window stays open and unchanged
           const encodedFile = encodeURIComponent(file.name);
           const jwt = localStorage.getItem('qcm_token') || '';
-          window.location.href = `${BASE}/auth/google?project=${encodeURIComponent(projectName)}&step=${stepId}&filename=${encodedFile}&token=${encodeURIComponent(jwt)}`;
+          const oauthUrl = `${BASE}/auth/google?project=${encodeURIComponent(projectName)}&step=${stepId}&filename=${encodedFile}&token=${encodeURIComponent(jwt)}`;
+          if (newTab) {
+            newTab.location.href = oauthUrl;
+          } else {
+            // Popup was blocked — fall back to opening a new window
+            window.open(oauthUrl, '_blank');
+          }
         } else {
+          if (newTab) newTab.close();
           // App JWT expired — ask user to re-login
           alert('Session expired. Please log in again.');
         }

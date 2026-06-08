@@ -16,38 +16,51 @@ export function Pipeline() {
 
   useEffect(() => {
     const sheetsPending = searchParams.get('sheets_pending') === '1'
-    const project      = searchParams.get('project') || ''
-    const step         = searchParams.get('step') || ''
-    const filename     = searchParams.get('filename') || ''
-    const BASE         = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
-    const token        = localStorage.getItem('qcm_token') || ''
+    const projectName   = searchParams.get('project') || ''
+    const step          = searchParams.get('step') || ''
+    const filename      = searchParams.get('filename') || ''
+    const BASE          = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
+    const token         = localStorage.getItem('qcm_token') || ''
+    const authHeaders: Record<string, string> = token ? { 'Authorization': `Bearer ${token}` } : {}
 
-    // If project is in URL, activate it in the store so the sidebar shows it
-    if (project && setActiveProject) {
-      setActiveProject(project)
-    }
+    if (!projectName) return
 
-    if (sheetsPending && project && step && filename) {
-      // Clear the URL params so a refresh doesn't re-trigger
-      setSearchParams({})
-      // Auto-retry the upload now that we have a Google token
-      fetch(`${BASE}/projects/${encodeURIComponent(project)}/steps/${step}/open-sheets`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(token ? { 'Authorization': `Bearer ${token}` } : {})
-        },
-        body: JSON.stringify({ filename })
-      }).then(r => r.json()).then(data => {
-        if (data.url) window.open(data.url, '_blank')
-        else console.error('Sheets upload succeeded but no URL returned:', data)
-      }).catch(err => console.error('Auto-retry sheets upload failed:', err))
-    }
+    // Clear URL params so a refresh doesn't re-trigger
+    setSearchParams({})
+
+    // Fetch full project object (has pdf_path, last_step, etc.) and activate it
+    fetch(`${BASE}/projects`, { headers: authHeaders })
+      .then(r => r.json())
+      .then(data => {
+        const found = (data.projects || []).find((p: any) => p.name === projectName)
+        if (found) setActiveProject(found)
+
+        // If sheets_pending, trigger upload then auto-redirect THIS tab to the sheet
+        // (this tab went through OAuth, it exists solely to complete the flow)
+        if (sheetsPending && step && filename) {
+          fetch(`${BASE}/projects/${encodeURIComponent(projectName)}/steps/${step}/open-sheets`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...authHeaders },
+            body: JSON.stringify({ filename })
+          })
+            .then(r => r.json())
+            .then(res => {
+              if (res.url) {
+                // Auto-redirect: this tab goes straight to the Google Sheet
+                window.location.href = res.url;
+              } else {
+                console.error('Sheets retry: no URL returned', res)
+              }
+            })
+            .catch(err => console.error('Sheets retry failed:', err))
+        }
+      })
+      .catch(err => console.error('Pipeline: failed to load projects', err))
   }, [searchParams])
-
 
   return (
     <div className="flex flex-col h-[calc(100vh-64px)] overflow-hidden relative">
+
       {/* Header with Auto Run trigger */}
       <div className="h-14 bg-surface-container-low border-b border-outline-variant/10 flex items-center justify-end px-6 shrink-0">
         <button
@@ -62,17 +75,12 @@ export function Pipeline() {
 
       {/* Main two-column area */}
       <div className="flex flex-1 overflow-hidden">
-        {/* LEFT — Step list */}
         <StepList />
-
-        {/* RIGHT — Config panel */}
         <ConfigPanel />
       </div>
 
-      {/* BOTTOM — Terminal log */}
       <TerminalLog />
 
-      {/* Slide-over Drawer */}
       {showAutoRun && createPortal(<AutoRunPanel onClose={() => setShowAutoRun(false)} />, document.body)}
     </div>
   )
