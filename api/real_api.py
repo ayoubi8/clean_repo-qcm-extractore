@@ -586,21 +586,25 @@ async def upload_project_pdf(name: str, file: UploadFile = File(...), user: dict
     storage_pdf_path = f"{user['id']}/{name}/source.pdf"
 
     # Upload to Supabase Storage (cloud-persistent)
-    try:
-        write_bytes_file(storage_pdf_path, content)
-        write_file(
-            f"{user['id']}/{name}/project.json",
-            json.dumps({"name": name, "pdf_path": storage_pdf_path})
-        )
-    except Exception as e:
-        print(f"[STORAGE] PDF upload to Supabase failed: {e}")
-
-    # Also write to local filesystem (pipeline modules read from here)
+    # Store the absolute local path in project.json so that after a container
+    # restart, list_projects restores the correct path and Step 1 can find the file.
     project_dir = Path(f"/app/output/{user['id']}/{name}")
     project_dir.mkdir(parents=True, exist_ok=True)
     local_pdf_path = project_dir / "source.pdf"
     local_pdf_path.write_bytes(content)
-    internal_path = str(local_pdf_path)
+    internal_path = str(local_pdf_path)          # /app/output/{uid}/{name}/source.pdf
+
+    try:
+        write_bytes_file(storage_pdf_path, content)
+        # ✅ Store the LOCAL absolute path so restored project.json is correct
+        write_file(
+            f"{user['id']}/{name}/project.json",
+            json.dumps({"name": name, "pdf_path": internal_path})
+        )
+    except Exception as e:
+        print(f"[STORAGE] PDF upload to Supabase failed: {e}")
+
+    # Write the same project.json locally
     (project_dir / "project.json").write_text(
         json.dumps({"name": name, "pdf_path": internal_path})
     )
@@ -808,6 +812,24 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
 
             await loop.run_in_executor(None, _do_archive)
 
+        # Ensure source.pdf is on local disk before running any step.
+        # After a container restart the local FS is wiped; download from Supabase.
+        local_pdf = Path(f"/app/output/{user_id}/{project}/source.pdf")
+        if not local_pdf.exists():
+            storage_pdf = f"{user_id}/{project}/source.pdf"
+            try:
+                if file_exists(storage_pdf):
+                    local_pdf.parent.mkdir(parents=True, exist_ok=True)
+                    local_pdf.write_bytes(read_bytes_file(storage_pdf))
+                    # Also fix project.json so pdf_path points to the local file
+                    pjson_local = local_pdf.parent / "project.json"
+                    pjson_local.write_text(json.dumps({"name": project, "pdf_path": str(local_pdf)}))
+                    print(f"[RESTORE] ✅ PDF restored from Supabase to {local_pdf}")
+                else:
+                    print(f"[RESTORE] ⚠️ source.pdf not in Supabase at {storage_pdf}")
+            except Exception as _e:
+                print(f"[RESTORE] ❌ PDF download failed: {_e}")
+
         await loop.run_in_executor(None, _run_with_capture)
 
         job_manager.set_done(project, step_id)
@@ -997,7 +1019,9 @@ def _call_step(step_id: str, tracker, context, config: dict):
 
     step_map = {
         "1":   lambda: Step1Extraction(tracker, context).run(
-                    pdf_path=config.get("pdf_path", ""),
+                    # Always use the canonical local path — config.pdf_path may be
+                    # stale (e.g. a Supabase storage key) after a container restart.
+                    pdf_path=str(Path(f"/app/output/{context.name}/source.pdf")),
                     auto_ocr=(config.get("method", "") == "vision_ocr"),
                     ocr_guidance=config.get("ocr_guidance", "")
                ),
