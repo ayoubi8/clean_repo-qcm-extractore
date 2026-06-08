@@ -39,7 +39,7 @@ def mask(val: str) -> str:
     return val[:8] + "****" + val[-4:]
 
 def write_env_keys(updates: dict):
-    """Only updates EDITABLE_KEYS, preserves all other lines."""
+    """Only updates EDITABLE_KEYS, preserves all other lines. Skips masked values."""
     if not ENV_PATH.exists():
         ENV_PATH.touch()
         
@@ -55,8 +55,13 @@ def write_env_keys(updates: dict):
         if stripped and not stripped.startswith("#") and "=" in stripped:
             key = stripped.split("=", 1)[0].strip()
             if key in updates and key in EDITABLE_KEYS:
-                new_lines.append(f"{key}={updates[key]}")
-                updated_keys.add(key)
+                val = updates[key]
+                # Safeguard: do not write masked keys
+                if "*" in val or val == "****":
+                    new_lines.append(line)
+                else:
+                    new_lines.append(f"{key}={val}")
+                    updated_keys.add(key)
                 processed_keys.add(key)
                 continue
         new_lines.append(line)
@@ -64,8 +69,21 @@ def write_env_keys(updates: dict):
     # Append any keys that weren't in the file yet
     for key, val in updates.items():
         if key in EDITABLE_KEYS and key not in processed_keys:
+            # Safeguard: do not write masked keys
+            if "*" in val or val == "****":
+                continue
             new_lines.append(f"{key}={val}")
             updated_keys.add(key)
             
     ENV_PATH.write_text("\n".join(new_lines) + "\n")
+    
+    # Upload to Supabase Storage for persistence across restarts
+    try:
+        from storage_client import write_file
+        write_file("config/.env", ENV_PATH.read_text())
+        print("[ENV] ✅ Uploaded updated .env to Supabase Storage")
+    except Exception as e:
+        print(f"[ENV] ❌ Failed to upload .env to Supabase Storage: {e}")
+        
     return list(updated_keys)
+

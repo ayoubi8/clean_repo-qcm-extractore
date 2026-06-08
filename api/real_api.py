@@ -52,6 +52,20 @@ async def _startup():
     """Seed admin user and decode Google credentials on every container start."""
     ensure_admin_exists()
 
+    # Restore .env from Supabase Storage for persistence across restarts
+    try:
+        if file_exists("config/.env"):
+            env_content = read_file("config/.env")
+            dest_path = Path("/app/.env")
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            dest_path.write_text(env_content)
+            print("[STARTUP] ✅ Restored .env from Supabase Storage")
+            load_dotenv(str(dest_path), override=True)
+            print("[STARTUP] ✅ Reloaded env variables with override=True")
+    except Exception as e:
+        print(f"[STARTUP] ❌ Failed to restore .env from Supabase Storage: {e}")
+
+
     # Decode Google OAuth client secret from base64 env var → write to disk
     google_secret_b64 = os.environ.get("GOOGLE_CLIENT_SECRET_B64", "")
     if google_secret_b64:
@@ -371,6 +385,8 @@ def _apply_user_env(user: dict):
         os.environ["GEMINI_API_KEY"] = key
         os.environ["OPENAI_API_KEY"] = key
         os.environ["ANTHROPIC_API_KEY"] = key
+        os.environ["OPENROUTER_API_KEY"] = key
+
 
 # --- Project Endpoints ---
 

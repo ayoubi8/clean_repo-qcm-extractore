@@ -32,6 +32,15 @@ class OpenRouterClient:
         self.site_url = os.getenv("SITE_URL", "https://local.dev")
         self.site_name = os.getenv("SITE_NAME", "QCM Extractor")
         
+        # Masked key log for debugging
+        masked_key = "None"
+        if self.api_key:
+            if len(self.api_key) <= 8:
+                masked_key = "****"
+            else:
+                masked_key = self.api_key[:8] + "****" + self.api_key[-4:]
+        print(f"[OpenRouterClient] Loaded API Key: {masked_key}")
+
         # Headers required by OpenRouter
         self.headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -39,6 +48,7 @@ class OpenRouterClient:
             "X-Title": self.site_name,
             "Content-Type": "application/json"
         }
+
         
     def _encode_image(self, image: Image.Image, format: str = "JPEG") -> str:
         """
