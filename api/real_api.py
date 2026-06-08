@@ -790,6 +790,7 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
         step_dir = Path(f"/app/output/{user_id}/{project}/{folder_name}")
 
         # Archive previous run to _history/ (local + Supabase)
+        loop = asyncio.get_event_loop()
         if step_dir.exists() and any(step_dir.iterdir()):
             archive_ts = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
             archive_local = Path(f"/app/output/{user_id}/{project}/_history/step{step_id}/{archive_ts}")
@@ -807,7 +808,6 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
 
             await loop.run_in_executor(None, _do_archive)
 
-        loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, _run_with_capture)
 
         job_manager.set_done(project, step_id)
