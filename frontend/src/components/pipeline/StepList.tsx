@@ -164,13 +164,17 @@ export function StepList() {
   const openPdf = async () => {
     if (!activeProject) return
     setPdfLoading(true)
+    const newTab = window.open('about:blank', '_blank')
     try {
       const blobUrl = await fetchAuthenticatedBlobUrl(
         `${BASE}/projects/${encodeURIComponent(activeProject.name)}/pdf`
       )
-      window.open(blobUrl, '_blank')
+      if (newTab) {
+        newTab.location.href = blobUrl
+      }
       setTimeout(() => URL.revokeObjectURL(blobUrl), 30000)
     } catch {
+      if (newTab) newTab.close()
       alert('Could not open PDF. Make sure the project has a PDF uploaded.')
     } finally {
       setPdfLoading(false)

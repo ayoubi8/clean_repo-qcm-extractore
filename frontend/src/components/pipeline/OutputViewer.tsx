@@ -42,7 +42,7 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
 
       // 2. Always load history metadata on mount — lightweight check
       try {
-        const res = await fetch(`${BASE}/projects/${projectName}/steps/${stepId}/history`, {
+        const res = await fetch(`${BASE}/projects/${encodeURIComponent(projectName)}/steps/${stepId}/history`, {
           headers: getAuthHeaders()
         });
         const hdata = await res.json();
@@ -65,7 +65,7 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
     // Called on manual refresh via the button toggle
     setHistoryLoading(true);
     try {
-      const res = await fetch(`${BASE}/projects/${projectName}/steps/${stepId}/history`, {
+      const res = await fetch(`${BASE}/projects/${encodeURIComponent(projectName)}/steps/${stepId}/history`, {
         headers: getAuthHeaders()
       });
       const data = await res.json();
@@ -89,7 +89,7 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
     setPreviewLoading(true);
     try {
       const encodedName = file.name.split('/').map(encodeURIComponent).join('/');
-      const res = await fetch(`${BASE}/projects/${projectName}/steps/${stepId}/output/${encodedName}`, {
+      const res = await fetch(`${BASE}/projects/${encodeURIComponent(projectName)}/steps/${stepId}/output/${encodedName}`, {
         headers: getAuthHeaders()
       });
       const data = await res.json();
@@ -103,34 +103,37 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
 
   const getDownloadUrl = (filename: string) => {
     const encodedName = filename.split('/').map(encodeURIComponent).join('/');
-    return `${BASE}/projects/${projectName}/steps/${stepId}/download/${encodedName}`;
+    return `${BASE}/projects/${encodeURIComponent(projectName)}/steps/${stepId}/download/${encodedName}`;
   };
 
   const getViewUrl = (filename: string) => {
     const encodedName = filename.split('/').map(encodeURIComponent).join('/');
-    return `${BASE}/projects/${projectName}/steps/${stepId}/view/${encodedName}`;
+    return `${BASE}/projects/${encodeURIComponent(projectName)}/steps/${stepId}/view/${encodedName}`;
   };
 
   const getHistoryDownloadUrl = (runId: string, filename: string) => {
     const encodedName = filename.split('/').map(encodeURIComponent).join('/');
-    return `${BASE}/projects/${projectName}/steps/${stepId}/history/${runId}/${encodedName}`;
+    return `${BASE}/projects/${encodeURIComponent(projectName)}/steps/${stepId}/history/${runId}/${encodedName}`;
   };
 
   const getHistoryViewUrl = (runId: string, filename: string) => {
     const encodedName = filename.split('/').map(encodeURIComponent).join('/');
-    return `${BASE}/projects/${projectName}/steps/${stepId}/history/${runId}/${encodedName}`;
+    return `${BASE}/projects/${encodeURIComponent(projectName)}/steps/${stepId}/history/${runId}/${encodedName}`;
   };
 
   const openInSheets = async (file: any) => {
     setSheetsLoading(file.name);
+    // Pre-open window immediately to bypass popup blocker
+    const newTab = window.open('about:blank', '_blank');
     try {
-      const res = await fetch(`${BASE}/projects/${projectName}/steps/${stepId}/open-sheets`, {
+      const res = await fetch(`${BASE}/projects/${encodeURIComponent(projectName)}/steps/${stepId}/open-sheets`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
         body: JSON.stringify({ filename: file.name })
       });
 
       if (res.status === 401) {
+        if (newTab) newTab.close();
         // Read the body to distinguish JWT-expired vs Google-creds-missing
         let detail = '';
         try { detail = (await res.json()).detail || ''; } catch {}
@@ -148,6 +151,7 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
       }
 
       if (!res.ok) {
+        if (newTab) newTab.close();
         let errMsg = 'Upload to Google Sheets failed';
         try { errMsg = (await res.json()).detail || errMsg; } catch {}
         alert(errMsg);
@@ -156,11 +160,15 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
 
       const data = await res.json();
       if (data.url) {
-        window.open(data.url, '_blank');
+        if (newTab) {
+          newTab.location.href = data.url;
+        }
       } else {
+        if (newTab) newTab.close();
         alert('Google Sheets upload succeeded but no URL was returned.');
       }
     } catch (e: any) {
+      if (newTab) newTab.close();
       console.error('Google Sheets error:', e);
       alert(`Google Sheets error: ${e.message || 'Unknown error'}`);
     } finally {
@@ -290,6 +298,8 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
                       openInSheets(file);
                       return;
                     }
+                    // Pre-open window immediately to bypass popup blocker
+                    const newTab = window.open('about:blank', '_blank');
                     const url = showHistory
                       ? getHistoryViewUrl(selectedRun!, file.name)
                       : (file.name.endsWith('.json') || file.name.endsWith('.pdf')
@@ -297,9 +307,14 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
                           : getDownloadUrl(file.name));
                     try {
                       const blobUrl = await fetchAuthenticatedBlobUrl(url);
-                      window.open(blobUrl, '_blank');
+                      if (newTab) {
+                        newTab.location.href = blobUrl;
+                      }
                       setTimeout(() => URL.revokeObjectURL(blobUrl), 30000);
-                    } catch { alert('Could not open file.'); }
+                    } catch {
+                      if (newTab) newTab.close();
+                      alert('Could not open file.');
+                    }
                   }}
                   title={file.name.endsWith('.xlsx') ? 'Open in Google Sheets' : 'Open in new tab'}
                   disabled={file.name.endsWith('.xlsx') && sheetsLoading === file.name}

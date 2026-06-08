@@ -119,7 +119,7 @@ export async function uploadProjectPdf(
     formData.append('file', file)
 
     const xhr = new XMLHttpRequest()
-    xhr.open('POST', `${BASE}/projects/${projectName}/pdf`)
+    xhr.open('POST', `${BASE}/projects/${encodeURIComponent(projectName)}/pdf`)
 
     const token = localStorage.getItem("qcm_token")
     if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`)
@@ -148,7 +148,7 @@ export async function uploadProjectPdf(
 
 // POST /projects/{name}/steps/{stepId}/run
 export async function runStep(projectName: string, stepId: number, config: object) {
-  const res = await fetchWithRefresh(`${BASE}/projects/${projectName}/steps/${stepId}/run`, {
+  const res = await fetchWithRefresh(`${BASE}/projects/${encodeURIComponent(projectName)}/steps/${stepId}/run`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
     body: JSON.stringify(config),
@@ -159,7 +159,7 @@ export async function runStep(projectName: string, stepId: number, config: objec
 
 // GET /projects/{name}/steps/{stepId}/status
 export async function getStepStatus(projectName: string, stepId: number): Promise<{ status: any, output_exists: boolean }> {
-  const res = await fetchWithRefresh(`${BASE}/projects/${projectName}/steps/${stepId}/status`, {
+  const res = await fetchWithRefresh(`${BASE}/projects/${encodeURIComponent(projectName)}/steps/${stepId}/status`, {
     headers: { ...getAuthHeaders() }
   })
   if (!res.ok) throw new Error('Failed to get step status')
@@ -183,7 +183,7 @@ export function connectLogStream(
   onClose: () => void
 ): WebSocket {
   const wsBase = BASE.replace('http', 'ws')
-  const ws = new WebSocket(`${wsBase}/ws/log/${projectName}/${stepId}`)
+  const ws = new WebSocket(`${wsBase}/ws/log/${encodeURIComponent(projectName)}/${stepId}`)
 
   ws.onmessage = (event) => {
     try {
@@ -216,7 +216,7 @@ export async function startAutoRun(
   projectName: string,
   payload: any
 ): Promise<{ job_id: string }> {
-  const res = await fetchWithRefresh(`${BASE}/projects/${projectName}/autorun`, {
+  const res = await fetchWithRefresh(`${BASE}/projects/${encodeURIComponent(projectName)}/autorun`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
     body: JSON.stringify(payload),
@@ -227,7 +227,7 @@ export async function startAutoRun(
 
 // GET /projects/{name}/costs
 export async function fetchCosts(projectName: string): Promise<any> {
-  const res = await fetchWithRefresh(`${BASE}/projects/${projectName}/costs`, {
+  const res = await fetchWithRefresh(`${BASE}/projects/${encodeURIComponent(projectName)}/costs`, {
     headers: { ...getAuthHeaders() }
   })
   if (!res.ok) throw new Error('Failed to fetch costs')
@@ -236,7 +236,7 @@ export async function fetchCosts(projectName: string): Promise<any> {
 
 // POST /projects/{name}/costs/save
 export async function saveCosts(projectName: string): Promise<{ saved_to: string }> {
-  const res = await fetchWithRefresh(`${BASE}/projects/${projectName}/costs/save`, {
+  const res = await fetchWithRefresh(`${BASE}/projects/${encodeURIComponent(projectName)}/costs/save`, {
     method: 'POST',
     headers: { ...getAuthHeaders() }
   })
@@ -246,7 +246,7 @@ export async function saveCosts(projectName: string): Promise<{ saved_to: string
 
 // POST /projects/{name}/step8/export-existing
 export async function exportExisting(projectName: string, body?: object): Promise<any> {
-  const res = await fetchWithRefresh(`${BASE}/projects/${projectName}/step8/export-existing`, {
+  const res = await fetchWithRefresh(`${BASE}/projects/${encodeURIComponent(projectName)}/step8/export-existing`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
     body: JSON.stringify(body ?? {}),
@@ -322,7 +322,7 @@ export async function fetchStepModels(): Promise<any> {
 
 // GET /projects/{name}/steps/{step_id}/output
 export async function fetchStepOutput(projectName: string, stepId: string): Promise<{ files: any[] }> {
-  const res = await fetchWithRefresh(`${BASE}/projects/${projectName}/steps/${stepId}/output`, {
+  const res = await fetchWithRefresh(`${BASE}/projects/${encodeURIComponent(projectName)}/steps/${stepId}/output`, {
     headers: { ...getAuthHeaders() }
   })
   if (!res.ok) throw new Error('Failed to fetch step output list')
@@ -333,7 +333,7 @@ export async function fetchStepOutput(projectName: string, stepId: string): Prom
 export async function fetchStepFileContent(projectName: string, stepId: string, filename: string): Promise<any> {
   const encodedFilename = filename.split('/').map(encodeURIComponent).join('/')
   const res = await fetchWithRefresh(
-    `${BASE}/projects/${projectName}/steps/${stepId}/output/${encodedFilename}`,
+    `${BASE}/projects/${encodeURIComponent(projectName)}/steps/${stepId}/output/${encodedFilename}`,
     { headers: { ...getAuthHeaders() } }
   )
   if (!res.ok) throw new Error('Failed to fetch file content')
@@ -341,7 +341,7 @@ export async function fetchStepFileContent(projectName: string, stepId: string, 
 }
 
 export async function fetchStepHistory(projectName: string): Promise<any> {
-  const res = await fetchWithRefresh(`${BASE}/projects/${projectName}/step-history`, {
+  const res = await fetchWithRefresh(`${BASE}/projects/${encodeURIComponent(projectName)}/step-history`, {
     headers: { ...getAuthHeaders() }
   })
   if (!res.ok) return {}

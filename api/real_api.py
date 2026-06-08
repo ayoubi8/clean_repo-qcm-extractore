@@ -58,8 +58,10 @@ async def _startup():
         import base64
         try:
             secret_bytes = base64.b64decode(google_secret_b64)
-            Path("/app/google_client_secret.json").write_bytes(secret_bytes)
-            print("[STARTUP] ✅ Google client secret written to /app/google_client_secret.json")
+            secret_path = Path(GOOGLE_CLIENT_SECRET_PATH)
+            secret_path.parent.mkdir(parents=True, exist_ok=True)
+            secret_path.write_bytes(secret_bytes)
+            print(f"[STARTUP] ✅ Google client secret written to {GOOGLE_CLIENT_SECRET_PATH}")
         except Exception as e:
             print(f"[STARTUP] ❌ Could not decode GOOGLE_CLIENT_SECRET_B64: {e}")
     else:
@@ -406,7 +408,7 @@ def create_project(body: dict, user: dict = Depends(get_current_user)):
     }
 
 # --- Google Sheets Config ---
-GOOGLE_CLIENT_SECRET_PATH = "/app/google_client_secret.json"
+GOOGLE_CLIENT_SECRET_PATH = "/app/google_client_secret.json" if Path("/app").exists() else str(Path(__file__).parent / "google_client_secret.json")
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.file",
