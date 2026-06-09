@@ -1,7 +1,7 @@
 from pathlib import Path
 import os
 
-ENV_PATH = Path("/app/.env")
+ENV_PATH = Path("/app/.env") if Path("/app").exists() else Path(__file__).parent.parent / ".env"
 EDITABLE_KEYS = {
     "OPENROUTER_API_KEY", "ENABLE_CACHING",
     "STEP1_MODEL", "STEP1_FALLBACK_MODEL",

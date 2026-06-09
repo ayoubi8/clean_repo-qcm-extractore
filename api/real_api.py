@@ -20,8 +20,8 @@ from google.auth.transport.requests import Request as GoogleAuthRequest
 from googleapiclient.discovery import build
 from fastapi.middleware.cors import CORSMiddleware
 
-load_dotenv("/app/.env", override=False)   # local Docker; on HF Spaces this file won't exist
-load_dotenv(override=False)                  # fallback: .env in cwd (local dev)
+load_dotenv("/app/.env" if Path("/app").exists() else ".env", override=False)
+load_dotenv(override=False)
 
 
 # Setup path to include the root /app (so modules can be imported)
@@ -56,7 +56,7 @@ async def _startup():
     try:
         if file_exists("config/.env"):
             env_content = read_file("config/.env")
-            dest_path = Path("/app/.env")
+            dest_path = Path("/app/.env") if Path("/app").exists() else Path(__file__).parent / ".env"
             dest_path.parent.mkdir(parents=True, exist_ok=True)
             dest_path.write_text(env_content)
             print("[STARTUP] ✅ Restored .env from Supabase Storage")

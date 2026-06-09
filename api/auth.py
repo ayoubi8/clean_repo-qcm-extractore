@@ -275,7 +275,9 @@ async def get_current_user(authorization: str = Header(None)) -> dict:
     if email == ADMIN_EMAIL:
         user = find_user_by_email(ADMIN_EMAIL)
         if user:
-            return user
+            user_copy = dict(user)
+            user_copy["id"] = "admin"
+            return user_copy
         return {
             "email":       ADMIN_EMAIL,
             "is_admin":    True,
