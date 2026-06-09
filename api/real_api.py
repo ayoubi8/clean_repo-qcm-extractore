@@ -630,11 +630,22 @@ async def upload_project_pdf(name: str, file: UploadFile = File(...), user: dict
 
 # --- Reference Database Management Endpoints ---
 
+def _get_user_db_id(user: dict) -> str:
+    """Helper to return the actual database UUID for the user (resolves 'admin' placeholder to UUID)."""
+    from auth import find_user_by_email, ADMIN_EMAIL
+    user_id = user.get("id", "")
+    if user_id == "admin":
+        admin_record = find_user_by_email(ADMIN_EMAIL)
+        if admin_record:
+            return admin_record["id"]
+    return user_id
+
 @app.get("/ref-db")
 def list_ref_dbs(user: dict = Depends(get_current_user)):
     """List all reference databases uploaded by the current user."""
     sb = get_supabase()
-    res = sb.table("reference_databases").select("*").eq("user_id", user["id"]).order("created_at").execute()
+    user_id = _get_user_db_id(user)
+    res = sb.table("reference_databases").select("*").eq("user_id", user_id).order("created_at").execute()
     return {"files": res.data or []}
 
 @app.post("/ref-db/upload")
@@ -646,7 +657,8 @@ async def upload_ref_db(file: UploadFile = File(...), user: dict = Depends(get_c
     
     # Enforce limit of max 5 files per user
     sb = get_supabase()
-    existing_res = sb.table("reference_databases").select("id").eq("user_id", user["id"]).execute()
+    user_id = _get_user_db_id(user)
+    existing_res = sb.table("reference_databases").select("id").eq("user_id", user_id).execute()
     if len(existing_res.data or []) >= 5:
         raise HTTPException(status_code=400, detail="Maximum limit of 5 reference database files reached. Please delete an existing file first.")
     
@@ -693,7 +705,7 @@ async def upload_ref_db(file: UploadFile = File(...), user: dict = Depends(get_c
         raise HTTPException(status_code=500, detail=f"Failed to upload to storage: {str(e)}")
     
     db_record = {
-        "user_id": user["id"],
+        "user_id": user_id,
         "filename": filename,
         "storage_path": storage_path,
         "size_bytes": size_bytes,
@@ -702,7 +714,7 @@ async def upload_ref_db(file: UploadFile = File(...), user: dict = Depends(get_c
     
     try:
         # Delete if existing file with same name exists to avoid UNIQUE constraint violation
-        sb.table("reference_databases").delete().eq("user_id", user["id"]).eq("filename", filename).execute()
+        sb.table("reference_databases").delete().eq("user_id", user_id).eq("filename", filename).execute()
         res = sb.table("reference_databases").insert(db_record).execute()
         record = res.data[0] if res.data else db_record
     except Exception as e:
@@ -727,7 +739,8 @@ async def upload_ref_db(file: UploadFile = File(...), user: dict = Depends(get_c
 def delete_ref_db(file_id: str, user: dict = Depends(get_current_user)):
     """Delete reference database record from database, cloud storage, and local cache."""
     sb = get_supabase()
-    res = sb.table("reference_databases").select("*").eq("id", file_id).eq("user_id", user["id"]).limit(1).execute()
+    user_id = _get_user_db_id(user)
+    res = sb.table("reference_databases").select("*").eq("id", file_id).eq("user_id", user_id).limit(1).execute()
     if not res.data:
         raise HTTPException(status_code=404, detail="Reference database file not found")
     
