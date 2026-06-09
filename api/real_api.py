@@ -641,17 +641,24 @@ def _get_user_db_id(user: dict) -> str:
     return user_id
 
 @app.get("/ref-db/diagnose")
-def diagnose_ref_db(user: dict = Depends(get_current_user)):
-    """Diagnostic: check if reference_databases table exists and return row count."""
+def diagnose_ref_db():
+    """Public diagnostic: check if reference_databases table exists."""
     sb = get_supabase()
-    user_id = _get_user_db_id(user)
-    result = {"user_id": user_id, "table_exists": False, "row_count": None, "error": None}
+    result = {"table_exists": False, "row_count": None, "error": None, "users_table_ok": False}
     try:
-        res = sb.table("reference_databases").select("id").eq("user_id", user_id).execute()
+        # Check if reference_databases table exists by selecting count
+        res = sb.table("reference_databases").select("id").limit(1).execute()
         result["table_exists"] = True
         result["row_count"] = len(res.data or [])
     except Exception as e:
         result["error"] = str(e)
+    try:
+        # Also verify users table is accessible
+        res2 = sb.table("users").select("id").limit(1).execute()
+        result["users_table_ok"] = True
+        result["users_count"] = len(res2.data or [])
+    except Exception as e2:
+        result["users_error"] = str(e2)
     return result
 
 @app.get("/ref-db")
