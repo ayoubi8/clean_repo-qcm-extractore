@@ -451,3 +451,42 @@ export async function fetchAdminUserProjects(uid: string): Promise<any> {
   if (!res.ok) throw new Error('Failed to fetch user projects')
   return res.json()
 }
+
+// ---------------------------------------------------------------------------
+// Reference Databases
+// ---------------------------------------------------------------------------
+
+// GET /ref-db
+export async function fetchRefDbs(): Promise<any[]> {
+  const res = await fetchWithRefresh(`${BASE}/ref-db`, {
+    headers: { ...getAuthHeaders() }
+  })
+  if (!res.ok) throw new Error('Failed to fetch reference databases')
+  const data = await res.json()
+  return data.files
+}
+
+// POST /ref-db/upload
+export async function uploadRefDb(file: File): Promise<any> {
+  const formData = new FormData()
+  formData.append('file', file)
+  const res = await fetchWithRefresh(`${BASE}/ref-db/upload`, {
+    method: 'POST',
+    headers: { ...getAuthHeaders() },
+    body: formData
+  })
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}))
+    throw new Error(errData.detail || 'Failed to upload reference database')
+  }
+  return res.json()
+}
+
+// DELETE /ref-db/{id}
+export async function deleteRefDb(id: string): Promise<void> {
+  const res = await fetchWithRefresh(`${BASE}/ref-db/${id}`, {
+    method: 'DELETE',
+    headers: { ...getAuthHeaders() }
+  })
+  if (!res.ok) throw new Error('Failed to delete reference database')
+}

@@ -628,6 +628,133 @@ async def upload_project_pdf(name: str, file: UploadFile = File(...), user: dict
     return {"pdf_path": internal_path, "size_bytes": len(content)}
 
 
+# --- Reference Database Management Endpoints ---
+
+@app.get("/ref-db")
+def list_ref_dbs(user: dict = Depends(get_current_user)):
+    """List all reference databases uploaded by the current user."""
+    sb = get_supabase()
+    res = sb.table("reference_databases").select("*").eq("user_id", user["id"]).order("created_at").execute()
+    return {"files": res.data or []}
+
+@app.post("/ref-db/upload")
+async def upload_ref_db(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+    """Upload reference database, parse line count, upload to Supabase storage, cache locally, and store metadata in DB."""
+    filename = file.filename
+    if not filename.lower().endswith((".xlsx", ".xls", ".json")):
+        raise HTTPException(status_code=400, detail="Only Excel (.xlsx, .xls) and JSON (.json) files are accepted")
+    
+    # Enforce limit of max 5 files per user
+    sb = get_supabase()
+    existing_res = sb.table("reference_databases").select("id").eq("user_id", user["id"]).execute()
+    if len(existing_res.data or []) >= 5:
+        raise HTTPException(status_code=400, detail="Maximum limit of 5 reference database files reached. Please delete an existing file first.")
+    
+    content = await file.read()
+    size_bytes = len(content)
+    
+    # Parse file to determine total line/QCM count
+    line_count = 0
+    try:
+        import io
+        if filename.lower().endswith(".json"):
+            data = json.loads(content.decode("utf-8"))
+            if isinstance(data, list):
+                line_count = len(data)
+            elif isinstance(data, dict):
+                for key in ("qcms", "questions", "data", "items"):
+                    if key in data and isinstance(data[key], list):
+                        line_count = len(data[key])
+                        break
+                else:
+                    line_count = len(data.keys())
+        else:
+            # Excel files: try pandas first, fall back to openpyxl
+            try:
+                import pandas as pd
+                df = pd.read_excel(io.BytesIO(content))
+                line_count = len(df)
+            except Exception:
+                from openpyxl import load_workbook
+                wb = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+                ws = wb.active
+                rows = list(ws.iter_rows(values_only=True))
+                count = sum(1 for r in rows if any(v is not None for v in r))
+                line_count = max(0, count - 1)  # Subtract header row
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to parse reference database: {str(e)}")
+    
+    storage_path = f"{user['id']}/ref_dbs/{filename}"
+    
+    # Upload to Supabase Storage
+    try:
+        write_bytes_file(storage_path, content)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to upload to storage: {str(e)}")
+    
+    db_record = {
+        "user_id": user["id"],
+        "filename": filename,
+        "storage_path": storage_path,
+        "size_bytes": size_bytes,
+        "line_count": line_count
+    }
+    
+    try:
+        # Delete if existing file with same name exists to avoid UNIQUE constraint violation
+        sb.table("reference_databases").delete().eq("user_id", user["id"]).eq("filename", filename).execute()
+        res = sb.table("reference_databases").insert(db_record).execute()
+        record = res.data[0] if res.data else db_record
+    except Exception as e:
+        try:
+            # Clean up uploaded storage file if database recording fails
+            sb.storage.from_("qcm-projects").remove([storage_path])
+        except:
+            pass
+        raise HTTPException(status_code=500, detail=f"Failed to save record to database: {str(e)}")
+    
+    # Cache locally on the container filesystem for execution compatibility
+    try:
+        local_dir = Path(f"/app/output/{user['id']}/ref_dbs")
+        local_dir.mkdir(parents=True, exist_ok=True)
+        (local_dir / filename).write_bytes(content)
+    except Exception as e:
+        print(f"[REF-DB] Local write failed: {e}")
+    
+    return record
+
+@app.delete("/ref-db/{file_id}")
+def delete_ref_db(file_id: str, user: dict = Depends(get_current_user)):
+    """Delete reference database record from database, cloud storage, and local cache."""
+    sb = get_supabase()
+    res = sb.table("reference_databases").select("*").eq("id", file_id).eq("user_id", user["id"]).limit(1).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Reference database file not found")
+    
+    record = res.data[0]
+    filename = record["filename"]
+    storage_path = record["storage_path"]
+    
+    # Delete from Database
+    sb.table("reference_databases").delete().eq("id", file_id).execute()
+    
+    # Delete from Supabase Storage
+    try:
+        sb.storage.from_("qcm-projects").remove([storage_path])
+    except Exception as e:
+        print(f"[STORAGE] Failed to delete reference db from storage: {e}")
+    
+    # Delete local cached file
+    try:
+        local_file = Path(f"/app/output/{user['id']}/ref_dbs/{filename}")
+        if local_file.exists():
+            local_file.unlink()
+    except Exception as e:
+        print(f"[REF-DB] Failed to delete local file: {e}")
+        
+    return {"status": "deleted", "id": file_id}
+
+
 @app.delete("/projects/{name}")
 def delete_project(name: str, user: dict = Depends(get_current_user)):
     """Delete a project from Supabase Storage and local FS."""
@@ -846,6 +973,26 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
             except Exception as _e:
                 print(f"[RESTORE] ❌ PDF download failed: {_e}")
 
+        # Ensure Step 8 selected reference database is downloaded locally
+        if step_id == "8" and config.get("ref_db_path"):
+            ref_db_val = config.get("ref_db_path")
+            # If it's a simple filename, retrieve it from Supabase storage and download locally
+            if ref_db_val and not (ref_db_val.startswith("/") or ":" in ref_db_val or "\\" in ref_db_val):
+                local_ref_dir = Path(f"/app/output/{user_id}/ref_dbs")
+                local_ref_path = local_ref_dir / ref_db_val
+                
+                if not local_ref_path.exists():
+                    storage_path = f"{user_id}/ref_dbs/{ref_db_val}"
+                    try:
+                        if file_exists(storage_path):
+                            local_ref_dir.mkdir(parents=True, exist_ok=True)
+                            local_ref_path.write_bytes(read_bytes_file(storage_path))
+                            print(f"[RESTORE] ✅ Ref DB restored from Supabase to {local_ref_path}")
+                        else:
+                            print(f"[RESTORE] ⚠️ Ref DB not found in Supabase Storage at {storage_path}")
+                    except Exception as ex:
+                        print(f"[RESTORE] ❌ Ref DB download failed: {ex}")
+
         await loop.run_in_executor(None, _run_with_capture)
 
         job_manager.set_done(project, step_id)
@@ -972,7 +1119,12 @@ def _call_step(step_id: str, tracker, context, config: dict):
     
     if step_id == "8":
         if config.get("ref_db_path"):
-            os.environ["REFERENCE_DB_PATH"] = config["ref_db_path"]
+            ref_db_val = config["ref_db_path"]
+            # If it's a simple filename, resolve to the local user's folder path
+            if ref_db_val and not (ref_db_val.startswith("/") or ":" in ref_db_val or "\\" in ref_db_val):
+                uid = context.name.split("/")[0]
+                ref_db_val = f"/app/output/{uid}/ref_dbs/{ref_db_val}"
+            os.environ["REFERENCE_DB_PATH"] = ref_db_val
         if config.get("match_mode"):
             os.environ["MATCH_MODE"] = config["match_mode"]
         if config.get("threshold") is not None:
