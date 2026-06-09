@@ -640,13 +640,30 @@ def _get_user_db_id(user: dict) -> str:
             return admin_record["id"]
     return user_id
 
+@app.get("/ref-db/diagnose")
+def diagnose_ref_db(user: dict = Depends(get_current_user)):
+    """Diagnostic: check if reference_databases table exists and return row count."""
+    sb = get_supabase()
+    user_id = _get_user_db_id(user)
+    result = {"user_id": user_id, "table_exists": False, "row_count": None, "error": None}
+    try:
+        res = sb.table("reference_databases").select("id").eq("user_id", user_id).execute()
+        result["table_exists"] = True
+        result["row_count"] = len(res.data or [])
+    except Exception as e:
+        result["error"] = str(e)
+    return result
+
 @app.get("/ref-db")
 def list_ref_dbs(user: dict = Depends(get_current_user)):
     """List all reference databases uploaded by the current user."""
     sb = get_supabase()
     user_id = _get_user_db_id(user)
-    res = sb.table("reference_databases").select("*").eq("user_id", user_id).order("created_at").execute()
-    return {"files": res.data or []}
+    try:
+        res = sb.table("reference_databases").select("*").eq("user_id", user_id).order("created_at").execute()
+        return {"files": res.data or []}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"[ref-db list] DB error: {str(e)}")
 
 @app.post("/ref-db/upload")
 async def upload_ref_db(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
@@ -658,7 +675,10 @@ async def upload_ref_db(file: UploadFile = File(...), user: dict = Depends(get_c
     # Enforce limit of max 5 files per user
     sb = get_supabase()
     user_id = _get_user_db_id(user)
-    existing_res = sb.table("reference_databases").select("id").eq("user_id", user_id).execute()
+    try:
+        existing_res = sb.table("reference_databases").select("id").eq("user_id", user_id).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"[ref-db upload] Table check failed — table may not exist: {str(e)}")
     if len(existing_res.data or []) >= 5:
         raise HTTPException(status_code=400, detail="Maximum limit of 5 reference database files reached. Please delete an existing file first.")
     
