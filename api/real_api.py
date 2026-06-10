@@ -578,13 +578,14 @@ def google_oauth_callback(code: str, state: str = ""):
         print(f"[OAUTH] Local token save failed: {e}")
 
     # Token saved — redirect back to frontend to retry the upload via /open-sheets
-    frontend_url = os.environ.get("FRONTEND_URL", "http://localhost:3000")
+    frontend_url = os.environ.get("FRONTEND_URL", "https://qcm-extractor-frontend.vercel.app")
+    from urllib.parse import quote as _url_quote
     return RedirectResponse(
         f"{frontend_url}/pipeline"
         f"?sheets_pending=1"
-        f"&project={project}"
-        f"&step={step}"
-        f"&filename={filename}"
+        f"&project={_url_quote(project, safe='')}"
+        f"&step={_url_quote(step, safe='')}"
+        f"&filename={_url_quote(filename, safe='')}"
     )
 
 
@@ -771,7 +772,9 @@ async def upload_ref_db(file: UploadFile = File(...), user: dict = Depends(get_c
 def delete_ref_db(file_id: str, user: dict = Depends(get_current_user)):
     """Delete reference database record from database, cloud storage, and local cache."""
     sb = get_supabase()
+    
     user_id = _get_user_db_id(user)
+
     res = sb.table("reference_databases").select("*").eq("id", file_id).eq("user_id", user_id).limit(1).execute()
     if not res.data:
         raise HTTPException(status_code=404, detail="Reference database file not found")
@@ -1119,9 +1122,17 @@ def _call_step(step_id: str, tracker, context, config: dict):
         if "correction" in p and "enter" in p:
             return ""
         
-        # Step 8 — reference DB path prompt
+        # Step 8 — reference DB path prompt: return full resolved path so step8_matcher can find the file
         if prompt.strip() == ">":
-            return config.get("ref_db_path", "")
+            ref = config.get("ref_db_path", "")
+            # If it's a plain filename, resolve to the full local container path
+            if ref and not (ref.startswith("/") or ":" in ref or "\\" in ref):
+                try:
+                    uid = context.name.split("/")[0]
+                except Exception:
+                    uid = "admin"
+                ref = f"/app/output/{uid}/ref_dbs/{ref}"
+            return ref
         
         # Step 8 — interactive export → skip
         if "export custom xlsx" in p:
