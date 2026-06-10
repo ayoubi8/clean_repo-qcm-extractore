@@ -643,17 +643,21 @@ def _get_user_db_id(user: dict) -> str:
 @app.get("/ref-db/diagnose")
 def diagnose_ref_db():
     """Public diagnostic: check if reference_databases table exists."""
-    sb = get_supabase()
-    result = {"table_exists": False, "row_count": None, "error": None, "users_table_ok": False}
+    result = {"table_exists": False, "row_count": None, "error": None,
+              "users_table_ok": False, "supabase_ok": False}
     try:
-        # Check if reference_databases table exists by selecting count
+        sb = get_supabase()
+        result["supabase_ok"] = True
+    except Exception as e:
+        result["supabase_error"] = str(e)
+        return result
+    try:
         res = sb.table("reference_databases").select("id").limit(1).execute()
         result["table_exists"] = True
         result["row_count"] = len(res.data or [])
     except Exception as e:
         result["error"] = str(e)
     try:
-        # Also verify users table is accessible
         res2 = sb.table("users").select("id").limit(1).execute()
         result["users_table_ok"] = True
         result["users_count"] = len(res2.data or [])
