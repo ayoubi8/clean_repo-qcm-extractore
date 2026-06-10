@@ -38,6 +38,7 @@ from auth import (get_current_user, require_admin, load_users,
                      create_refresh_token, verify_and_rotate_refresh_token, revoke_all_refresh_tokens,
                      ADMIN_EMAIL, ADMIN_PASSWORD, ensure_admin_exists)
 import uuid
+from supabase_client import get_supabase
 from storage_client import (
     write_file, write_bytes_file, read_file, read_bytes_file,
     file_exists, list_files, delete_prefix, get_signed_url,
