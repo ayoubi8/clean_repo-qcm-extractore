@@ -1713,9 +1713,10 @@ def open_in_google_sheets(name: str, step_id: str, body: dict, user: dict = Depe
         print(f"[SHEETS] ERROR: Google client secret not found at {GOOGLE_CLIENT_SECRET_PATH}")
         raise HTTPException(status_code=500, detail="Google client secret not configured on server")
 
-    creds = _get_google_creds(user["id"])
+    user_db_id = _get_user_db_id(user)
+    creds = _get_google_creds(user_db_id)
     if not creds:
-        print(f"[SHEETS] No Google creds for user {user['id']} — returning 401 NOT_AUTHORIZED")
+        print(f"[SHEETS] No Google creds for user {user['id']} (db_id={user_db_id}) — returning 401 NOT_AUTHORIZED")
         raise HTTPException(status_code=401, detail="NOT_AUTHORIZED")
     try:
         from googleapiclient.http import MediaFileUpload
