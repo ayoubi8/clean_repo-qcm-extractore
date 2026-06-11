@@ -1691,9 +1691,8 @@ def open_in_google_sheets(name: str, step_id: str, body: dict, user: dict = Depe
     if not file_path.exists():
         print(f"[SHEETS] File not local, downloading from Supabase...")
         import tempfile
-        from urllib.parse import quote
-        # URL-encode path segments to handle special chars (parentheses, spaces, etc.)
-        storage_path = f"{user['id']}/{quote(name, safe='')}/{folder}/{quote(filename, safe='')}"
+        # Use raw path segments (supabase-py handles any required escaping internally)
+        storage_path = f"{user['id']}/{name}/{folder}/{filename}"
         print(f"[SHEETS] Supabase path: {storage_path}")
         try:
             data = read_bytes_file(storage_path)

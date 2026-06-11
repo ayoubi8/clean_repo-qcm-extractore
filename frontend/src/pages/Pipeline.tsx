@@ -43,16 +43,25 @@ export function Pipeline() {
             headers: { 'Content-Type': 'application/json', ...authHeaders },
             body: JSON.stringify({ filename })
           })
-            .then(r => r.json())
+            .then(async r => {
+              const data = await r.json();
+              if (!r.ok) {
+                throw new Error(data.detail || 'Upload to Google Sheets failed');
+              }
+              return data;
+            })
             .then(res => {
               if (res.url) {
                 // Auto-redirect: this tab goes straight to the Google Sheet
                 window.location.href = res.url;
               } else {
-                console.error('Sheets retry: no URL returned', res)
+                alert('Google Sheets upload succeeded but no URL was returned.');
               }
             })
-            .catch(err => console.error('Sheets retry failed:', err))
+            .catch(err => {
+              console.error('Sheets retry failed:', err);
+              alert(`Google Sheets error: ${err.message || 'Unknown error'}`);
+            })
         }
       })
       .catch(err => console.error('Pipeline: failed to load projects', err))
