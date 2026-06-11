@@ -532,6 +532,7 @@ def start_google_auth(
     auth_url, _ = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
+        prompt="consent",
         state=f"{project}||{step}||{filename}||{user_id}"
     )
     return RedirectResponse(auth_url)
