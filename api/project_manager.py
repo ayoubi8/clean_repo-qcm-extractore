@@ -131,12 +131,31 @@ def list_projects(email: str) -> list:
 
 
 def step_output_exists(project_name: str, step_id: str, email: str) -> bool:
+    """
+    Check whether output files exist for a given step.
+
+    Priority:
+    1. Local container filesystem (fast — no network call).
+    2. Supabase Storage fallback (handles container restart where local FS was wiped).
+    """
     folder_name = STEP_FOLDER_MAP.get(str(step_id), f"step{step_id}")
     step_dir = Path(f"/app/output/{email}/{project_name}/{folder_name}")
-    if not step_dir.exists():
+
+    # ── Fast path: local FS ─────────────────────────────────────────────────
+    if step_dir.exists() and any(step_dir.iterdir()):
+        return True
+
+    # ── Fallback: Supabase Storage (FIX-01) ─────────────────────────────────
+    # Only reach here if local FS is empty or the container was restarted.
+    try:
+        from storage_client import list_files
+        prefix = f"{email}/{project_name}/{folder_name}"
+        items = list_files(prefix)
+        # Items with an 'id' field are real files; items without are sub-folders.
+        return any(f.get("id") for f in items)
+    except Exception as e:
+        print(f"[step_output_exists] Storage fallback failed for {email}/{project_name}/{folder_name}: {e}")
         return False
-    # If it's a directory, check if it has files
-    return any(step_dir.iterdir())
 
 def get_weekly_costs(email: str = None) -> dict:
     """Aggregate total_costs.json files across projects, grouped by week."""

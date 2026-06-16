@@ -1289,12 +1289,46 @@ def _call_step(step_id: str, tracker, context, config: dict):
 
 # --- Status + WebSocket Endpoints ---
 
+def _check_step_done_in_storage(user_id: str, project: str, step_id: str) -> bool:
+    """
+    FIX-01 (Option A): Check whether a step has outputs uploaded to Supabase Storage.
+    Used as the authoritative fallback when the in-memory JobManager is empty
+    (e.g. after a container restart on HuggingFace Spaces).
+
+    Storage prefix pattern: {user_id}/{project}/{step_folder}/
+    Returns True if at least one file exists under that prefix.
+    """
+    from project_manager import STEP_FOLDER_MAP
+    folder_name = STEP_FOLDER_MAP.get(str(step_id), f"step{step_id}")
+    prefix = f"{user_id}/{project}/{folder_name}"
+    try:
+        items = list_files(prefix)
+        # Filter out placeholder/folder entries (those with no 'id' are sub-folders)
+        real_files = [f for f in items if f.get("id")]
+        return len(real_files) > 0
+    except Exception as e:
+        print(f"[STATUS] Storage check failed for {prefix}: {e}")
+        return False
+
+
 @app.get("/projects/{name}/steps/{step_id}/status")
 def get_step_status(name: str, step_id: str, user: dict = Depends(get_current_user)):
-    return {
-        "status": job_manager.get_status(name, step_id),
-        "output_exists": step_output_exists(name, step_id, user["id"])
-    }
+    mem_status = job_manager.get_status(name, step_id)
+    mem_output = step_output_exists(name, step_id, user["id"])
+
+    # If the job is actively tracked in memory (running or finished this session),
+    # trust the in-memory state — it's the most up-to-date.
+    if mem_status in ("running", "done", "error"):
+        return {"status": mem_status, "output_exists": mem_output}
+
+    # mem_status == "idle": the container may have restarted and lost job state.
+    # Fall back to Supabase Storage to check if outputs were already uploaded.
+    storage_done = _check_step_done_in_storage(user["id"], name, step_id)
+    if storage_done:
+        return {"status": "done", "output_exists": True}
+
+    # Nothing in memory or storage — step has genuinely not been run yet.
+    return {"status": "idle", "output_exists": False}
 
 @app.websocket("/ws/log/{project}/{step_id}")
 async def ws_log(websocket: WebSocket, project: str, step_id: str):
