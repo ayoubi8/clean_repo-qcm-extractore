@@ -6,6 +6,8 @@ import { AutoRunPanel } from '../components/autorun/AutoRunPanel'
 import { useEffect } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { useAppStore } from '../store/appStore'
+import { usePipelineStore } from '../store/pipelineStore'
+import { getStepStatus } from '../lib/api'
 
 import { createPortal } from 'react-dom'
 
@@ -13,6 +15,24 @@ export function Pipeline() {
   const [showAutoRun, setShowAutoRun] = useState(false)
   const [searchParams, setSearchParams] = useSearchParams()
   const setActiveProject = useAppStore((s) => s.setActiveProject)
+  const activeProject = useAppStore((s) => s.activeProject)
+  const steps = usePipelineStore((s) => s.steps)
+  const setStepStatus = usePipelineStore((s) => s.setStepStatus)
+  const setStepOutputExists = usePipelineStore((s) => s.setStepOutputExists)
+
+  useEffect(() => {
+    if (!activeProject?.name) return
+
+    steps.forEach(async (step) => {
+      try {
+        const res = await getStepStatus(activeProject.name, step.id)
+        setStepStatus(step.id, res.status)
+        setStepOutputExists(step.id, res.output_exists)
+      } catch (err) {
+        console.warn(`Failed to fetch status for step ${step.id}:`, err)
+      }
+    })
+  }, [activeProject?.name])
 
   useEffect(() => {
     const sheetsPending = searchParams.get('sheets_pending') === '1'
