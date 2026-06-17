@@ -1042,44 +1042,69 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
                     except Exception as ex:
                         print(f"[RESTORE] ❌ Ref DB download failed: {ex}")
 
-        await loop.run_in_executor(None, _run_with_capture)
+        # --- FIX-04: Track step success separately so _do_post_step can never
+        # overwrite a successful step status with a false "error" badge. ---
+        step_succeeded = False
 
-        job_manager.set_done(project, step_id)
-        log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "ok", "text": f"\u2705 Step {step_id} completed successfully."})
+        try:
+            await loop.run_in_executor(None, _run_with_capture)
 
-        # All post-step I/O in one thread to keep event loop free
-        def _do_post_step():
-            # Save costs locally
-            cost_path = f"/app/output/{user_id}/{project}/total_costs.json"
-            Path(cost_path).parent.mkdir(parents=True, exist_ok=True)
-            tracker.save(cost_path)
-            # Upload costs to Supabase
+            step_succeeded = True
+            job_manager.set_done(project, step_id)
+            log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "ok", "text": f"\u2705 Step {step_id} completed successfully."})
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            job_manager.set_error(project, step_id)
+            log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "error", "text": f"❌ Step {step_id} failed: {str(e)}"})
+
+        finally:
+            # Always attempt to save outputs to Supabase — even on failed steps,
+            # partial outputs may exist and are worth preserving.
+            # This is isolated so it can never change the step's success/error status.
+            def _do_post_step():
+                # Save costs locally
+                cost_path = f"/app/output/{user_id}/{project}/total_costs.json"
+                Path(cost_path).parent.mkdir(parents=True, exist_ok=True)
+                tracker.save(cost_path)
+                # Upload costs to Supabase
+                try:
+                    write_file(f"{user_id}/{project}/total_costs.json", Path(cost_path).read_text())
+                except Exception as e:
+                    print(f"[STORAGE] cost upload failed: {e}")
+                # Upload step output folder to Supabase
+                step_storage_prefix = f"{user_id}/{project}/{folder_name}"
+                _upload_step_folder_to_storage(user_id, project, folder_name, step_storage_prefix)
+
             try:
-                write_file(f"{user_id}/{project}/total_costs.json", Path(cost_path).read_text())
-            except Exception as e:
-                print(f"[STORAGE] cost upload failed: {e}")
-            # Upload step output folder to Supabase
-            step_storage_prefix = f"{user_id}/{project}/{folder_name}"
-            _upload_step_folder_to_storage(user_id, project, folder_name, step_storage_prefix)
+                await loop.run_in_executor(None, _do_post_step)
+            except Exception as post_e:
+                # Log but do NOT propagate — post-step I/O failure must not change
+                # the step's status which was already set above.
+                print(f"[POST-STEP] Output upload failed for step {step_id}: {post_e}")
 
-        await loop.run_in_executor(None, _do_post_step)
+            # Record history based on the actual step outcome (not post-step I/O outcome)
+            try:
+                if step_succeeded:
+                    badge, stats = _compute_step_badge(project, user_id, step_id)
+                    _record_step_history(project, user_id, step_id, _step_start_time.get(f"{project}-{step_id}", time.time()), badge, stats)
+                else:
+                    _record_step_history(project, user_id, step_id, _step_start_time.get(f"{project}-{step_id}", time.time()), "error", {})
+            except Exception as be:
+                print(f"[POST-STEP] Badge recording failed for step {step_id}: {be}")
 
-    except Exception as e:
+    except Exception as outer_e:
+        # Outer except catches setup failures (archive, PDF restore, ref DB restore)
+        # that happen before the step even starts.
         import traceback
         traceback.print_exc()
         job_manager.set_error(project, step_id)
-        log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "error", "text": f"❌ Step {step_id} failed: {str(e)}"})
-
+        log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "error", "text": f"❌ Step {step_id} setup failed: {str(outer_e)}"})
         try:
             _record_step_history(project, user_id, step_id, _step_start_time.get(f"{project}-{step_id}", time.time()), "error", {})
-        except: pass
-
-    else:
-        try:
-            badge, stats = _compute_step_badge(project, user_id, step_id)
-            _record_step_history(project, user_id, step_id, _step_start_time.get(f"{project}-{step_id}", time.time()), badge, stats)
         except Exception as be:
-            print(f"Badge recording failed: {be}")
+            print(f"[POST-STEP] Badge recording failed for step {step_id}: {be}")
 
 def _call_step(step_id: str, tracker, context, config: dict):
     """Synchronous step dispatcher. Runs in a thread via run_in_executor."""
@@ -1289,12 +1314,46 @@ def _call_step(step_id: str, tracker, context, config: dict):
 
 # --- Status + WebSocket Endpoints ---
 
+def _check_step_done_in_storage(user_id: str, project: str, step_id: str) -> bool:
+    """
+    FIX-01 (Option A): Check whether a step has outputs uploaded to Supabase Storage.
+    Used as the authoritative fallback when the in-memory JobManager is empty
+    (e.g. after a container restart on HuggingFace Spaces).
+
+    Storage prefix pattern: {user_id}/{project}/{step_folder}/
+    Returns True if at least one file exists under that prefix.
+    """
+    from project_manager import STEP_FOLDER_MAP
+    folder_name = STEP_FOLDER_MAP.get(str(step_id), f"step{step_id}")
+    prefix = f"{user_id}/{project}/{folder_name}"
+    try:
+        items = list_files(prefix)
+        # Filter out placeholder/folder entries (those with no 'id' are sub-folders)
+        real_files = [f for f in items if f.get("id")]
+        return len(real_files) > 0
+    except Exception as e:
+        print(f"[STATUS] Storage check failed for {prefix}: {e}")
+        return False
+
+
 @app.get("/projects/{name}/steps/{step_id}/status")
 def get_step_status(name: str, step_id: str, user: dict = Depends(get_current_user)):
-    return {
-        "status": job_manager.get_status(name, step_id),
-        "output_exists": step_output_exists(name, step_id, user["id"])
-    }
+    mem_status = job_manager.get_status(name, step_id)
+    mem_output = step_output_exists(name, step_id, user["id"])
+
+    # If the job is actively tracked in memory (running or finished this session),
+    # trust the in-memory state — it's the most up-to-date.
+    if mem_status in ("running", "done", "error"):
+        return {"status": mem_status, "output_exists": mem_output}
+
+    # mem_status == "idle": the container may have restarted and lost job state.
+    # Fall back to Supabase Storage to check if outputs were already uploaded.
+    storage_done = _check_step_done_in_storage(user["id"], name, step_id)
+    if storage_done:
+        return {"status": "done", "output_exists": True}
+
+    # Nothing in memory or storage — step has genuinely not been run yet.
+    return {"status": "idle", "output_exists": False}
 
 @app.websocket("/ws/log/{project}/{step_id}")
 async def ws_log(websocket: WebSocket, project: str, step_id: str):
