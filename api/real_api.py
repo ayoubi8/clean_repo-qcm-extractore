@@ -926,16 +926,18 @@ def get_step_history(name: str, user: dict = Depends(get_current_user)):
 
 # --- Step Upload Helper (Group C fix) ---
 
-def _upload_step_folder_to_storage(user_id: str, project: str, folder_name: str, storage_prefix: str) -> None:
+def _upload_step_folder_to_storage(user_id: str, project: str, folder_name: str, storage_prefix: str) -> tuple:
     """
     Upload all files in a local step folder to Supabase Storage.
     Runs synchronously — must be called inside run_in_executor.
     Storage path: {user_id}/{project}/{folder_name}/{relative_file_path}
+    Returns: (uploaded_count, failed_count)
     """
     local_dir = Path(f"/app/output/{user_id}/{project}/{folder_name}")
     if not local_dir.exists():
-        return
+        return 0, 0
     uploaded = 0
+    failed = 0
     for f in local_dir.rglob("*"):
         if not f.is_file():
             continue
@@ -946,7 +948,12 @@ def _upload_step_folder_to_storage(user_id: str, project: str, folder_name: str,
             uploaded += 1
         except Exception as e:
             print(f"[STORAGE] upload failed {storage_path}: {e}")
-    print(f"[STORAGE] uploaded {uploaded} file(s) for {storage_prefix}")
+            failed += 1
+    summary = f"[STORAGE] uploaded {uploaded} file(s) for {storage_prefix}"
+    if failed:
+        summary += f", {failed} FAILED"
+    print(summary)
+    return uploaded, failed
 
 
 # --- Step Run Endpoint + Background Task ---
@@ -1064,6 +1071,9 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
             # partial outputs may exist and are worth preserving.
             # This is isolated so it can never change the step's success/error status.
             def _do_post_step():
+                # FIX-06: Collect upload failures so we can warn the user in the UI
+                failed_uploads: list = []
+
                 # Save costs locally
                 cost_path = f"/app/output/{user_id}/{project}/total_costs.json"
                 Path(cost_path).parent.mkdir(parents=True, exist_ok=True)
@@ -1073,9 +1083,25 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
                     write_file(f"{user_id}/{project}/total_costs.json", Path(cost_path).read_text())
                 except Exception as e:
                     print(f"[STORAGE] cost upload failed: {e}")
+                    failed_uploads.append(f"cost file: {e}")
+
                 # Upload step output folder to Supabase
                 step_storage_prefix = f"{user_id}/{project}/{folder_name}"
-                _upload_step_folder_to_storage(user_id, project, folder_name, step_storage_prefix)
+                _, folder_failed = _upload_step_folder_to_storage(user_id, project, folder_name, step_storage_prefix)
+                if folder_failed > 0:
+                    failed_uploads.append(f"{folder_failed} output file(s) failed to sync")
+
+                # Surface any failures as a visible warning in the user's terminal panel
+                if failed_uploads:
+                    log_callback({
+                        "ts": datetime.now().strftime("%H:%M:%S"),
+                        "type": "warn",
+                        "text": (
+                            f"⚠️ Cloud sync issue ({len(failed_uploads)} problem(s)): "
+                            + "; ".join(failed_uploads)
+                            + ". Results saved locally but may not persist after a container restart."
+                        )
+                    })
 
             try:
                 await loop.run_in_executor(None, _do_post_step)
