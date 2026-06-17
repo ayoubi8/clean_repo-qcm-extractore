@@ -56,8 +56,9 @@ def write_env_keys(updates: dict):
             key = stripped.split("=", 1)[0].strip()
             if key in updates and key in EDITABLE_KEYS:
                 val = updates[key]
-                # Safeguard: do not write masked keys
-                if "*" in val or val == "****":
+                # Safeguard: skip values that are entirely asterisks (masked placeholders).
+                # Using strip("*") == "" so valid model IDs containing * are allowed.
+                if val.strip("*") == "" or val == "****":
                     new_lines.append(line)
                 else:
                     new_lines.append(f"{key}={val}")
@@ -69,8 +70,8 @@ def write_env_keys(updates: dict):
     # Append any keys that weren't in the file yet
     for key, val in updates.items():
         if key in EDITABLE_KEYS and key not in processed_keys:
-            # Safeguard: do not write masked keys
-            if "*" in val or val == "****":
+            # Safeguard: skip values that are entirely asterisks (masked placeholders).
+            if val.strip("*") == "" or val == "****":
                 continue
             new_lines.append(f"{key}={val}")
             updated_keys.add(key)

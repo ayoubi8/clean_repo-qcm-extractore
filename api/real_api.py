@@ -1382,9 +1382,22 @@ def get_step_status(name: str, step_id: str, user: dict = Depends(get_current_us
     return {"status": "idle", "output_exists": False}
 
 @app.websocket("/ws/log/{project}/{step_id}")
-async def ws_log(websocket: WebSocket, project: str, step_id: str):
-    # WebSocket is intentionally left unprotected — Bearer header auth from the browser
-    # is non-trivial over WS, and log data alone does not expose sensitive information.
+async def ws_log(websocket: WebSocket, project: str, step_id: str, token: str = ""):
+    # FIX-09: Validate the JWT token passed as a query param.
+    # Browser WS cannot set Authorization headers, so the token is passed via ?token=...
+    from auth import decode_token
+    payload = decode_token(token) if token else None
+    if not payload:
+        # Must accept before we can send a close/error frame
+        await websocket.accept()
+        await websocket.send_text(json.dumps({
+            "ts": datetime.now().strftime("%H:%M:%S"),
+            "type": "auth_error",
+            "text": "Unauthorized: missing or expired token. Please refresh the page."
+        }))
+        await websocket.close(code=4401)
+        return
+
     await websocket.accept()
     sent_count = 0
     try:

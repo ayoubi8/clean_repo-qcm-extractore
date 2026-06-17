@@ -202,7 +202,8 @@ export async function fetchTemplates(): Promise<string[]> {
   return res.json()
 }
 
-// WebSocket: ws://localhost:8000/ws/log/{project}/{stepId}  (no auth header over WS)
+// WebSocket: ws://localhost:8000/ws/log/{project}/{stepId}?token=...
+// FIX-09: Token passed as query param because browser WS cannot set Authorization headers.
 export function connectLogStream(
   projectName: string,
   stepId: number,
@@ -210,11 +211,20 @@ export function connectLogStream(
   onClose: () => void
 ): WebSocket {
   const wsBase = BASE.replace('http', 'ws')
-  const ws = new WebSocket(`${wsBase}/ws/log/${encodeURIComponent(projectName)}/${stepId}`)
+  const token = localStorage.getItem('qcm_token') ?? ''
+  const ws = new WebSocket(
+    `${wsBase}/ws/log/${encodeURIComponent(projectName)}/${stepId}?token=${encodeURIComponent(token)}`
+  )
 
   ws.onmessage = (event) => {
     try {
       const data = JSON.parse(event.data)
+      // If the server rejects our token it sends an auth_error frame then closes
+      if (data.type === 'auth_error') {
+        onLine(data)
+        ws.close()
+        return
+      }
       onLine(data)
     } catch (e) {
       console.error('Failed to parse WS message', e)
