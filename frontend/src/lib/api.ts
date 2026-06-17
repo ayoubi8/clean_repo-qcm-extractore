@@ -108,38 +108,65 @@ export async function createProject(payload: {
   return res.json()
 }
 
-// POST /projects/{name}/pdf  (XHR — no fetchWithRefresh; token added manually)
+// POST /projects/{name}/pdf  (XHR for progress tracking — with 401 retry on token expiry)
 export async function uploadProjectPdf(
   projectName: string,
   file: File,
   onProgress?: (pct: number) => void
 ): Promise<{ pdf_path: string; size_bytes: number }> {
-  return new Promise((resolve, reject) => {
-    const formData = new FormData()
-    formData.append('file', file)
 
-    const xhr = new XMLHttpRequest()
-    xhr.open('POST', `${BASE}/projects/${encodeURIComponent(projectName)}/pdf`)
+  // Inner helper: performs the actual XHR upload with a given token.
+  // Attaches a `status` property to the rejected Error so the caller can
+  // detect 401s without string-matching the error message.
+  function doUpload(token: string | null): Promise<{ pdf_path: string; size_bytes: number }> {
+    return new Promise((resolve, reject) => {
+      const formData = new FormData()
+      formData.append('file', file)
 
-    const token = localStorage.getItem("qcm_token")
-    if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`)
+      const xhr = new XMLHttpRequest()
+      xhr.open('POST', `${BASE}/projects/${encodeURIComponent(projectName)}/pdf`)
 
-    if (onProgress) {
-      xhr.upload.onprogress = (e) => {
-        if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100))
+      if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`)
+
+      if (onProgress) {
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100))
+        }
+      }
+
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve(JSON.parse(xhr.responseText))
+        } else {
+          const err = Object.assign(
+            new Error(`Upload failed: ${xhr.status} ${xhr.statusText}`),
+            { status: xhr.status }
+          )
+          reject(err)
+        }
+      }
+      xhr.onerror = () => reject(new Error('Network error during upload'))
+      xhr.send(formData)
+    })
+  }
+
+  // First attempt — use the current stored token
+  const token = localStorage.getItem('qcm_token')
+  try {
+    return await doUpload(token)
+  } catch (err: any) {
+    // On 401 only: attempt one silent token refresh and retry the upload.
+    // Any other status (403, 413, 500…) is re-thrown immediately.
+    if (err.status === 401) {
+      const { refreshSession } = useAuthStore.getState()
+      const refreshed = await refreshSession()
+      if (refreshed) {
+        const newToken = useAuthStore.getState().token
+        return await doUpload(newToken)
       }
     }
-
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        resolve(JSON.parse(xhr.responseText))
-      } else {
-        reject(new Error(`Upload failed: ${xhr.statusText}`))
-      }
-    }
-    xhr.onerror = () => reject(new Error('Network error during upload'))
-    xhr.send(formData)
-  })
+    throw err
+  }
 }
 
 // ---------------------------------------------------------------------------
