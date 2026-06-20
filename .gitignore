@@ -62,4 +62,8 @@ new (trach)/
 stitch_medical_document_analytics_hub/
 design-results/
 
+# Clean repository target
+clean_repo/
+
+
 

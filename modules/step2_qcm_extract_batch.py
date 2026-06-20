@@ -298,7 +298,8 @@ Return ONLY the JSON array, no markdown, no explanation.
         return qcms
     
     def _parse_json(self, content: str) -> List[Dict]:
-        """Parse JSON from LLM response."""
+        """Parse JSON from LLM response. Truncation-safe: extracts all
+        complete objects even if the closing ] is missing."""
         # Remove markdown code blocks
         content = re.sub(r'```json\s*', '', content)
         content = re.sub(r'```\s*', '', content)
@@ -308,18 +309,44 @@ Return ONLY the JSON array, no markdown, no explanation.
         start = content.find('[')
         end = content.rfind(']')
         
-        if start == -1 or end == -1:
+        if start == -1:
             print(f"[ERROR] No JSON array found in response")
             return []
         
-        json_str = content[start:end+1]
+        # Happy path - well-formed array
+        if end != -1:
+            try:
+                json_str = content[start:end+1]
+                qcms = json.loads(json_str)
+                return qcms if isinstance(qcms, list) else []
+            except json.JSONDecodeError:
+                pass # fall through to partial recovery
         
-        try:
-            qcms = json.loads(json_str)
-            return qcms if isinstance(qcms, list) else []
-        except json.JSONDecodeError as e:
-            print(f"[ERROR] JSON parse error: {e}")
-            return []
+        # Partial recovery - truncated response: scan for complete {...} objects
+        print("[WARN] JSON array truncated — attempting partial object recovery")
+        recovered = []
+        depth = 0
+        obj_start = None
+        for i, ch in enumerate(content[start:], start=start):
+            if ch == '{':
+                if depth == 0:
+                    obj_start = i
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0 and obj_start is not None:
+                    try:
+                        obj = json.loads(content[obj_start:i+1])
+                        if isinstance(obj, dict):
+                            recovered.append(obj)
+                    except json.JSONDecodeError:
+                        pass
+                    obj_start = None
+        if recovered:
+            print(f"[RECOVER] Salvaged {len(recovered)} QCMs from truncated response")
+        else:
+            print(f"[ERROR] Could not recover any QCMs from response")
+        return recovered
     
     def _sanitize_qcms(self, qcms: List[Dict]) -> List[Dict]:
         """
@@ -340,11 +367,28 @@ Return ONLY the JSON array, no markdown, no explanation.
                 qcm['page'] = self._safe_int(raw_page, default=0)
         return qcms
 
+    @staticmethod
+    def _assign_uids(qcms: List[Dict]) -> List[Dict]:
+        """
+        Stamp every QCM with a stable synthetic uid:
+            uid = f"{page}_{number}_{position}"
+        where position is the 0-based index within this LLM response batch.
+        This guarantees two QCMs with identical (page, number) - from two-half
+        pages that independently restart numbering - get distinct keys and are
+        both preserved instead of one silently overwriting the other.
+        """
+        for i, qcm in enumerate(qcms):
+            qcm.setdefault(
+                'uid',
+                f"{qcm.get('page', 0)}_{qcm.get('number', 0)}_{i}"
+            )
+        return qcms
+
     def _save_batch_results_accumulate(self, new_qcms: List[Dict]):
         """
-        Merge new QCMs into existing all_qcms.json using (page, number) as the key.
-        - Same (page, number) → update existing entry
-        - New (page, number) → add as new entry
+        Merge new QCMs into existing all_qcms.json using uid as the key.
+        - Same uid → update existing entry
+        - New uid → add as new entry
         Never deletes QCMs from other page runs.
         """
         if self.context:
@@ -372,24 +416,30 @@ Return ONLY the JSON array, no markdown, no explanation.
         new_qcms  = self._sanitize_qcms(new_qcms)
         existing  = self._sanitize_qcms(existing)
 
-        # Build map keyed by (page, number) — both are guaranteed ints now
+        # Assign uids to incoming QCMs
+        new_qcms  = self._assign_uids(new_qcms)
+
+        # Ensure all existing QCMs have a uid (for backward compatibility)
+        for i, q in enumerate(existing):
+            q.setdefault('uid', f"{q['page']}_{q['number']}_legacy_{i}")
+
+        # Build map keyed by uid
         existing_map = {}
         for q in existing:
-            key = (q['page'], q['number'])
-            existing_map[key] = q
+            existing_map[q['uid']] = q
 
         # Merge new QCMs
         added = 0
         updated = 0
         for qcm in new_qcms:
-            key = (qcm['page'], qcm['number'])
+            key = qcm['uid']
             if key in existing_map:
                 updated += 1
             else:
                 added += 1
             existing_map[key] = qcm
 
-        # Sort by (page, number) — both ints, no more TypeError
+        # Sort by (page, number) - both ints, no more TypeError
         merged = sorted(existing_map.values(), key=lambda q: (q['page'], q['number']))
 
         with open(output_file, 'w', encoding='utf-8') as f:
