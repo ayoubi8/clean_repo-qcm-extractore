@@ -146,9 +146,116 @@ def _migrate_legacy_projects():
     except Exception as e:
         print(f"[UUID-MIGRATION] Error: {e}")
 
+def _backfill_projects_to_db():
+    """
+    One-time startup backfill. Enumerates all projects from Storage 
+    for all registered users (including admin) and registers them in the projects DB table.
+    """
+    try:
+        from auth import load_users, find_user_by_email, ADMIN_EMAIL
+        from storage_client import list_files, read_file
+        from supabase_client import get_supabase
+        import json
+
+        sb = get_supabase()
+        
+        # 1. Gather all users
+        users = []
+        try:
+            users = load_users()
+        except Exception as e:
+            print(f"[BACKFILL] Failed to load users: {e}")
+            return
+            
+        admin_rec = find_user_by_email(ADMIN_EMAIL)
+        user_mappings = [] # list of dicts: {"storage_id": ..., "db_uid": ...}
+        
+        for u in users:
+            user_mappings.append({"storage_id": u["id"], "db_uid": u["id"]})
+        if admin_rec:
+            # Check if admin is already added as its UUID or if we need to add the storage_id='admin' mapping
+            user_mappings.append({"storage_id": "admin", "db_uid": admin_rec["id"]})
+            
+        print(f"[BACKFILL] Starting backfill scan for {len(user_mappings)} user(s)")
+
+        for mapping in user_mappings:
+            storage_id = mapping["storage_id"]
+            db_uid = mapping["db_uid"]
+            
+            # List all storage items for this user
+            try:
+                items = list_files(f"{storage_id}/")
+            except Exception as e:
+                print(f"[BACKFILL] Failed to list files for {storage_id}: {e}")
+                continue
+                
+            project_names = set()
+            for item in items:
+                name = item.get("name", "")
+                parts = name.split("/")
+                if parts and parts[0] and not parts[0].startswith(("_", ".", "global")):
+                    project_names.add(parts[0])
+                    
+            for pname in project_names:
+                # Retrieve pdf_path if project.json exists
+                pdf_path = ""
+                try:
+                    pjson_text = read_file(f"{storage_id}/{pname}/project.json")
+                    pdata = json.loads(pjson_text)
+                    pdf_path = pdata.get("pdf_path", "")
+                except Exception:
+                    pass
+                    
+                # Register in database projects table
+                try:
+                    sb.table("projects").upsert({
+                        "user_id": db_uid,
+                        "name": pname,
+                        "pdf_storage_path": pdf_path
+                    }, on_conflict="user_id,name").execute()
+                    print(f"[BACKFILL] Registered project {pname} for user {storage_id}")
+                except Exception as e:
+                    print(f"[BACKFILL] DB register failed for {storage_id}/{pname}: {e}")
+                    
+        print("[BACKFILL] Finished backfill scan.")
+    except Exception as e:
+        print(f"[BACKFILL] Error during backfill: {e}")
+
 @app.on_event("startup")
 async def startup_event():
     _migrate_legacy_projects()
+    _backfill_projects_to_db()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Best-effort flush of any in-progress step output to Supabase Storage."""
+    print("[SHUTDOWN] Graceful shutdown triggered. Flushing in-progress jobs...")
+    from project_manager import STEP_FOLDER_MAP
+    for key, task in list(job_manager._jobs.items()):
+        if not task.done():
+            parts = key.split("-")
+            if len(parts) >= 2:
+                step_id = parts[-1]
+                project = "-".join(parts[:-1])
+                user_id = _job_user_ids.get(key, "admin")
+                
+                # Resolve folder name mapping
+                s_id = "8" if step_id == "8-export" else step_id
+                folder_name = STEP_FOLDER_MAP.get(str(s_id), f"step{s_id}")
+                step_storage_prefix = f"{user_id}/{project}/{folder_name}"
+                
+                try:
+                    print(f"[SHUTDOWN] Flushing step {step_id} folder for {project}...")
+                    _upload_step_folder_to_storage(user_id, project, folder_name, step_storage_prefix)
+                    
+                    # Also flush total_costs.json
+                    cost_path = f"/app/output/{user_id}/{project}/total_costs.json"
+                    if Path(cost_path).exists():
+                        write_file(f"{user_id}/{project}/total_costs.json", Path(cost_path).read_text())
+                    print(f"[SHUTDOWN] Flush complete for {project}/{step_id}")
+                except Exception as e:
+                    print(f"[SHUTDOWN] Flush failed for {project}/{step_id}: {e}")
+
 
 # --- Auth Endpoints ---
 
@@ -415,6 +522,18 @@ def create_project(body: dict, user: dict = Depends(get_current_user)):
         write_file(f"{user['id']}/{name}/project.json", project_meta)
     except Exception as e:
         print(f"[STORAGE] project.json upload failed: {e}")
+
+    # Register in projects DB table (source of truth for list_projects)
+    try:
+        sb = get_supabase()
+        db_uid = _get_user_db_id(user)
+        sb.table("projects").upsert({
+            "user_id": db_uid,
+            "name": name,
+            "pdf_storage_path": pdf_path,
+        }, on_conflict="user_id,name").execute()
+    except Exception as e:
+        print(f"[DB] projects upsert failed: {e}")
 
     return {
         "name": name,
@@ -827,11 +946,20 @@ def delete_project(name: str, user: dict = Depends(get_current_user)):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to delete locally: {str(e)}")
 
+    # Delete from projects DB table
+    try:
+        sb = get_supabase()
+        db_uid = _get_user_db_id(user)
+        sb.table("projects").delete().eq("user_id", db_uid).eq("name", name).execute()
+    except Exception as e:
+        print(f"[DB] projects delete failed: {e}")
+
     return {"deleted": name}
 
 # --- Step Run History & Badges ---
 
 _step_start_time: dict = {}
+_job_user_ids: dict = {}
 
 def _record_step_history(project: str, user_id: str, step_id: str, start_time: float, badge: str, stats: dict):
     storage_path = f"{user_id}/{project}/step_history.json"
@@ -969,6 +1097,7 @@ async def run_step(name: str, step_id: str, body: dict, user: dict = Depends(get
     # Pass the config body to the task
     task = asyncio.ensure_future(_run_step_task(name, user["id"], step_id, body))
     job_manager.set_running(name, step_id, task)
+    _job_user_ids[job_manager.key(name, step_id)] = user["id"]
     return {"job_id": f"{name}-{step_id}-001"}
 
 async def _run_step_task(project: str, user_id: str, step_id: str, config: dict):
@@ -1840,6 +1969,7 @@ async def export_matches_only(name: str, body: dict, user: dict = Depends(get_cu
     _apply_user_env(user)
     task = asyncio.ensure_future(_export_step8_task(name, user["id"], body))
     job_manager.set_running(name, "8-export", task)
+    _job_user_ids[job_manager.key(name, "8-export")] = user["id"]
     return {"job_id": f"{name}-8-export-001"}
 
 async def _export_step8_task(project: str, email: str, body: dict):

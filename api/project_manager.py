@@ -33,30 +33,82 @@ def get_or_create(project_name: str, email: str) -> dict:
         _registry[registry_key] = {"context": context, "tracker": tracker}
     return _registry[registry_key]
 
+def _get_db_user_id(user_id: str) -> str:
+    if user_id == "admin":
+        try:
+            from auth import find_user_by_email, ADMIN_EMAIL
+            admin_record = find_user_by_email(ADMIN_EMAIL)
+            if admin_record:
+                return admin_record.get("id", user_id)
+        except Exception:
+            pass
+    return user_id
+
 def list_projects(email: str) -> list:
     projects = []
-    output_dir = Path(f"/app/output/{email}")
+    
+    # 1. Query the projects DB table first (source of truth)
+    db_projects = []
+    try:
+        from supabase_client import get_supabase
+        sb = get_supabase()
+        db_uid = _get_db_user_id(email)
+        res = sb.table("projects").select("name,created_at,pdf_storage_path").eq("user_id", db_uid).order("created_at", desc=True).execute()
+        db_projects = res.data or []
+    except Exception as e:
+        print(f"[list_projects] DB query failed: {e}")
 
-    # ── Local filesystem (fast path) ────────────────────────────────────────
-    if output_dir.exists():
-        for d in sorted(output_dir.iterdir()):
-            if not d.is_dir() or d.name.startswith(("_", ".", "global")):
-                continue
-
+    if db_projects:
+        for row in db_projects:
+            pname = row["name"]
+            pdf_path = row.get("pdf_storage_path", "")
+            created_at = row.get("created_at", "")
+            
+            # Check local FS first for last_step and tokens (fast path)
+            local_pdir = Path(f"/app/output/{email}/{pname}")
             last_step = 0
+            total_tokens = 0
+            
             STEP_ORDER = [
                 (8, "step8_matcher"), (7, "step7_categories"), (6, "step6_corrections"),
                 (5, "step5_json"), (4, "step4_format"), (3, "step3_metadata"), (2, "step2_qcm"),
                 (1.6, "step1_extraction"), (1.5, "step1_extraction"), (1, "step1_extraction"),
             ]
-            for step_num, folder_name in STEP_ORDER:
-                folder_path = d / folder_name
-                if folder_path.exists() and any(folder_path.iterdir()):
-                    last_step = step_num
-                    break
+            
+            if local_pdir.exists():
+                for step_num, folder_name in STEP_ORDER:
+                    folder_path = local_pdir / folder_name
+                    if folder_path.exists() and any(folder_path.iterdir()):
+                        last_step = step_num
+                        break
 
-            total_tokens = 0
-            cost_file = d / "total_costs.json"
+            # If not found locally, probe Storage
+            if last_step == 0:
+                STEP_CHECK_ORDER = [
+                    (8, "8"), (7, "7"), (6, "6"), (5, "5"),
+                    (4, "4"), (3, "3"), (2, "2"), (1.6, "1.6"),
+                    (1.5, "1.5"), (1, "1"),
+                ]
+                for snum, sid in STEP_CHECK_ORDER:
+                    if step_output_exists(pname, sid, email):
+                        last_step = snum
+                        break
+
+            # Restore project.json locally so pipeline works
+            if not local_pdir.exists() or not (local_pdir / "project.json").exists():
+                try:
+                    from storage_client import read_file
+                    pjson_text = read_file(f"{email}/{pname}/project.json")
+                    local_pdir.mkdir(parents=True, exist_ok=True)
+                    (local_pdir / "project.json").write_text(pjson_text)
+                    if not pdf_path:
+                        pdata = json.loads(pjson_text)
+                        pdf_path = pdata.get("pdf_path", "")
+                except Exception:
+                    pass
+
+            # Find tokens
+            cost_file = local_pdir / "total_costs.json"
             if cost_file.exists():
                 try:
                     data = json.loads(cost_file.read_text())
@@ -64,71 +116,129 @@ def list_projects(email: str) -> list:
                     total_tokens = summary.get("total_tokens", 0)
                 except:
                     pass
-
-            pdf_path = ""
-            project_json = d / "project.json"
-            if project_json.exists():
-                try:
-                    pdata = json.loads(project_json.read_text())
-                    pdf_path = pdata.get("pdf_path", "")
-                except:
-                    pass
-
-            projects.append({
-                "name": d.name,
-                "last_step": last_step,
-                "last_modified": datetime.fromtimestamp(d.stat().st_mtime).isoformat() + "Z",
-                "total_tokens": total_tokens,
-                "pdf_path": pdf_path
-            })
-
-    # ── Supabase Storage fallback (container restarted — local FS is empty) ─
-    if not projects:
-        try:
-            from storage_client import list_files, read_file
-            items = list_files(f"{email}/")
-            project_names: set = set()
-            for item in items:
-                name = item.get("name", "")
-                parts = name.split("/")
-                if parts and parts[0] and not parts[0].startswith(("_", ".", "global")):
-                    project_names.add(parts[0])
-
-            for pname in sorted(project_names):
-                proj: dict = {
-                    "name": pname, "last_step": 0,
-                    "last_modified": "", "total_tokens": 0, "pdf_path": ""
-                }
-                # Restore project.json locally so subsequent ops work
-                try:
-                    pjson_text = read_file(f"{email}/{pname}/project.json")
-                    local_pdir = Path(f"/app/output/{email}/{pname}")
-                    local_pdir.mkdir(parents=True, exist_ok=True)
-                    (local_pdir / "project.json").write_text(pjson_text)
-                    pdata = json.loads(pjson_text)
-                    proj["pdf_path"] = pdata.get("pdf_path", "")
-                except Exception:
-                    pass
+            else:
                 # Restore costs locally
                 try:
+                    from storage_client import read_file
                     costs_text = read_file(f"{email}/{pname}/total_costs.json")
-                    local_pdir = Path(f"/app/output/{email}/{pname}")
                     local_pdir.mkdir(parents=True, exist_ok=True)
                     (local_pdir / "total_costs.json").write_text(costs_text)
                     costs = json.loads(costs_text)
                     summary = costs.get("summary", costs)
-                    proj["total_tokens"] = summary.get("total_tokens", 0)
+                    total_tokens = summary.get("total_tokens", 0)
                 except Exception:
                     pass
-                projects.append(proj)
-            if projects:
-                print(f"[list_projects] Restored {len(projects)} project(s) from Supabase for {email}")
-        except Exception as e:
-            print(f"[list_projects] Supabase fallback error: {e}")
 
+            projects.append({
+                "name": pname,
+                "last_step": last_step,
+                "last_modified": created_at,
+                "total_tokens": total_tokens,
+                "pdf_path": pdf_path
+            })
+
+    # 2. Fallback: Local filesystem scan and Storage listing if DB returns nothing
+    if not projects:
+        output_dir = Path(f"/app/output/{email}")
+        if output_dir.exists():
+            for d in sorted(output_dir.iterdir()):
+                if not d.is_dir() or d.name.startswith(("_", ".", "global")):
+                    continue
+
+                last_step = 0
+                STEP_ORDER = [
+                    (8, "step8_matcher"), (7, "step7_categories"), (6, "step6_corrections"),
+                    (5, "step5_json"), (4, "step4_format"), (3, "step3_metadata"), (2, "step2_qcm"),
+                    (1.6, "step1_extraction"), (1.5, "step1_extraction"), (1, "step1_extraction"),
+                ]
+                for step_num, folder_name in STEP_ORDER:
+                    folder_path = d / folder_name
+                    if folder_path.exists() and any(folder_path.iterdir()):
+                        last_step = step_num
+                        break
+
+                total_tokens = 0
+                cost_file = d / "total_costs.json"
+                if cost_file.exists():
+                    try:
+                        data = json.loads(cost_file.read_text())
+                        summary = data.get("summary", data)
+                        total_tokens = summary.get("total_tokens", 0)
+                    except:
+                        pass
+
+                pdf_path = ""
+                project_json = d / "project.json"
+                if project_json.exists():
+                    try:
+                        pdata = json.loads(project_json.read_text())
+                        pdf_path = pdata.get("pdf_path", "")
+                    except:
+                        pass
+
+                projects.append({
+                    "name": d.name,
+                    "last_step": last_step,
+                    "last_modified": datetime.fromtimestamp(d.stat().st_mtime).isoformat() + "Z",
+                    "total_tokens": total_tokens,
+                    "pdf_path": pdf_path
+                })
+
+        # Supabase Storage fallback
+        if not projects:
+            try:
+                from storage_client import list_files, read_file
+                items = list_files(f"{email}/")
+                project_names = set()
+                for item in items:
+                    name = item.get("name", "")
+                    parts = name.split("/")
+                    if parts and parts[0] and not parts[0].startswith(("_", ".", "global")):
+                        project_names.add(parts[0])
+
+                for pname in sorted(project_names):
+                    proj = {
+                        "name": pname, "last_step": 0,
+                        "last_modified": "", "total_tokens": 0, "pdf_path": ""
+                    }
+                    try:
+                        pjson_text = read_file(f"{email}/{pname}/project.json")
+                        local_pdir = Path(f"/app/output/{email}/{pname}")
+                        local_pdir.mkdir(parents=True, exist_ok=True)
+                        (local_pdir / "project.json").write_text(pjson_text)
+                        pdata = json.loads(pjson_text)
+                        proj["pdf_path"] = pdata.get("pdf_path", "")
+                    except Exception:
+                        pass
+                    try:
+                        costs_text = read_file(f"{email}/{pname}/total_costs.json")
+                        local_pdir = Path(f"/app/output/{email}/{pname}")
+                        local_pdir.mkdir(parents=True, exist_ok=True)
+                        (local_pdir / "total_costs.json").write_text(costs_text)
+                        costs = json.loads(costs_text)
+                        summary = costs.get("summary", costs)
+                        proj["total_tokens"] = summary.get("total_tokens", 0)
+                    except Exception:
+                        pass
+
+                    STEP_CHECK_ORDER = [
+                        (8, "8"), (7, "7"), (6, "6"), (5, "5"),
+                        (4, "4"), (3, "3"), (2, "2"), (1.6, "1.6"),
+                        (1.5, "1.5"), (1, "1"),
+                    ]
+                    for snum, sid in STEP_CHECK_ORDER:
+                        if step_output_exists(pname, sid, email):
+                            proj["last_step"] = snum
+                            break
+
+                    projects.append(proj)
+
+                projects.sort(key=lambda p: p["last_modified"] or "", reverse=True)
+                if projects:
+                    print(f"[list_projects] Restored {len(projects)} project(s) from Supabase for {email}")
+            except Exception as e:
+                print(f"[list_projects] Supabase fallback error: {e}")
     return projects
-
-
 
 def step_output_exists(project_name: str, step_id: str, email: str) -> bool:
     """

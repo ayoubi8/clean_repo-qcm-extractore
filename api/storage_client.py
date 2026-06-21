@@ -72,12 +72,25 @@ def list_files(prefix: str) -> list:
     """
     List files under a storage prefix.
     Returns list of metadata dicts from Supabase: [{name, id, metadata, ...}].
+    Handles pagination.
     """
     sb = get_supabase()
+    all_items = []
+    limit = 100
+    offset = 0
     try:
-        return sb.storage.from_(BUCKET).list(prefix) or []
-    except Exception:
-        return []
+        while True:
+            page = sb.storage.from_(BUCKET).list(
+                prefix,
+                {"limit": limit, "offset": offset, "sortBy": {"column": "name", "order": "asc"}}
+            ) or []
+            all_items.extend(page)
+            if len(page) < limit:
+                break
+            offset += limit
+    except Exception as e:
+        print(f"[STORAGE] list_files error: {e}")
+    return all_items
 
 
 def delete_prefix(prefix: str) -> None:
