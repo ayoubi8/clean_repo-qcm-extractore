@@ -176,8 +176,12 @@ class Step2QCMExtractBatch:
         
         return "\n\n".join(parts)
     
-    def _extract_all_qcms_batch(self, full_text: str, start_page: int, end_page: int, config: Dict = None) -> List[Dict]:
-        """Extract all QCMs using batch LLM call with smart fallback."""
+    def _extract_all_qcms_batch(self, full_text: str, start_page: int, end_page: int, config: Dict = None, prev_page_qcm_numbers: list = None) -> List[Dict]:
+        """Extract all QCMs using batch LLM call with smart fallback.
+        prev_page_qcm_numbers: list of integer QCM numbers extracted from the previous page/chunk.
+        When provided, injected into the prompt so the LLM can infer sequential numbers
+        for QCMs whose numbers are cropped or missing.
+        """
         
         # Pull extraction guidance if provided in config
         guidance = "- If metadata markers (e.g. year ->YYYY, subcategory **bold**) appear before a question, extract them into 'year' and 'subcategory' fields."
@@ -200,8 +204,21 @@ class Step2QCMExtractBatch:
             )
             cc_hint_format = '\n    "clinical_case_hint": "CAS CLINIQUE 1"  (only if a Cas Clinique precedes this QCM)'
 
-        prompt = f"""Extract ALL QCMs (multiple choice questions) from these pages.
+        # Build previous-page QCM number context (single lean line, empty if first page)
+        prev_numbers_block = ""
+        if prev_page_qcm_numbers:
+            nums_str = ", ".join(str(n) for n in sorted(prev_page_qcm_numbers))
+            next_expected = max(prev_page_qcm_numbers) + 1
+            prev_numbers_block = (
+                f"PREVIOUS PAGE QCM NUMBERS: {nums_str}\n"
+                f"NUMBERING RULE: The next QCM in sequence should be #{next_expected}. "
+                f"If a question's number is missing or cropped on this page, assign it "
+                f"sequentially starting from #{next_expected}. "
+                f"If a number IS visible, preserve it and continue the sequence from there.\n"
+            )
 
+        prompt = f"""Extract ALL QCMs (multiple choice questions) from these pages.
+{prev_numbers_block}
 {full_text}
 
 TASK: Extract every QCM with its number, question text, and all propositions.
@@ -210,7 +227,7 @@ IMPORTANT RULES:
 - The text is divided by markers in the format `=== PAGE X ===`. Each QCM MUST include a "page" field set to X, where X is the number from the `=== PAGE X ===` marker that appears IMMEDIATELY BEFORE the question text.
 - If a QCM spans two pages (question on one page, propositions on the next), assign it to the page where the QUESTION TEXT begins.
 - QCMs may span across page breaks — merge split QCMs but assign to the page of the question text.
-- Number each QCM (1, 2, 3, etc.). Preserve the original question numbers EXACTLY.
+- Preserve visible question numbers EXACTLY. If a question number is missing or cropped, use the PREVIOUS PAGE QCM NUMBERS above to assign the correct sequential number.
 - Extract all propositions (a, b, c, d, e).
 - Do NOT include Answer Key tables in the output.
 {guidance}
@@ -499,6 +516,7 @@ Return ONLY the JSON array, no markdown, no explanation.
         print(f"   Each chunk = 1 LLM call. Results accumulate in all_qcms.json\n")
 
         total_extracted = 0
+        prev_page_qcm_numbers = None  # Tracks QCM numbers from the last processed chunk
 
         for i, chunk in enumerate(chunks, start=1):
             start_p = self._extract_page_number(chunk[0].name)
@@ -507,13 +525,28 @@ Return ONLY the JSON array, no markdown, no explanation.
             print(f"📦 Chunk {i}/{total_chunks}: pages {start_p}–{end_p}  ({len(chunk)} pages)")
             print(f"{'='*60}")
 
+            if prev_page_qcm_numbers:
+                print(f"   📌 [SEQ-CONTEXT] Previous chunk QCM numbers: {sorted(prev_page_qcm_numbers)} → next expected #{max(prev_page_qcm_numbers) + 1}")
+
             full_text = self._concatenate_pages(chunk)
-            qcms = self._extract_all_qcms_batch(full_text, start_p, end_p, config)
+            qcms = self._extract_all_qcms_batch(
+                full_text, start_p, end_p, config,
+                prev_page_qcm_numbers=prev_page_qcm_numbers
+            )
 
             if qcms:
                 qcms = self._stamp_pages(qcms, chunk)
-                
-                # NEW: Apply corrections if we have them
+
+                # Update context: collect valid integer QCM numbers for the next chunk
+                valid_numbers = [
+                    q['number'] for q in qcms
+                    if isinstance(q.get('number'), int) and q['number'] > 0
+                ]
+                if valid_numbers:
+                    prev_page_qcm_numbers = valid_numbers
+                # If nothing valid was extracted, keep previous context so we don't lose the sequence
+
+                # Apply corrections if we have them
                 if correction_map:
                     applied = 0
                     for qcm in qcms:
@@ -530,6 +563,7 @@ Return ONLY the JSON array, no markdown, no explanation.
                 total_extracted += len(qcms)
             else:
                 print(f"⚠️  No QCMs extracted for chunk {i} (pages {start_p}–{end_p}). Skipping.")
+                # Keep prev_page_qcm_numbers unchanged — don't lose the sequence on empty chunks
 
         print(f"\n✅ AUTO-LOOP COMPLETE — All {total_chunks} chunks processed.")
         return total_extracted
