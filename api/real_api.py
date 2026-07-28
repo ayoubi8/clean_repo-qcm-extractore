@@ -36,7 +36,7 @@ from auth import (get_current_user, require_admin, load_users,
                      create_access_token, add_user, update_user_field, delete_user,
                      check_rate_limit,
                      create_refresh_token, verify_and_rotate_refresh_token, revoke_all_refresh_tokens,
-                     ADMIN_EMAIL, ADMIN_PASSWORD, ensure_admin_exists)
+                     ADMIN_EMAIL, ADMIN_PASSWORD, ensure_admin_exists, get_db_user_id)
 import uuid
 from supabase_client import get_supabase
 from storage_client import (
@@ -197,22 +197,33 @@ def _backfill_projects_to_db():
                     project_names.add(parts[0])
                     
             for pname in project_names:
-                # Retrieve pdf_path if project.json exists
+                # Retrieve pdf_path if project.json exists, and get its timestamp
                 pdf_path = ""
+                created_at = None
                 try:
                     pjson_text = read_file(f"{storage_id}/{pname}/project.json")
                     pdata = json.loads(pjson_text)
                     pdf_path = pdata.get("pdf_path", "")
+
+                    # Fetch project.json metadata to get actual created_at/last_activity_at
+                    p_files = list_files(f"{storage_id}/{pname}/")
+                    pjson_item = next((x for x in p_files if x.get("name") == "project.json"), None)
+                    if pjson_item:
+                        created_at = pjson_item.get("created_at") or pjson_item.get("updated_at") or pjson_item.get("metadata", {}).get("lastModified")
                 except Exception:
                     pass
                     
                 # Register in database projects table
                 try:
-                    sb.table("projects").upsert({
+                    upsert_row = {
                         "user_id": db_uid,
                         "name": pname,
                         "pdf_storage_path": pdf_path
-                    }, on_conflict="user_id,name").execute()
+                    }
+                    if created_at:
+                        upsert_row["created_at"] = created_at
+                        upsert_row["last_activity_at"] = created_at
+                    sb.table("projects").upsert(upsert_row, on_conflict="user_id,name").execute()
                     print(f"[BACKFILL] Registered project {pname} for user {storage_id}")
                 except Exception as e:
                     print(f"[BACKFILL] DB register failed for {storage_id}/{pname}: {e}")
@@ -524,16 +535,23 @@ def create_project(body: dict, user: dict = Depends(get_current_user)):
         print(f"[STORAGE] project.json upload failed: {e}")
 
     # Register in projects DB table (source of truth for list_projects)
-    try:
-        sb = get_supabase()
-        db_uid = _get_user_db_id(user)
-        sb.table("projects").upsert({
-            "user_id": db_uid,
-            "name": name,
-            "pdf_storage_path": pdf_path,
-        }, on_conflict="user_id,name").execute()
-    except Exception as e:
-        print(f"[DB] projects upsert failed: {e}")
+    registered = False
+    for attempt in range(2):
+        try:
+            sb = get_supabase()
+            db_uid = get_db_user_id(user)
+            sb.table("projects").upsert({
+                "user_id": db_uid,
+                "name": name,
+                "pdf_storage_path": pdf_path,
+                "last_activity_at": datetime.utcnow().isoformat(),
+            }, on_conflict="user_id,name").execute()
+            registered = True
+            break
+        except Exception as e:
+            print(f"[DB] projects upsert attempt {attempt+1} failed: {e}")
+    if not registered:
+        print(f"[DB] WARNING: project '{name}' created in Storage but NOT in DB — S-1 self-heal will recover on next list")
 
     return {
         "name": name,
@@ -752,15 +770,6 @@ async def upload_project_pdf(name: str, file: UploadFile = File(...), user: dict
 
 # --- Reference Database Management Endpoints ---
 
-def _get_user_db_id(user: dict) -> str:
-    """Helper to return the actual database UUID for the user (resolves 'admin' placeholder to UUID)."""
-    from auth import find_user_by_email, ADMIN_EMAIL
-    user_id = user.get("id", "")
-    if user_id == "admin":
-        admin_record = find_user_by_email(ADMIN_EMAIL)
-        if admin_record:
-            return admin_record["id"]
-    return user_id
 
 @app.get("/ref-db/diagnose")
 def diagnose_ref_db():
@@ -791,7 +800,7 @@ def diagnose_ref_db():
 def list_ref_dbs(user: dict = Depends(get_current_user)):
     """List all reference databases uploaded by the current user."""
     sb = get_supabase()
-    user_id = _get_user_db_id(user)
+    user_id = get_db_user_id(user)
     try:
         res = sb.table("reference_databases").select("*").eq("user_id", user_id).order("created_at").execute()
         return {"files": res.data or []}
@@ -807,7 +816,7 @@ async def upload_ref_db(file: UploadFile = File(...), user: dict = Depends(get_c
     
     # Enforce limit of max 5 files per user
     sb = get_supabase()
-    user_id = _get_user_db_id(user)
+    user_id = get_db_user_id(user)
     try:
         existing_res = sb.table("reference_databases").select("id").eq("user_id", user_id).execute()
     except Exception as e:
@@ -893,7 +902,7 @@ def delete_ref_db(file_id: str, user: dict = Depends(get_current_user)):
     """Delete reference database record from database, cloud storage, and local cache."""
     sb = get_supabase()
     
-    user_id = _get_user_db_id(user)
+    user_id = get_db_user_id(user)
 
     res = sb.table("reference_databases").select("*").eq("id", file_id).eq("user_id", user_id).limit(1).execute()
     if not res.data:
@@ -949,7 +958,7 @@ def delete_project(name: str, user: dict = Depends(get_current_user)):
     # Delete from projects DB table
     try:
         sb = get_supabase()
-        db_uid = _get_user_db_id(user)
+        db_uid = get_db_user_id(user)
         sb.table("projects").delete().eq("user_id", db_uid).eq("name", name).execute()
     except Exception as e:
         print(f"[DB] projects delete failed: {e}")
@@ -1086,13 +1095,28 @@ def _upload_step_folder_to_storage(user_id: str, project: str, folder_name: str,
 
 # --- Step Run Endpoint + Background Task ---
 
-@app.post("/projects/{name}/steps/{step_id}/run")
+@app.post(
+    "/projects/{name}/steps/{step_id}/run",
+    deprecated=False,
+    summary="Run a single pipeline step. NOTE: steps 4 and 5 are now deprecated "
+            "— they run automatically in the backend after Step 3 succeeds "
+            "(see modules/post_step3_build.py). Manual /steps/4/run and "
+            "/steps/5/run remain available for advanced/debug use.",
+)
 async def run_step(name: str, step_id: str, body: dict, user: dict = Depends(get_current_user)):
     if job_manager.is_running(name, step_id):
         return {"error": "Step already running"}
 
     _apply_user_env(user)
     _step_start_time[f"{name}-{step_id}"] = time.time()
+
+    # Bump last_activity_at in DB
+    try:
+        sb = get_supabase()
+        sb.table("projects").update({"last_activity_at": datetime.utcnow().isoformat()}) \
+            .eq("user_id", get_db_user_id(user)).eq("name", name).execute()
+    except Exception:
+        pass
 
     # Pass the config body to the task
     task = asyncio.ensure_future(_run_step_task(name, user["id"], step_id, body))
@@ -1189,6 +1213,42 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
             job_manager.set_done(project, step_id)
             log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "ok", "text": f"\u2705 Step {step_id} completed successfully."})
 
+            # POST-STEP-3 AUTO-BUILD: after Step 3 succeeds, invisibly run the
+            # old Step 4 (Format/Template) + Step 5 (JSON Merge) as a single
+            # backend operation using the Template.xlsx default schema (all
+            # fields included). Steps 4 & 5 are no longer exposed in the UI.
+            # Failure here MUST NOT flip Step 3's success status — the user can
+            # still run Steps 4/5 manually via the deprecated endpoints.
+            auto_build_folders: list = []
+            if step_id == "3":
+                try:
+                    from modules.post_step3_build import run_post_step3_build
+                    res = await loop.run_in_executor(
+                        None,
+                        lambda: run_post_step3_build(tracker, context, user_id, project)
+                    )
+                    if res.get("status") == "ok":
+                        total = res.get("step5", {}).get("total_qcms", 0)
+                        log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "ok", "text": f"⚡ Auto-build (Step 4→5) done in backend: {total} QCMs merged."})
+                        job_manager.set_done(project, "4")
+                        job_manager.set_done(project, "5")
+                        auto_build_folders = ["step4_format", "step5_json"]
+                        # Record success badges for the hidden steps so history matches reality
+                        for _sid in ("4", "5"):
+                            try:
+                                _b, _s = _compute_step_badge(project, user_id, _sid)
+                                _record_step_history(project, user_id, _sid, _step_start_time.get(f"{project}-{_sid}", time.time()), _b, _s)
+                            except Exception as _be:
+                                print(f"[POST-STEP-3] badge record failed for {_sid}: {_be}")
+                    elif res.get("status") == "no_qcms":
+                        log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "warn", "text": "ℹ️ Auto-build skipped: no accepted QCMs after Step 3."})
+                    else:
+                        log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "warn", "text": f"⚠️ Auto-build (Step 4→5) failed: {res}. You can run Steps 4/5 manually."})
+                except Exception as abe:
+                    import traceback
+                    traceback.print_exc()
+                    log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "warn", "text": f"⚠️ Auto-build (Step 4→5) failed: {str(abe)}. You can run Steps 4/5 manually."})
+
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -1219,6 +1279,19 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
                 _, folder_failed = _upload_step_folder_to_storage(user_id, project, folder_name, step_storage_prefix)
                 if folder_failed > 0:
                     failed_uploads.append(f"{folder_failed} output file(s) failed to sync")
+
+                # If the Post-Step-3 auto-build ran, also upload the produced
+                # step4_format/ and step5_json/ folders so they survive restarts.
+                for _extra_folder in auto_build_folders:
+                    try:
+                        _, extra_failed = _upload_step_folder_to_storage(
+                            user_id, project, _extra_folder, f"{user_id}/{project}/{_extra_folder}"
+                        )
+                        if extra_failed > 0:
+                            failed_uploads.append(f"{extra_failed} {_extra_folder} file(s) failed to sync")
+                    except Exception as e:
+                        print(f"[POST-STEP-3] upload of {_extra_folder} failed: {e}")
+                        failed_uploads.append(f"{_extra_folder}: {e}")
 
                 # Surface any failures as a visible warning in the user's terminal panel
                 if failed_uploads:
@@ -1940,7 +2013,7 @@ def open_in_google_sheets(name: str, step_id: str, body: dict, user: dict = Depe
         print(f"[SHEETS] ERROR: Google client secret not found at {GOOGLE_CLIENT_SECRET_PATH}")
         raise HTTPException(status_code=500, detail="Google client secret not configured on server")
 
-    user_db_id = _get_user_db_id(user)
+    user_db_id = get_db_user_id(user)
     creds = _get_google_creds(user_db_id)
     if not creds:
         print(f"[SHEETS] No Google creds for user {user['id']} (db_id={user_db_id}) — returning 401 NOT_AUTHORIZED")
@@ -2020,8 +2093,11 @@ async def _autorun_task(project: str, email: str, body: dict):
     end   = str(body.get("end_step",   "7"))
     run_config = body.get("run_config", {})
     
-    # Valid step sequence
-    sequence = ["1", "1.5", "1.6", "2", "3", "4", "5", "6", "7", "8"]
+    # Valid step sequence. Steps 4 and 5 are no longer in the visible
+    # sequence: they run automatically in the backend after Step 3 succeeds
+    # (see run_post_step3_build in _run_step_task). If run_config.step4 or
+    # step5 are sent by a legacy client they are silently ignored.
+    sequence = ["1", "1.5", "1.6", "2", "3", "6", "7", "8"]
     
     # Filter sequence by start/end constraints
     try:

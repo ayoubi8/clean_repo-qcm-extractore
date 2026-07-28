@@ -2,6 +2,12 @@ import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import { AutoRunState } from '../types'
 
+// Steps 4 and 5 are intentionally absent — they run as an invisible backend
+// operation after Step 3 (see backend modules/post_step3_build.py).
+const ALLOWED_STEPS = [1, 2, 3, 6, 7, 8]
+const nearestAllowed = (n: number, fallback: number) =>
+  ALLOWED_STEPS.includes(n) ? n : fallback
+
 export const useAutorunStore = create<AutoRunState>()(
   persist(
     (set) => ({
@@ -23,7 +29,7 @@ export const useAutorunStore = create<AutoRunState>()(
       setIsRunning: (v) => set({ isRunning: v }),
     }),
     {
-      name: 'qcm-autorun-store',
+      name: 'qcm-autorun-store-v2',
       partialize: (state) => ({
         startStep: state.startStep,
         endStep: state.endStep,
@@ -31,6 +37,15 @@ export const useAutorunStore = create<AutoRunState>()(
         useYaml: state.useYaml,
         batchConfig: state.batchConfig,
       }),
+      migrate: (persisted: any) => {
+        // Coerce any legacy persisted startStep/endStep that pointed at the
+        // now-removed steps 4 or 5 back onto a valid allowed step.
+        if (!persisted) return persisted
+        const startStep = nearestAllowed(Number(persisted.startStep ?? 1), 1)
+        const endStep = nearestAllowed(Number(persisted.endStep ?? 7), 7)
+        return { ...persisted, startStep, endStep }
+      },
+      version: 1,
     }
   )
 )

@@ -12,10 +12,10 @@ from modules.step1_extraction import Step1Extraction
 from modules.step1_5_batch_text_fixer import Step1_5BatchTextFixer
 from modules.step2_qcm_extract_batch import Step2QCMExtractBatch
 from modules.step3_metadata import Step3Metadata
-from modules.step4_format import Step4Format
 from modules.step5_builder import Step5Builder
 from modules.step6_corrections import Step6Corrections
 from modules.step7_categorization import Step7Categorization
+from modules.post_step3_build import run_post_step3_build
 
 class FolderBatchProcessor:
     """Orchestrates processing of multiple PDFs in a folder."""
@@ -116,13 +116,14 @@ class FolderBatchProcessor:
             global_values={k.capitalize(): v['value'] for k, v in s3_cfg.get('fields', {}).items() if v.get('value')},
             global_pages=s3_cfg.get('global_pages', None)
         )
-        
-        # Step 4: Template Mapping
-        s4_cfg = self.config.get('template', {})
-        s4_result = Step4Format(self.tracker, context).run(auto_template=s4_cfg.get('name'))
-        
-        # Step 5: Final Builder
-        s5_result = Step5Builder(self.tracker, context).run()
+
+        # Steps 4 + 5: merged Post-Step-3 Auto-Build (invisible backend step)
+        # Uses the Template.xlsx default schema (all fields included).
+        # s4_cfg in YAML is ignored — the auto-build always uses the default
+        # Template.xlsx skeleton to guarantee one consistent output schema.
+        ab_result = run_post_step3_build(self.tracker, context)
+        s4_result = ab_result.get("step4", {})
+        s5_result = ab_result.get("step5", {})
         
         # Step 6: Corrections (if enabled)
         s6_cfg = self.config.get('corrections', {})

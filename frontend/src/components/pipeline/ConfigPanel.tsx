@@ -4,7 +4,6 @@ import { StepId } from '../../types'
 import { Step1Config } from './configs/Step1Config'
 import { Step2Config } from './configs/Step2Config'
 import { Step3Config } from './configs/Step3Config'
-import { Step4Config } from './configs/Step4Config'
 import { Step6Config } from './configs/Step6Config'
 import { Step8Config } from './configs/Step8Config'
 import { StepRunOnly } from './configs/StepRunOnly'
@@ -13,14 +12,14 @@ import { useAppStore } from '../../store/appStore'
 import { OutputViewer } from './OutputViewer'
 import { useStepHistory } from '../../hooks/useStepHistory'
 
+// Steps 4 & 5 are intentionally absent — they run as an invisible backend
+// operation after Step 3 (see modules/post_step3_build.py on the backend).
 const CONFIG_MAP: Record<string, React.FC<any>> = {
   '1': Step1Config,
   '1.5': StepRunOnly,
   '1.6': StepRunOnly,
   '2': Step2Config,
   '3': Step3Config,
-  '4': Step4Config,
-  '5': StepRunOnly,
   '6': Step6Config,
   '7': StepRunOnly,
   '8': Step8Config,
@@ -134,7 +133,6 @@ export function ConfigPanel() {
         }
       }
       if (activeStep.id === 3) config = store.step3Config
-      if (activeStep.id === 4) config = store.step4Config
       if (activeStep.id === 6) config = {
         ...store.step6Config,
         pdf_path: activeProject?.pdf_path ?? ''

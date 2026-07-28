@@ -65,7 +65,6 @@ export function StepRow({ step, isActive, onClick }: StepRowProps) {
       if (step.id === 1) config = store.step1Config
       if (step.id === 2) config = store.step2Config
       if (step.id === 3) config = store.step3Config
-      if (step.id === 4) config = store.step4Config
       if (step.id === 6) config = store.step6Config
 
       await runStep(activeProject.name, step.id, config)

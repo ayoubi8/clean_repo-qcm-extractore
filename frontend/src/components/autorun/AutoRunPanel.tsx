@@ -67,7 +67,7 @@ export function AutoRunPanel({ onClose }: AutoRunPanelProps) {
             step1: store.batchConfig!.extraction,
             step2: store.batchConfig!.qcm_extraction,
             step3: store.batchConfig!.metadata,
-            step4: store.batchConfig!.template,
+            // Steps 4 & 5 run automatically in the backend after Step 3.
             step6: store.batchConfig!.corrections,
           }
         }

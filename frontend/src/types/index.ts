@@ -7,7 +7,10 @@ export interface Project {
   pdf_path: string;      // absolute path to source PDF — persisted in project.json
 }
 
-export type StepId = 1 | 1.5 | 1.6 | 2 | 3 | 4 | 5 | 6 | 7 | 8
+// Steps 4 & 5 were merged into an invisible backend operation that fires
+// automatically after Step 3 succeeds (see backend modules/post_step3_build.py).
+// They are intentionally NOT exposed to the frontend.
+export type StepId = 1 | 1.5 | 1.6 | 2 | 3 | 6 | 7 | 8
 export type StepStatus = 'idle' | 'running' | 'done' | 'error'
 
 export interface StepState {
@@ -56,24 +59,6 @@ export interface Step3Config {
     clinical_case: MetaFieldConfig
   }
   global_pages: string
-}
-
-export interface Step4Fields {
-  Num: boolean
-  Text: boolean
-  Propositions: boolean
-  Correct: boolean
-  Year: boolean
-  Category: boolean
-  Subcategory: boolean
-  Source: boolean
-  Tag: boolean
-  ClinicalCase: boolean
-}
-
-export interface Step4Config {
-  name: string
-  fields: Step4Fields
 }
 
 export type CorrectionSource = 'ai_knowledge' | 'page_text' | 'auto_detect' | 'vision_ai'
@@ -138,11 +123,12 @@ export interface AutoRunPayload {
   end_step: number
   pause_for_verification: boolean
   use_folder_batch: boolean
+  // Steps 4 & 5 run automatically in the backend after Step 3 — they are no
+  // longer part of the autorun sequence and have no client config.
   run_config: {
     step1?: object
     step2?: object
     step3?: object
-    step4?: object
     step6?: object
   }
 }
