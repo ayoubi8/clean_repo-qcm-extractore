@@ -213,7 +213,10 @@ def _backfill_projects_to_db():
                 except Exception:
                     pass
                     
-                # Register in database projects table
+                # Register in database projects table.
+                # Resilient to a missing `last_activity_at` column: retry the
+                # upsert with a slim payload (created_at only) so the project
+                # still registers until the operator runs migration.sql.
                 try:
                     upsert_row = {
                         "user_id": db_uid,
@@ -226,7 +229,23 @@ def _backfill_projects_to_db():
                     sb.table("projects").upsert(upsert_row, on_conflict="user_id,name").execute()
                     print(f"[BACKFILL] Registered project {pname} for user {storage_id}")
                 except Exception as e:
-                    print(f"[BACKFILL] DB register failed for {storage_id}/{pname}: {e}")
+                    if created_at and (
+                        "column projects.last_activity_at does not exist" in str(e)
+                        or "Could not find the 'last_activity_at' column of 'projects'" in str(e)
+                    ):
+                        try:
+                            slim_row = {
+                                "user_id": db_uid,
+                                "name": pname,
+                                "pdf_storage_path": pdf_path,
+                                "created_at": created_at,
+                            }
+                            sb.table("projects").upsert(slim_row, on_conflict="user_id,name").execute()
+                            print(f"[BACKFILL] Registered project {pname} for user {storage_id} (without last_activity_at — column missing)")
+                        except Exception as e2:
+                            print(f"[BACKFILL] DB register failed for {storage_id}/{pname}: {e2}")
+                    else:
+                        print(f"[BACKFILL] DB register failed for {storage_id}/{pname}: {e}")
                     
         print("[BACKFILL] Finished backfill scan.")
     except Exception as e:

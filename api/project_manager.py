@@ -9,6 +9,24 @@ STEP_FOLDER_MAP = {
     "5": "step5_json", "6": "step6_corrections", "7": "step7_categories", "8": "step8_matches",
 }
 
+
+def _is_missing_column_error(err: any, column: str = "last_activity_at") -> bool:
+    """Supabase/PostgREST emits the column-not-found error either as
+    'column projects.<column> does not exist' (42703) or as
+    'Could not find the <column> column of <table> in the schema cache' (PGRST204).
+    Returns True if `err` matches either shape, so callers can retry a slimmed
+    payload that omits the column and degrades gracefully until the migration runs.
+    """
+    try:
+        msg = str(err)
+        needle = column
+        return (
+            f"column projects.{needle} does not exist" in msg
+            or f"Could not find the '{needle}' column of 'projects'" in msg
+        )
+    except Exception:
+        return False
+
 # NOTE: sys.path manipulation needed because modules/ is at /app/modules
 import sys
 sys.path.insert(0, "/app")
@@ -95,7 +113,10 @@ def list_projects(email: str) -> list:
     projects = []
     seen = set()
     
-    # 1. DB query with retry (RC-1)
+    # 1. DB query with retry (RC-1).
+    # Resilient to a missing `last_activity_at` column: retry a slim SELECT
+    # that selects/orders by `created_at` only so list_projects keeps working
+    # until the operator runs migration.sql (which adds the column).
     db_projects = []
     for attempt in range(2):
         try:
@@ -112,7 +133,25 @@ def list_projects(email: str) -> list:
             break
         except Exception as e:
             print(f"[list_projects] DB query attempt {attempt+1} failed: {e}")
-            if attempt == 1:
+            # If the column is genuinely missing in the live DB schema,
+            # retry without last_activity_at so the app stays usable.
+            if _is_missing_column_error(e, "last_activity_at"):
+                try:
+                    from supabase_client import get_supabase
+                    sb = get_supabase()
+                    db_uid = get_db_user_id({"id": email})
+                    res = (sb.table("projects")
+                             .select("name,created_at,pdf_storage_path")
+                             .eq("user_id", db_uid)
+                             .order("created_at", desc=True)
+                             .execute())
+                    db_projects = res.data or []
+                    print("[list_projects] falling back to created_at (last_activity_at missing)")
+                    break
+                except Exception as fe:
+                    print(f"[list_projects] created_at fallback failed: {fe}")
+                    db_projects = []
+            elif attempt == 1:
                 db_projects = []
 
     # Process DB projects
@@ -212,18 +251,35 @@ def list_projects(email: str) -> list:
             proj = _build_project_from_storage(email, pname, {})
             projects.append(proj)
             seen.add(pname)
-            # Self-heal: upsert missing row so future calls hit DB first
+            # Self-heal: upsert missing row so future calls hit DB first.
+            # Resilient to a missing `last_activity_at` column: drop it from
+            # the upsert payload and retry once so the self-heal still registers
+            # the project (using created_at as a stand-in timestamp).
             try:
                 sb = get_supabase()
-                sb.table("projects").upsert({
+                row = {
                     "user_id": get_db_user_id({"id": email}),
                     "name": pname,
                     "pdf_storage_path": proj.get("pdf_path", ""),
                     "created_at": proj.get("last_modified") or datetime.utcnow().isoformat(),
                     "last_activity_at": proj.get("last_modified") or datetime.utcnow().isoformat(),
-                }, on_conflict="user_id,name").execute()
+                }
+                sb.table("projects").upsert(row, on_conflict="user_id,name").execute()
             except Exception as ue:
-                print(f"[list_projects] self-heal upsert failed for {pname}: {ue}")
+                if _is_missing_column_error(ue, "last_activity_at"):
+                    try:
+                        sb = get_supabase()
+                        sb.table("projects").upsert({
+                            "user_id": get_db_user_id({"id": email}),
+                            "name": pname,
+                            "pdf_storage_path": proj.get("pdf_path", ""),
+                            "created_at": proj.get("last_modified") or datetime.utcnow().isoformat(),
+                        }, on_conflict="user_id,name").execute()
+                        print(f"[list_projects] self-heal registered {pname} without last_activity_at (column missing)")
+                    except Exception as ue2:
+                        print(f"[list_projects] self-heal upsert failed for {pname}: {ue2}")
+                else:
+                    print(f"[list_projects] self-heal upsert failed for {pname}: {ue}")
     except Exception as e:
         print(f"[list_projects] Storage merge error: {e}")
 
