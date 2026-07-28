@@ -303,3 +303,12 @@ async def require_admin(user: dict = Depends(get_current_user)) -> dict:
             detail="Admin privileges required",
         )
     return user
+
+
+def get_db_user_id(user: dict) -> str:
+    """Resolve the real DB UUID for a user. 'admin' placeholder → admin row UUID."""
+    if user.get("id") == "admin" or user.get("email") == ADMIN_EMAIL:
+        rec = find_user_by_email(ADMIN_EMAIL)
+        if rec:
+            return rec["id"]
+    return user.get("id", "")

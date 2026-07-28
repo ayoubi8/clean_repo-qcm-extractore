@@ -15,6 +15,7 @@ sys.path.insert(0, "/app")
 
 from modules.utils.project_context import ProjectContext
 from modules.utils.cost_tracker import CostTracker
+from auth import get_db_user_id
 
 # In-memory registry: project_name → {"context": ..., "tracker": ...}
 _registry = {}
@@ -33,36 +34,94 @@ def get_or_create(project_name: str, email: str) -> dict:
         _registry[registry_key] = {"context": context, "tracker": tracker}
     return _registry[registry_key]
 
-def _get_db_user_id(user_id: str) -> str:
-    if user_id == "admin":
-        try:
-            from auth import find_user_by_email, ADMIN_EMAIL
-            admin_record = find_user_by_email(ADMIN_EMAIL)
-            if admin_record:
-                return admin_record.get("id", user_id)
-        except Exception:
-            pass
-    return user_id
+def _build_project_from_storage(email: str, pname: str, meta: dict) -> dict:
+    local_pdir = Path(f"/app/output/{email}/{pname}")
+    proj = {
+        "name": pname,
+        "last_step": 0,
+        "last_modified": meta.get("created_at") or meta.get("lastUpdated") or meta.get("updated_at") or "",
+        "total_tokens": 0,
+        "pdf_path": ""
+    }
+
+    # Try to list files in f"{email}/{pname}/" to find project.json and get its metadata created_at timestamp
+    try:
+        from storage_client import list_files
+        p_files = list_files(f"{email}/{pname}/")
+        pjson_item = next((x for x in p_files if x.get("name") == "project.json"), None)
+        if pjson_item:
+            proj["last_modified"] = pjson_item.get("created_at") or pjson_item.get("updated_at") or ""
+    except Exception as e:
+        print(f"[_build_project_from_storage] failed to get project.json metadata for {pname}: {e}")
+
+    # Restore project.json locally so pipeline works
+    try:
+        from storage_client import read_file
+        pjson_text = read_file(f"{email}/{pname}/project.json")
+        local_pdir.mkdir(parents=True, exist_ok=True)
+        (local_pdir / "project.json").write_text(pjson_text)
+        pdata = json.loads(pjson_text)
+        proj["pdf_path"] = pdata.get("pdf_path", "")
+    except Exception:
+        pass
+        
+    # Restore costs locally
+    try:
+        from storage_client import read_file
+        costs_text = read_file(f"{email}/{pname}/total_costs.json")
+        local_pdir.mkdir(parents=True, exist_ok=True)
+        (local_pdir / "total_costs.json").write_text(costs_text)
+        costs = json.loads(costs_text)
+        summary = costs.get("summary", costs)
+        proj["total_tokens"] = summary.get("total_tokens", 0)
+    except Exception:
+        pass
+
+    # Check last step
+    STEP_CHECK_ORDER = [
+        (8, "8"), (7, "7"), (6, "6"), (5, "5"),
+        (4, "4"), (3, "3"), (2, "2"), (1.6, "1.6"),
+        (1.5, "1.5"), (1, "1"),
+    ]
+    for snum, sid in STEP_CHECK_ORDER:
+        if step_output_exists(pname, sid, email):
+            proj["last_step"] = snum
+            break
+            
+    return proj
+
 
 def list_projects(email: str) -> list:
     projects = []
+    seen = set()
     
-    # 1. Query the projects DB table first (source of truth)
+    # 1. DB query with retry (RC-1)
     db_projects = []
-    try:
-        from supabase_client import get_supabase
-        sb = get_supabase()
-        db_uid = _get_db_user_id(email)
-        res = sb.table("projects").select("name,created_at,pdf_storage_path").eq("user_id", db_uid).order("created_at", desc=True).execute()
-        db_projects = res.data or []
-    except Exception as e:
-        print(f"[list_projects] DB query failed: {e}")
+    for attempt in range(2):
+        try:
+            from supabase_client import get_supabase
+            sb = get_supabase()
+            db_uid = get_db_user_id({"id": email})
+            res = (sb.table("projects")
+                     .select("name,created_at,last_activity_at,pdf_storage_path")
+                     .eq("user_id", db_uid)
+                     .order("last_activity_at", desc=True)
+                     .order("created_at", desc=True)
+                     .execute())
+            db_projects = res.data or []
+            break
+        except Exception as e:
+            print(f"[list_projects] DB query attempt {attempt+1} failed: {e}")
+            if attempt == 1:
+                db_projects = []
 
+    # Process DB projects
     if db_projects:
         for row in db_projects:
             pname = row["name"]
+            seen.add(pname)
             pdf_path = row.get("pdf_storage_path", "")
-            created_at = row.get("created_at", "")
+            last_modified = row.get("last_activity_at") or row.get("created_at", "")
             
             # Check local FS first for last_step and tokens (fast path)
             local_pdir = Path(f"/app/output/{email}/{pname}")
@@ -132,19 +191,52 @@ def list_projects(email: str) -> list:
             projects.append({
                 "name": pname,
                 "last_step": last_step,
-                "last_modified": created_at,
+                "last_modified": last_modified,
                 "total_tokens": total_tokens,
                 "pdf_path": pdf_path
             })
 
-    # 2. Fallback: Local filesystem scan and Storage listing if DB returns nothing
+    # 2. Merge: discover any project in Storage missing from DB and self-heal
+    try:
+        from storage_client import list_files
+        items = list_files(f"{email}/")
+        storage_names = set()
+        for it in items:
+            name = it.get("name", "")
+            parts = name.split("/")
+            if parts and parts[0] and not parts[0].startswith(("_", ".", "global")):
+                storage_names.add(parts[0])
+
+        missing = storage_names - seen
+        for pname in sorted(missing):
+            proj = _build_project_from_storage(email, pname, {})
+            projects.append(proj)
+            seen.add(pname)
+            # Self-heal: upsert missing row so future calls hit DB first
+            try:
+                sb = get_supabase()
+                sb.table("projects").upsert({
+                    "user_id": get_db_user_id({"id": email}),
+                    "name": pname,
+                    "pdf_storage_path": proj.get("pdf_path", ""),
+                    "created_at": proj.get("last_modified") or datetime.utcnow().isoformat(),
+                    "last_activity_at": proj.get("last_modified") or datetime.utcnow().isoformat(),
+                }, on_conflict="user_id,name").execute()
+            except Exception as ue:
+                print(f"[list_projects] self-heal upsert failed for {pname}: {ue}")
+    except Exception as e:
+        print(f"[list_projects] Storage merge error: {e}")
+
+    # 3. Third-tier fallback: Local filesystem scan if STILL no projects
+    # (e.g. offline container with local data)
     if not projects:
         output_dir = Path(f"/app/output/{email}")
         if output_dir.exists():
             for d in sorted(output_dir.iterdir()):
                 if not d.is_dir() or d.name.startswith(("_", ".", "global")):
                     continue
-
+                
+                pname = d.name
                 last_step = 0
                 STEP_ORDER = [
                     (8, "step8_matcher"), (7, "step7_categories"), (6, "step6_corrections"),
@@ -177,67 +269,15 @@ def list_projects(email: str) -> list:
                         pass
 
                 projects.append({
-                    "name": d.name,
+                    "name": pname,
                     "last_step": last_step,
                     "last_modified": datetime.fromtimestamp(d.stat().st_mtime).isoformat() + "Z",
                     "total_tokens": total_tokens,
                     "pdf_path": pdf_path
                 })
 
-        # Supabase Storage fallback
-        if not projects:
-            try:
-                from storage_client import list_files, read_file
-                items = list_files(f"{email}/")
-                project_names = set()
-                for item in items:
-                    name = item.get("name", "")
-                    parts = name.split("/")
-                    if parts and parts[0] and not parts[0].startswith(("_", ".", "global")):
-                        project_names.add(parts[0])
-
-                for pname in sorted(project_names):
-                    proj = {
-                        "name": pname, "last_step": 0,
-                        "last_modified": "", "total_tokens": 0, "pdf_path": ""
-                    }
-                    try:
-                        pjson_text = read_file(f"{email}/{pname}/project.json")
-                        local_pdir = Path(f"/app/output/{email}/{pname}")
-                        local_pdir.mkdir(parents=True, exist_ok=True)
-                        (local_pdir / "project.json").write_text(pjson_text)
-                        pdata = json.loads(pjson_text)
-                        proj["pdf_path"] = pdata.get("pdf_path", "")
-                    except Exception:
-                        pass
-                    try:
-                        costs_text = read_file(f"{email}/{pname}/total_costs.json")
-                        local_pdir = Path(f"/app/output/{email}/{pname}")
-                        local_pdir.mkdir(parents=True, exist_ok=True)
-                        (local_pdir / "total_costs.json").write_text(costs_text)
-                        costs = json.loads(costs_text)
-                        summary = costs.get("summary", costs)
-                        proj["total_tokens"] = summary.get("total_tokens", 0)
-                    except Exception:
-                        pass
-
-                    STEP_CHECK_ORDER = [
-                        (8, "8"), (7, "7"), (6, "6"), (5, "5"),
-                        (4, "4"), (3, "3"), (2, "2"), (1.6, "1.6"),
-                        (1.5, "1.5"), (1, "1"),
-                    ]
-                    for snum, sid in STEP_CHECK_ORDER:
-                        if step_output_exists(pname, sid, email):
-                            proj["last_step"] = snum
-                            break
-
-                    projects.append(proj)
-
-                projects.sort(key=lambda p: p["last_modified"] or "", reverse=True)
-                if projects:
-                    print(f"[list_projects] Restored {len(projects)} project(s) from Supabase for {email}")
-            except Exception as e:
-                print(f"[list_projects] Supabase fallback error: {e}")
+    # Final sort (descending by last_modified)
+    projects.sort(key=lambda p: p.get("last_modified") or "", reverse=True)
     return projects
 
 def step_output_exists(project_name: str, step_id: str, email: str) -> bool:
