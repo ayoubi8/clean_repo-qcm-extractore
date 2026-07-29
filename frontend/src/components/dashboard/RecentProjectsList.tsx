@@ -23,8 +23,9 @@ export function RecentProjectsList({ projects, loading }: RecentProjectsListProp
     )
   }
 
+  const ts = (p: Project) => p.last_modified ? new Date(p.last_modified).getTime() : 0
   const recent = [...projects]
-    .sort((a, b) => b.last_modified.localeCompare(a.last_modified))
+    .sort((a, b) => ts(b) - ts(a))
     .slice(0, 5)
 
   return (
@@ -62,7 +63,7 @@ export function RecentProjectsList({ projects, loading }: RecentProjectsListProp
                     {proj.name}
                   </p>
                   <p className="text-[10px] text-outline mt-0.5 font-medium uppercase tracking-widest opacity-60">
-                    Step {proj.last_step}/8 · {formatRelative(proj.last_modified)}
+                    Step {(proj.last_step === 4 || proj.last_step === 5) ? 3 : proj.last_step}/8 · {formatRelative(proj.last_modified)}
                   </p>
                 </div>
               </div>

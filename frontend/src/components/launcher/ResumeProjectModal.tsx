@@ -24,7 +24,8 @@ export function ResumeProjectModal({ onSuccess }: ResumeProjectModalProps) {
     setError(null)
     try {
       const data = await fetchProjects()
-      setProjects([...data].sort((a, b) => new Date(b.last_modified).getTime() - new Date(a.last_modified).getTime()))
+      const ts = (p: Project) => p.last_modified ? new Date(p.last_modified).getTime() : 0
+      setProjects([...data].sort((a, b) => ts(b) - ts(a)))
     } catch (e) {
       setError('Failed to load existing projects.')
     } finally {
@@ -108,7 +109,7 @@ export function ResumeProjectModal({ onSuccess }: ResumeProjectModalProps) {
                   {project.name}
                 </p>
                 <p className="text-[11px] text-outline mt-0.5 font-medium">
-                  Step {project.last_step} / 8 · {formatRelative(project.last_modified)}
+                  Step {(project.last_step === 4 || project.last_step === 5) ? 3 : project.last_step} / 8 · {formatRelative(project.last_modified)}
                 </p>
                 {project.pdf_path && (
                   <p className="text-[10px] text-outline/50 font-mono truncate mt-0.5">
@@ -170,7 +171,7 @@ export function ResumeProjectModal({ onSuccess }: ResumeProjectModalProps) {
           {selected?.last_step === 0 ? 'open_in_new' : 'history'}
         </span>
         {selected
-          ? (selected.last_step === 0 ? 'Open Project' : `Continue from Step ${selected.last_step}`)
+          ? (selected.last_step === 0 ? 'Open Project' : `Continue from Step ${(selected.last_step === 4 || selected.last_step === 5) ? 3 : selected.last_step}`)
           : 'Select a project'
         }
       </button>

@@ -6,7 +6,6 @@ import { useStepModels } from '../../../hooks/useStepModels'
 const STEP_DESCRIPTIONS: Record<number, string> = {
   1.5: "Fixes common text issues and formatting in the extracted text automatically.",
   1.6: "Optional manual check step for OCR errors. This will be expanded in Phase 4.",
-  5: "Merges all per-page JSON files from Step 2 into a single unified QCM list. No configuration needed.",
   7: "Assigns category IDs using Llama-3.3. Reads categorization.model from .env.",
   8: "Runs similarity matching against the reference DB. Configure thresholds in Settings."
 }
