@@ -73,6 +73,9 @@ def list_files(prefix: str) -> list:
     List files under a storage prefix.
     Returns list of metadata dicts from Supabase: [{name, id, metadata, ...}].
     Handles pagination.
+    NOTE: this is a FLAT listing — sub-folders are returned as a single entry
+    with `id: null`. Use list_files_recursive() when you need all files inside
+    sub-folders (e.g. step output under `step1_extraction/accepted/page_*.txt`).
     """
     sb = get_supabase()
     all_items = []
@@ -91,6 +94,50 @@ def list_files(prefix: str) -> list:
     except Exception as e:
         print(f"[STORAGE] list_files error: {e}")
     return all_items
+
+
+def list_files_recursive(prefix: str) -> list:
+    """
+    Recursively list all FILES (objects with an `id`) under a storage prefix.
+    Each returned item has its `name` rewritten to be the path RELATIVE to
+    `prefix`, including sub-folder segments e.g. "accepted/page_1.txt".
+    This mirrors what `Path.rglob("*")` yields relative to a local step_dir,
+    so the API endpoints can use the same shape for local FS and Storage fallbacks.
+
+    Folder entries (id == null) are recursed into, not returned.
+    """
+    if not prefix:
+        return []
+    sb = get_supabase()
+    result = []
+    root = prefix.rstrip("/")
+
+    def _recurse(current_prefix: str):
+        try:
+            items = sb.storage.from_(BUCKET).list(
+                current_prefix,
+                {"limit": 100, "offset": 0, "sortBy": {"column": "name", "order": "asc"}}
+            ) or []
+        except Exception as e:
+            print(f"[STORAGE] list_files_recursive error at {current_prefix}: {e}")
+            return
+        for item in items:
+            name = item.get("name", "")
+            if not name:
+                continue
+            absolute_path = f"{current_prefix}/{name}"
+            if item.get("id"):
+                # It's a file — rewrite name to be path relative to original prefix.
+                rel_path = absolute_path[len(root) + 1:]
+                new_item = dict(item)
+                new_item["name"] = rel_path
+                result.append(new_item)
+            else:
+                # Sub-folder — recurse.
+                _recurse(absolute_path)
+
+    _recurse(root)
+    return result
 
 
 def delete_prefix(prefix: str) -> None:

@@ -353,12 +353,14 @@ def step_output_exists(project_name: str, step_id: str, email: str) -> bool:
 
     # ── Fallback: Supabase Storage (FIX-01) ─────────────────────────────────
     # Only reach here if local FS is empty or the container was restarted.
+    # Use list_files_recursive because step outputs live in sub-folders
+    # (e.g. step1_extraction/accepted/page_*.txt) — flat list_files would
+    # only return the "accepted" folder entry (id=None) and look empty.
     try:
-        from storage_client import list_files
+        from storage_client import list_files_recursive
         prefix = f"{email}/{project_name}/{folder_name}"
-        items = list_files(prefix)
-        # Items with an 'id' field are real files; items without are sub-folders.
-        return any(f.get("id") for f in items)
+        items = list_files_recursive(prefix)
+        return len(items) > 0
     except Exception as e:
         print(f"[step_output_exists] Storage fallback failed for {email}/{project_name}/{folder_name}: {e}")
         return False

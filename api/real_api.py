@@ -41,7 +41,7 @@ import uuid
 from supabase_client import get_supabase
 from storage_client import (
     write_file, write_bytes_file, read_file, read_bytes_file,
-    file_exists, list_files, delete_prefix, get_signed_url,
+    file_exists, list_files, list_files_recursive, delete_prefix, get_signed_url,
     write_pickle, read_pickle
 )
 
@@ -1817,14 +1817,15 @@ def get_step_output_files(name: str, step_id: str, user: dict = Depends(get_curr
         if files:
             return {"files": files}
 
-    # Fallback: list from Supabase Storage
+    # Fallback: list from Supabase Storage (recursive — step outputs live in
+    # sub-folders like step1_extraction/accepted/page_*.txt)
     storage_prefix = f"{user['id']}/{name}/{folder_name}"
     try:
-        items = list_files(storage_prefix)
+        items = list_files_recursive(storage_prefix)
         files = [
             {"name": it["name"], "size_bytes": it.get("metadata", {}).get("size", 0),
              "path": f"{storage_prefix}/{it['name']}", "created_at": ""}
-            for it in items if it.get("id")
+            for it in items
         ]
         return {"files": files}
     except Exception:
@@ -1927,12 +1928,13 @@ def get_step_output_history(name: str, step_id: str, user: dict = Depends(get_cu
         if current_files:
             runs.append({"run_id": "current", "label": "\u25b6 Current Output", "files": current_files})
     else:
-        # Fallback: Supabase Storage for current
+        # Fallback: Supabase Storage for current (recursive — outputs live
+        # in sub-folders like accepted/page_*.txt)
         try:
-            items = list_files(f"{user['id']}/{name}/{folder_name}")
+            items = list_files_recursive(f"{user['id']}/{name}/{folder_name}")
             current_files = [
                 {"name": it["name"], "size_bytes": it.get("metadata", {}).get("size", 0), "created_at": ""}
-                for it in items if it.get("id")
+                for it in items
             ]
             if current_files:
                 runs.append({"run_id": "current", "label": "\u25b6 Current Output", "files": current_files})
