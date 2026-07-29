@@ -26,7 +26,10 @@ class ProjectContext:
         
     @staticmethod
     def list_projects() -> list:
-        """List all existing project names."""
+        """
+        Legacy CLI path — kept for local non-web usage.
+        List all existing project names.
+        """
         if not os.path.exists("output"):
             return []
         

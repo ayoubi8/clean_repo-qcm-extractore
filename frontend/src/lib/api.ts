@@ -77,12 +77,17 @@ export async function downloadAuthenticatedFile(url: string, filename: string): 
 
 // GET /projects
 export async function fetchProjects(): Promise<Project[]> {
-  const res = await fetchWithRefresh(`${BASE}/projects`, {
-    headers: { ...getAuthHeaders() }
-  })
-  if (!res.ok) throw new Error('Failed to fetch projects')
-  const data = await res.json()
-  return data.projects
+  const attempt = async () => {
+    const res = await fetchWithRefresh(`${BASE}/projects`, { headers: { ...getAuthHeaders() } })
+    if (!res.ok) throw new Error('Failed to fetch projects')
+    const data = await res.json()
+    return (data.projects ?? []) as Project[]
+  }
+  try { return await attempt() }
+  catch (e) {
+    await new Promise(r => setTimeout(r, 400))
+    return await attempt()   // one retry
+  }
 }
 
 // DELETE /projects/{name}
