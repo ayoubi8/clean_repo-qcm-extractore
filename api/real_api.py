@@ -1114,6 +1114,62 @@ def _upload_step_folder_to_storage(user_id: str, project: str, folder_name: str,
 
 # --- Step Run Endpoint + Background Task ---
 
+# Maps each step to the prior step folder(s) its module reads as input.
+# Used by _restore_step_input_from_storage() so that after a container
+# restart (local FS wiped) the step finds its dependencies on disk.
+STEP_INPUT_DEPENDENCIES = {
+    "2":         [("step1_extraction", "accepted")],   # Step 2 reads step1 Extraction accepted
+    "3":         [("step2_qcm", "accepted")],            # Step 3 reads step2 QCM accepted
+    # Steps 4 & 5 are auto-run after Step 3 — they read step3_metadata/accepted
+    # but we don't expose them in the UI. Their restore is handled by
+    # post_step3_build.py which uses context.get_path() — same local-FS-first
+    # logic. If local FS is empty, the auto-build will fail with "no QCMs"
+    # which is fine because Step 3 itself wouldn't have produced anything.
+    "6":         [("step5_json", None), ("step6_corrections", None)],  # Step 6 reads merged_qcms.json + its own prior corrections
+    "7":         [("step6_corrections", "accepted"), ("step5_json", None)],  # Step 7 reads corrected QCMs
+    "8":         [("step5_json", None), ("step7_categories", "accepted")],  # Step 8 reads merged_qcms + categorized
+}
+
+
+def _restore_step_input_from_storage(user_id: str, project: str, step_id: str) -> None:
+    """Before running a step, ensure its input folders exist on local disk.
+    If a folder is missing (container restart wiped local FS), download all
+    files from Supabase Storage under {user_id}/{project}/{folder}/ recursively.
+    Mirrors the existing PDF restore pattern but for step output folders.
+    """
+    deps = STEP_INPUT_DEPENDENCIES.get(str(step_id))
+    if not deps:
+        return
+    for folder, subdir in deps:
+        local_dir = Path(f"/app/output/{user_id}/{project}/{folder}")
+        if subdir:
+            local_dir = local_dir / subdir
+        # Fast path: already present locally (active container session or
+        # the step was already run once since last restart).
+        if local_dir.exists() and any(local_dir.rglob("*")):
+            continue
+        # Slow path: pull from Storage.
+        try:
+            storage_prefix = f"{user_id}/{project}/{folder}"
+            items = list_files_recursive(storage_prefix)
+            if not items:
+                continue
+            local_dir.mkdir(parents=True, exist_ok=True)
+            restored = 0
+            for it in items:
+                rel = it.get("name", "")
+                if not rel:
+                    continue
+                storage_path = f"{storage_prefix}/{rel}"
+                local_path = local_dir / rel
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                local_path.write_bytes(read_bytes_file(storage_path))
+                restored += 1
+            if restored:
+                print(f"[RESTORE] ✅ Restored {restored} file(s) from Supabase → {local_dir}")
+        except Exception as e:
+            print(f"[RESTORE] ⚠️ Could not restore {folder}/{subdir or ''} for step {step_id}: {e}")
+
 @app.post(
     "/projects/{name}/steps/{step_id}/run",
     deprecated=False,
@@ -1200,6 +1256,18 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
                     print(f"[RESTORE] ⚠️ source.pdf not in Supabase at {storage_pdf}")
             except Exception as _e:
                 print(f"[RESTORE] ❌ PDF download failed: {_e}")
+
+        # Ensure prior-step output folders are on local disk before running.
+        # After a container restart the local FS is wiped; Step 2/3/6/7/8 modules
+        # read from local directories (e.g. step2_qcm/accepted/). Without this
+        # restore, Step 3 would log "No extracted QCMs found in
+        # /app/output/.../step2_qcm/accepted" even though the files exist in
+        # Supabase Storage. _restore_step_input_from_storage() mirrors the PDF
+        # pattern but for step output folders.
+        try:
+            _restore_step_input_from_storage(user_id, project, step_id)
+        except Exception as _rie:
+            print(f"[RESTORE] ⚠️ step-input restore failed for step {step_id}: {_rie}")
 
         # Ensure Step 8 selected reference database is downloaded locally
         if step_id == "8" and config.get("ref_db_path"):
