@@ -1148,9 +1148,15 @@ def _restore_step_input_from_storage(user_id: str, project: str, step_id: str) -
         # the step was already run once since last restart).
         if local_dir.exists() and any(local_dir.rglob("*")):
             continue
-        # Slow path: pull from Storage.
+        # Slow path: pull from Storage. Include subdir in the storage prefix
+        # so list_files_recursive() walks from the SAME path local_dir ends
+        # at — otherwise rel-paths from StepX are appended to "accepted/"
+        # twice and files land in accepted/accepted/file.json (unreachable
+        # to the module that reads accepted/file.json).
         try:
             storage_prefix = f"{user_id}/{project}/{folder}"
+            if subdir:
+                storage_prefix = f"{storage_prefix}/{subdir}"
             items = list_files_recursive(storage_prefix)
             if not items:
                 continue
