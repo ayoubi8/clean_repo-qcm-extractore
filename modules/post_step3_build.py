@@ -5,6 +5,8 @@ Uses the Template.xlsx default schema (all fields included), so the output
 matches what a user would get today if they selected "all Fields to Include".
 """
 import json
+import shutil
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
 
@@ -89,6 +91,33 @@ def run_post_step3_build(tracker, context, output_user_id: str = None,
 
     total = s5_result.get("total_qcms", 0)
     print(f"[AUTO-BUILD] ✅ Auto-build done: {total} QCMs merged.")
+
+    # 4. Surface the merged result AS Step 3's output. The user explicitly
+    # demanded: "step 3 results are the results of step 4-5 that run in backend
+    # on the real results of step 3". So we copy merged_qcms.json + the
+    # timestamped xlsx into step3_metadata/accepted/ so that when the user
+    # clicks "Step 3 · Metadata Detection" in the UI, the file list includes
+    # the final merged artifacts (alongside the raw per-page step3 JSON files).
+    try:
+        step3_accepted = context.get_path("step3_metadata", "accepted")
+        step5_dir = context.get_path("step5_json")
+        # merged_qcms.json (canonical name — last one wins, so re-running Step 3
+        # produces a fresh merged file the user can preview).
+        merged_src = Path(step5_dir) / "merged_qcms.json"
+        merged_dst = Path(step3_accepted) / "merged_qcms.json"
+        if merged_src.exists():
+            shutil.copy2(merged_src, merged_dst)
+            print(f"[AUTO-BUILD] ✅ Copied merged_qcms.json → step3_metadata/accepted/")
+        # timestamped xlsx — give it a stable name so the frontend shows a
+        # single predictable file regardless of how many times Step 3 re-runs.
+        xlsx_src_str = s5_result.get("xlsx_file", "")
+        if xlsx_src_str and Path(xlsx_src_str).exists():
+            xlsx_dst = Path(step3_accepted) / "merged_qcms.xlsx"
+            shutil.copy2(xlsx_src_str, xlsx_dst)
+            print(f"[AUTO-BUILD] ✅ Copied xlsx → step3_metadata/accepted/merged_qcms.xlsx")
+    except Exception as copy_e:
+        print(f"[AUTO-BUILD] ⚠️ Failed to surface merged result into step3 output: {copy_e}")
+
     return {
         "status": "ok",
         "step4": {"template": DEFAULT_TEMPLATE_XLSX, "name": DEFAULT_TEMPLATE_NAME},

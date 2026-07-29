@@ -40,8 +40,13 @@ class Step5Builder:
         with open(target_template_path, 'r', encoding='utf-8') as f:
             template = json.load(f)
             
-        # 2. Load all QCMs from Step 3
-        q_files = sorted(list(Path(target_step3_dir).glob("*.json")))
+        # 2. Load all QCMs from Step 3 — EXCLUDE any merged_qcms.json that the
+        # Post-Step-3 auto-build may have mirrored back into step3_metadata/accepted/
+        # so re-runs of Step 3 don't double-count QCMs from a prior merge.
+        q_files = sorted([
+            p for p in Path(target_step3_dir).glob("*.json")
+            if not p.name.startswith("merged_")
+        ])
         if not q_files:
             print(f"❌ No QCM data found in {target_step3_dir}. Please run Step 3 first.")
             return {}

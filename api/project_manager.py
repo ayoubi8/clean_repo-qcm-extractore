@@ -96,9 +96,13 @@ def _build_project_from_storage(email: str, pname: str, meta: dict) -> dict:
         pass
 
     # Check last step
+    # Steps 4 & 5 are intentionally skipped — they are an invisible backend
+    # auto-build that fires after Step 3 succeeds (see modules/post_step3_build.py).
+    # Reporting last_step as 4 or 5 here would confuse the UI (which hides those
+    # steps) — the user-visible progression must jump 3 -> 6 directly.
     STEP_CHECK_ORDER = [
-        (8, "8"), (7, "7"), (6, "6"), (5, "5"),
-        (4, "4"), (3, "3"), (2, "2"), (1.6, "1.6"),
+        (8, "8"), (7, "7"), (6, "6"),
+        (3, "3"), (2, "2"), (1.6, "1.6"),
         (1.5, "1.5"), (1, "1"),
     ]
     for snum, sid in STEP_CHECK_ORDER:

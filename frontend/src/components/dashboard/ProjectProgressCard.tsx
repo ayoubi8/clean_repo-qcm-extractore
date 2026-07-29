@@ -17,8 +17,14 @@ export function ProjectProgressCard({ project, allProjects, loading }: ProjectPr
     )
   }
 
-  const steps = [1, 1.5, 1.6, 2, 3, 4, 5, 6, 7, 8]
-  const lastStep = project?.last_step ?? 0
+  // Steps 4 & 5 are intentionally absent — they run as an invisible backend
+  // auto-build after Step 3 succeeds (see backend modules/post_step3_build.py).
+  const steps = [1, 1.5, 1.6, 2, 3, 6, 7, 8]
+  // last_step from backend may be 4 or 5 (auto-build marked them done). Map
+  // those hidden step ids back to the visible Step 3 so the bar reflects what
+  // the user actually sees in the UI.
+  const rawLastStep = project?.last_step ?? 0
+  const lastStep = (rawLastStep === 4 || rawLastStep === 5) ? 3 : rawLastStep
 
   return (
     <div className="bg-surface-container rounded-2xl p-6 border border-outline-variant/10 flex flex-col h-[240px] shadow-sm">
@@ -35,19 +41,13 @@ export function ProjectProgressCard({ project, allProjects, loading }: ProjectPr
         <span className={`text-[10px] font-black px-3 py-1 rounded-full uppercase tracking-widest
           ${project ? "bg-primary/10 text-primary border border-primary/20"
                     : "bg-surface-container-high text-outline"}`}>
-          {project ? `Stage ${project.last_step} / 10` : "—"}
+          {project ? `Stage ${lastStep} / 8` : "—"}
         </span>
       </div>
 
-      {/* Step progress bar — 10 segments */}
+      {/* Step progress bar — 8 segments (Steps 4 & 5 hidden — auto-build) */}
       <div className="flex gap-1.5 mb-4">
         {steps.map((step, i) => {
-          // Logic for filling: if lastStep is e.g. 6, we fill up to index 7 (since 6 is the 8th segment in our sequence [1, 1.5, 1.6, 2, 3, 4, 5, 6, 7, 8])
-          // Wait, the plan says "i < last_step". Let's check step mapping.
-          // Step IDs: 1, 1.5, 1.6, 2, 3, 4, 5, 6, 7, 8
-          // If last_step is 6, it means we completed step 6? 
-          // Usually last_step means "last completed step".
-          // Let's use index based on the steps array.
           const currentIdx = steps.indexOf(lastStep)
           const isFilled = i <= currentIdx
 
@@ -66,6 +66,7 @@ export function ProjectProgressCard({ project, allProjects, loading }: ProjectPr
       <div className="flex justify-between text-[9px] text-outline font-mono opacity-60">
         {steps.map(s => <span key={s}>{s}</span>)}
       </div>
+      <p className="text-[8px] text-outline/40 italic mt-1">Steps 4 & 5 run automatically after Step 3</p>
 
       {/* Total projects stat */}
       <div className="mt-auto pt-4 border-t border-outline-variant/10 flex items-center justify-between">
