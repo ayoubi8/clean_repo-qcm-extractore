@@ -1614,7 +1614,8 @@ def _call_step(step_id: str, tracker, context, config: dict):
                     # stale (e.g. a Supabase storage key) after a container restart.
                     pdf_path=str(Path(f"/app/output/{context.name}/source.pdf")),
                     auto_ocr=(config.get("method", "") == "vision_ocr"),
-                    ocr_guidance=config.get("ocr_guidance", "")
+                    ocr_guidance=config.get("ocr_guidance", ""),
+                    force_overwrite=bool(config.get("force_overwrite", False)),
                ),
         "1.5": lambda: Step1_5BatchTextFixer(tracker, context).run(),
         "1.6": lambda: Step1_6IntelligentTextFixer(tracker, context).run(),

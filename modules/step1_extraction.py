@@ -22,7 +22,7 @@ class Step1Extraction:
         self.context = project_context
         self.cache = OCRCache()
     
-    def run(self, pdf_path: str, auto_ocr: bool = False, ocr_guidance: str = "") -> Dict:
+    def run(self, pdf_path: str, auto_ocr: bool = False, ocr_guidance: str = "", force_overwrite: bool = False) -> Dict:
         """
         Main execution
         Returns: {"output_dir": "output/project/step1_extraction", "method": "vision_ocr", "cost": 0.0073}
@@ -30,6 +30,12 @@ class Step1Extraction:
         print("\n" + "="*60)
         print("STEP 1: TEXT EXTRACTION")
         print("="*60)
+        
+        # Clear OCR cache when the user confirmed overwrite — otherwise the
+        # cache returns stale (possibly bad) OCR results for the same PDF.
+        if force_overwrite:
+            print("[OVERWRITE] Clearing OCR cache for this PDF...")
+            self.cache.clear(pdf_path)
         
         # Load document
         doc_processor = DocumentProcessor(pdf_path)

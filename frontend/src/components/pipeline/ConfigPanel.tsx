@@ -119,7 +119,8 @@ export function ConfigPanel() {
       let config: Record<string, any> = {}
       if (activeStep.id === 1) config = {
         ...store.step1Config,
-        pdf_path: activeProject?.pdf_path ?? ''
+        pdf_path: activeProject?.pdf_path ?? '',
+        force_overwrite: overwriteConfirmed,
       }
       if (activeStep.id === 2) {
         const s = store.step2Config

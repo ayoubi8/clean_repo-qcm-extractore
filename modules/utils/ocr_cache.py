@@ -37,3 +37,20 @@ class OCRCache:
         
         with open(cache_file, 'w', encoding='utf-8') as f:
             json.dump({"text": text, "pdf": pdf_path, "page": page_num}, f)
+
+    def clear(self, pdf_path: str):
+        """Remove all cached pages for a given PDF file."""
+        try:
+            file_hash = hashlib.md5(open(pdf_path, 'rb').read()).hexdigest()
+        except Exception:
+            return
+        prefix = f"{file_hash}_p"
+        removed = 0
+        for cache_file in self.cache_dir.glob(f"{prefix}*.json"):
+            try:
+                cache_file.unlink()
+                removed += 1
+            except Exception:
+                pass
+        if removed:
+            print(f"[OCR-CACHE] Cleared {removed} cached page(s) for {Path(pdf_path).name}")

@@ -62,7 +62,7 @@ export function StepRow({ step, isActive, onClick }: StepRowProps) {
     try {
       // Map step ID to config object
       let config = {}
-      if (step.id === 1) config = store.step1Config
+      if (step.id === 1) config = { ...store.step1Config, force_overwrite: step.outputExists }
       if (step.id === 2) {
         // Merged Step 2: forward both extraction + metadata config.
         // Step 3 config rides along as `step3` sub-key for run_post_step2_metadata.
