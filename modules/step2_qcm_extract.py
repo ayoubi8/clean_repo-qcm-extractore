@@ -8,8 +8,6 @@ from modules.openrouter_client import OpenRouterClient
 from modules.utils.cost_tracker import CostTracker
 from modules.utils.prompt_helper import PromptHelper
 from modules.utils.file_manager import FileManager
-from modules.step2_5_qcm_merger import Step2_5QCMMerger
-
 class Step2QCMExtract:
     """
     v6.0 - Full Page Semantic Extraction
@@ -108,22 +106,12 @@ class Step2QCMExtract:
                 break
         
         # ============================================================
-        # AUTOMATIC STEP 2.5: Merge split QCMs
-        # ============================================================
-        print("\n🔗 Running automatic QCM merger (Step 2.5)...")
-        try:
-            merger = Step2_5QCMMerger(project_context=self.context)
-            merge_result = merger.run(
-                input_dir=str(self.context.get_path("step2_qcm", "accepted")) if self.context else None
-            )
-            
-            if merge_result['merged_count'] > 0:
-                print(f"✅ Merged {merge_result['merged_count']} split QCMs automatically")
-            else:
-                print("✅ No split QCMs detected")
-        except Exception as e:
-            print(f"⚠️  Warning: Auto-merge failed: {e}")
-            print("   Continuing with un-merged data...")
+        # NOTE: Step 2.5 (automatic split-QCM merger) was removed.
+        # The active extraction path is Step2QCMExtractBatch (API/auto),
+        # which already eliminates split-QCM problems in a single LLM call
+        # and runs _apply_incomplete_fix for any stragglers. The legacy
+        # Step2_5QCMMerger was a guaranteed no-op on the active path
+        # (it globs a page_*.json pattern the batch mode never produces).
         # ============================================================
                 
         print(f"\n✅ Step 2 Complete. Total QCMs extracted: {len(all_results)}")
