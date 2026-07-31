@@ -1179,12 +1179,17 @@ def _restore_step_input_from_storage(user_id: str, project: str, step_id: str) -
 @app.post(
     "/projects/{name}/steps/{step_id}/run",
     deprecated=False,
-    summary="Run a single pipeline step. NOTE: steps 4 and 5 are now deprecated "
-            "— they run automatically in the backend after Step 3 succeeds "
-            "(see modules/post_step3_build.py). Manual /steps/4/run and "
-            "/steps/5/run remain available for advanced/debug use.",
+    summary="Run a single pipeline step. Step 2 success auto-triggers Step 3 "
+            "(metadata) and the Step 4→5 auto-build in the backend (see "
+            "modules/post_step2_metadata.py). Steps 3, 4 and 5 are no longer "
+            "standalone steps. Manual /steps/4/run and /steps/5/run remain "
+            "available for advanced/debug use.",
 )
 async def run_step(name: str, step_id: str, body: dict, user: dict = Depends(get_current_user)):
+    # Q5→5b: Step 3 is no longer a standalone step — it now runs as an
+    # invisible cascade after Step 2 succeeds (see run_post_step2_metadata).
+    if str(step_id) == "3":
+        raise HTTPException(status_code=410, detail="Step 3 is no longer a standalone step. It runs automatically after Step 2 succeeds. Call POST /projects/{name}/steps/2/run instead.")
     if job_manager.is_running(name, step_id):
         return {"error": "Step already running"}
 
@@ -1306,41 +1311,45 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
             job_manager.set_done(project, step_id)
             log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "ok", "text": f"\u2705 Step {step_id} completed successfully."})
 
-            # POST-STEP-3 AUTO-BUILD: after Step 3 succeeds, invisibly run the
-            # old Step 4 (Format/Template) + Step 5 (JSON Merge) as a single
-            # backend operation using the Template.xlsx default schema (all
-            # fields included). Steps 4 & 5 are no longer exposed in the UI.
-            # Failure here MUST NOT flip Step 3's success status — the user can
-            # still run Steps 4/5 manually via the deprecated endpoints.
+            # POST-STEP-2 AUTO-ENRICH: after Step 2 succeeds, invisibly run
+            # the old Step 3 (metadata) + the Step 4/5 auto-build
+            # (run_post_step3_build) as a single backend cascade. Step 3 is
+            # no longer an independently-triggered step (see Q5→5b in
+            # MERGE_STEP2_STEP3_REPORT.md); its trigger moved inside Step 2's
+            # task. Failure here MUST NOT flip Step 2's success status — the
+            # user can still re-run Step 2 to retry the whole cascade.
             auto_build_folders: list = []
-            if step_id == "3":
+            if step_id == "2":
                 try:
-                    from modules.post_step3_build import run_post_step3_build
+                    from modules.post_step2_metadata import run_post_step2_metadata
+                    step3_cfg = config.get("step3", config.get("step3_config", {}))
                     res = await loop.run_in_executor(
                         None,
-                        lambda: run_post_step3_build(tracker, context, user_id, project)
+                        lambda: run_post_step2_metadata(tracker, context, user_id, project, step3_cfg)
                     )
-                    if res.get("status") == "ok":
-                        total = res.get("step5", {}).get("total_qcms", 0)
-                        log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "ok", "text": f"⚡ Auto-build (Step 4→5) done in backend: {total} QCMs merged."})
+                    rstatus = res.get("status")
+                    if rstatus == "ok":
+                        total = res.get("build", {}).get("step5", {}).get("total_qcms", 0)
+                        log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "ok", "text": f"⚡ Auto-enrich (Step 3 + build) completed: {total} QCMs merged."})
+                        job_manager.set_done(project, "3")
                         job_manager.set_done(project, "4")
                         job_manager.set_done(project, "5")
-                        auto_build_folders = ["step4_format", "step5_json"]
+                        auto_build_folders = ["step3_metadata", "step4_format", "step5_json"]
                         # Record success badges for the hidden steps so history matches reality
-                        for _sid in ("4", "5"):
+                        for _sid in ("3", "4", "5"):
                             try:
                                 _b, _s = _compute_step_badge(project, user_id, _sid)
                                 _record_step_history(project, user_id, _sid, _step_start_time.get(f"{project}-{_sid}", time.time()), _b, _s)
                             except Exception as _be:
-                                print(f"[POST-STEP-3] badge record failed for {_sid}: {_be}")
-                    elif res.get("status") == "no_qcms":
-                        log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "warn", "text": "ℹ️ Auto-build skipped: no accepted QCMs after Step 3."})
+                                print(f"[POST-STEP-2] badge record failed for {_sid}: {_be}")
+                    elif rstatus == "no_qcms":
+                        log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "warn", "text": "ℹ️ Auto-enrich skipped: no accepted QCMs after Step 2."})
                     else:
-                        log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "warn", "text": f"⚠️ Auto-build (Step 4→5) failed: {res}. You can run Steps 4/5 manually."})
+                        log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "warn", "text": f"⚠️ Auto-enrich (Step 3 + build) reported: {res}. You can re-run Step 2 to retry."})
                 except Exception as abe:
                     import traceback
                     traceback.print_exc()
-                    log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "warn", "text": f"⚠️ Auto-build (Step 4→5) failed: {str(abe)}. You can run Steps 4/5 manually."})
+                    log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "warn", "text": f"⚠️ Auto-enrich (Step 3 + build) failed: {str(abe)}. You can re-run Step 2 to retry."})
 
         except Exception as e:
             import traceback
@@ -1546,7 +1555,6 @@ def _call_step(step_id: str, tracker, context, config: dict):
     from modules.step1_5_batch_text_fixer import Step1_5BatchTextFixer
     from modules.step1_6_intelligent_text_fixer import Step1_6IntelligentTextFixer
     from modules.step2_qcm_extract_batch import Step2QCMExtractBatch
-    from modules.step3_metadata import Step3Metadata
     from modules.step4_format import Step4Format
     from modules.step5_builder import Step5Builder
     from modules.step6_corrections import Step6Corrections
@@ -1607,15 +1615,6 @@ def _call_step(step_id: str, tracker, context, config: dict):
                         }
                     }
                ),
-        "3":   lambda: Step3Metadata(tracker, context).run(
-                    auto_mode=True,
-                    config=config.get("fields", {}),
-                    global_pages=[
-                        int(p.strip())
-                        for p in str(config.get("global_pages", "1")).split(",")
-                        if p.strip().isdigit()
-                    ],
-                ),
         "4":   lambda: _run_step4_auto(tracker, context, config),
         "5":   lambda: Step5Builder(tracker, context).run(),
         "6":   lambda: Step6Corrections(tracker, context).run(
@@ -2188,11 +2187,12 @@ async def _autorun_task(project: str, email: str, body: dict):
     end   = str(body.get("end_step",   "7"))
     run_config = body.get("run_config", {})
     
-    # Valid step sequence. Steps 4 and 5 are no longer in the visible
-    # sequence: they run automatically in the backend after Step 3 succeeds
-    # (see run_post_step3_build in _run_step_task). If run_config.step4 or
+    # Valid step sequence. Steps 3, 4 and 5 are no longer in the visible
+    # sequence: Step 3 now fires inside Step 2's task via
+    # run_post_step2_metadata (see _run_step_task), and Steps 4/5 fire inside
+    # that same cascade via run_post_step3_build. If run_config.step3/step4/
     # step5 are sent by a legacy client they are silently ignored.
-    sequence = ["1", "1.5", "1.6", "2", "3", "6", "7", "8"]
+    sequence = ["1", "1.5", "1.6", "2", "6", "7", "8"]
     
     # Filter sequence by start/end constraints
     try:
