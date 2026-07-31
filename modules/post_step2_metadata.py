@@ -127,6 +127,29 @@ def run_post_step2_metadata(tracker, context, user_id: str, project: str,
     if status == "ok":
         total = build.get("step5", {}).get("total_qcms", 0)
         print(f"[AUTO-ENRICH] ✅ Cascade complete. step5 total_qcms={total}")
+
+        # Surface the final merged artifacts into step2_qcm/accepted/ so the
+        # Step 2 OutputViewer (which lists step2_qcm/ files) shows the xlsx +
+        # merged JSON alongside the raw extraction output. Without this, the
+        # user sees extraction results but not the metadata-enriched final
+        # output (merged_qcms.xlsx) because the OutputViewer endpoint maps
+        # step "2" → step2_qcm/ only.
+        try:
+            import shutil
+            step2_accepted = context.get_path("step2_qcm", "accepted")
+            step5_dir = context.get_path("step5_json")
+            merged_src = Path(step5_dir) / "merged_qcms.json"
+            merged_dst = Path(step2_accepted) / "merged_qcms.json"
+            if merged_src.exists():
+                shutil.copy2(merged_src, merged_dst)
+                print(f"[AUTO-ENRICH] ✅ Copied merged_qcms.json → step2_qcm/accepted/")
+            xlsx_src_str = build.get("step5", {}).get("xlsx_file", "")
+            if xlsx_src_str and Path(xlsx_src_str).exists():
+                xlsx_dst = Path(step2_accepted) / "merged_qcms.xlsx"
+                shutil.copy2(xlsx_src_str, xlsx_dst)
+                print(f"[AUTO-ENRICH] ✅ Copied merged_qcms.xlsx → step2_qcm/accepted/")
+        except Exception as copy_e:
+            print(f"[AUTO-ENRICH] ⚠️ Failed to surface merged result into step2 output: {copy_e}")
     elif status == "no_qcms":
         print("[AUTO-ENRICH] Step 4+5 build skipped (no accepted metadata).")
     else:
