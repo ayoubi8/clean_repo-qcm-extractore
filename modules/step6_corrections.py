@@ -765,21 +765,32 @@ DOCUMENT TEXT:
         """
         Heuristic score for how likely a page contains correction data.
         Higher score = more likely to be a correction page.
+
+        Handles OCR-mangled French text (e.g. 'Corrigé' → 'CorrigAc',
+        'Rép.' → 'RAcp.') and markdown-table correction formats
+        (| N° | Rép. | with rows like | 1 | ADE |).
         """
         t = text.lower()
         score = 0
 
-        # Strong correction keywords
-        strong_keywords = ['corrigé', 'correction', 'answer key', 'clé de correction']
+        # Strong correction keywords — match both proper and OCR-mangled forms
+        # 'corrigé' may appear as 'corrigac', 'corrig', 'corrig e' after OCR
+        strong_keywords = ['corrigé', 'corrigac', 'corrig', 'correction', 'answer key', 'clé de correction', 'cle de correction']
         score += sum(20 for kw in strong_keywords if kw in t)
 
-        # Moderate keywords
-        moderate_keywords = ['réponse', 'réponses', 'rep.', 'answers']
+        # Moderate keywords — also OCR-tolerant
+        # 'réponse' may appear as 'reponse', 'racp', 'rep'
+        moderate_keywords = ['réponse', 'reponse', 'réponses', 'reponses', 'rep.', 'rep/', 'answers', 'barème', 'bareme', 'bar']
         score += sum(10 for kw in moderate_keywords if kw in t)
 
         # X-table signature: | A | B | C | D | E |
         if re.search(r'\|\s*a\s*\|\s*b\s*\|\s*c', t, re.I):
             score += 40  # Very strong signal
+
+        # Markdown table correction rows: | 1 | ADE | or | 10 | ABCD |
+        # This is the common format in OCR'd correction pages
+        table_row_matches = len(re.findall(r'\|\s*\d{1,3}\s*\|\s*[A-E]{1,5}\s*\|', text, re.I))
+        score += min(table_row_matches * 5, 60)  # Cap at 60 — very strong signal
 
         # Answer-list patterns: "1: BCE", "1. ab", "Q1 → ACD"
         list_matches = len(re.findall(r'\d{1,3}\s*[:\.\-→]\s*[a-e]{1,5}', t))
@@ -788,6 +799,10 @@ DOCUMENT TEXT:
         # Uppercase letter-group patterns like "1 ACE"
         upper_matches = len(re.findall(r'\b\d{1,3}\s+[A-E]{1,5}\b', text))
         score += min(upper_matches * 4, 40)
+
+        # Pipe-delimited answers: "1 | ADE" or "| 1 | ADE |"
+        pipe_matches = len(re.findall(r'\|\s*\d{1,3}\s*\|?\s*[A-E]{1,5}', text, re.I))
+        score += min(pipe_matches * 4, 40)
 
         return score
 

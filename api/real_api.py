@@ -1540,6 +1540,10 @@ def _call_step(step_id: str, tracker, context, config: dict):
             os.environ["STEP6_TEXT_MODEL"] = config["text_model"]
         if config.get("all_pages_model"):
             os.environ["STEP6_ALL_PAGES_MODEL"] = config["all_pages_model"]
+        if config.get("ai_model"):
+            os.environ["STEP6_AI_MODEL"] = config["ai_model"]
+        if config.get("vision_model"):
+            os.environ["STEP6_ALL_PAGES_MODEL"] = config["vision_model"]
     
     if step_id == "8":
         if config.get("ref_db_path"):
@@ -1844,10 +1848,12 @@ def get_step_models(user: dict = Depends(get_current_user)):
         "step2":   {"primary": env.get("STEP2_MODEL"),   "fallback": env.get("STEP2_FALLBACK_MODEL")},
         "step3":   {"primary": env.get("STEP3_MODEL"),   "fallback": env.get("STEP3_FALLBACK_MODEL")},
         "step6":   {
-            "text_model":      env.get("STEP6_TEXT_MODEL"),
-            "text_fallback":   env.get("STEP6_TEXT_FALLBACK_MODEL"),
-            "all_pages_model": env.get("STEP6_ALL_PAGES_MODEL"),
-            "ai_model":        env.get("STEP6_AI_MODEL")
+            "text_model":         env.get("STEP6_TEXT_MODEL"),
+            "text_fallback":      env.get("STEP6_TEXT_FALLBACK_MODEL"),
+            "all_pages_model":    env.get("STEP6_ALL_PAGES_MODEL"),
+            "all_pages_fallback": env.get("STEP6_ALL_PAGES_FALLBACK_MODEL"),
+            "ai_model":           env.get("STEP6_AI_MODEL"),
+            "ai_fallback":        env.get("STEP6_AI_FALLBACK_MODEL")
         },
         "step7":   {"primary": env.get("STEP7_MODEL"),   "fallback": env.get("STEP7_FALLBACK_MODEL")},
         "step8":   {}

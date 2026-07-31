@@ -43,9 +43,10 @@ export function Step6Config() {
 
   const getModelOptions = () => {
     if (!models?.step6) return [];
-    if (config.source === 'ai_knowledge') return [models.step6.ai_model];
-    if (config.source === 'vision_ai') return [models.step6.all_pages_model];
-    return [models.step6.text_model, models.step6.text_fallback];
+    if (config.source === 'ai_knowledge') return [models.step6.ai_model, models.step6.ai_fallback].filter(Boolean);
+    if (config.source === 'vision_ai') return [models.step6.all_pages_model, models.step6.all_pages_fallback].filter(Boolean);
+    // page_text + auto_detect use the text model
+    return [models.step6.text_model, models.step6.text_fallback].filter(Boolean);
   };
 
   const activeModels = getModelOptions();
