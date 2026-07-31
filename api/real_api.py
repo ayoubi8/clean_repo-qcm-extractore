@@ -1308,7 +1308,15 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
             await loop.run_in_executor(None, _run_with_capture)
 
             step_succeeded = True
-            job_manager.set_done(project, step_id)
+            # Defer set_done for Step 2 until AFTER the cascade (Step 3 + build)
+            # completes. The WebSocket log stream (ws_log) closes as soon as it
+            # sees status=="done" — if we set_done here, the WS would close
+            # before the cascade's log lines ("⚡ Auto-enrich...") reach the
+            # frontend. For Step 2, set_done is called at the end of the
+            # cascade block below (in its finally). For all other steps,
+            # set_done is called here as before.
+            if step_id != "2":
+                job_manager.set_done(project, step_id)
             log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "ok", "text": f"\u2705 Step {step_id} completed successfully."})
 
             # POST-STEP-2 AUTO-ENRICH: after Step 2 succeeds, invisibly run
@@ -1350,6 +1358,10 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
                     import traceback
                     traceback.print_exc()
                     log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "warn", "text": f"⚠️ Auto-enrich (Step 3 + build) failed: {str(abe)}. You can re-run Step 2 to retry."})
+                finally:
+                    # Now mark Step 2 as done — the WS log stream will see
+                    # "done" and close AFTER pushing all cascade log lines.
+                    job_manager.set_done(project, step_id)
 
         except Exception as e:
             import traceback
