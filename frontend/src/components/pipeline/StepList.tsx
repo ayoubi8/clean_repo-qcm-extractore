@@ -63,8 +63,11 @@ export function StepRow({ step, isActive, onClick }: StepRowProps) {
       // Map step ID to config object
       let config = {}
       if (step.id === 1) config = store.step1Config
-      if (step.id === 2) config = store.step2Config
-      if (step.id === 3) config = store.step3Config
+      if (step.id === 2) {
+        // Merged Step 2: forward both extraction + metadata config.
+        // Step 3 config rides along as `step3` sub-key for run_post_step2_metadata.
+        config = { ...store.step2Config, step3: store.step3Config }
+      }
       if (step.id === 6) config = store.step6Config
 
       await runStep(activeProject.name, step.id, config)

@@ -2,8 +2,7 @@ import { useState } from 'react'
 import { usePipelineStore } from '../../store/pipelineStore'
 import { StepId } from '../../types'
 import { Step1Config } from './configs/Step1Config'
-import { Step2Config } from './configs/Step2Config'
-import { Step3Config } from './configs/Step3Config'
+import { Step2_3Config } from './configs/Step2_3Config'
 import { Step6Config } from './configs/Step6Config'
 import { Step8Config } from './configs/Step8Config'
 import { StepRunOnly } from './configs/StepRunOnly'
@@ -12,14 +11,17 @@ import { useAppStore } from '../../store/appStore'
 import { OutputViewer } from './OutputViewer'
 import { useStepHistory } from '../../hooks/useStepHistory'
 
-// Steps 4 & 5 are intentionally absent — they run as an invisible backend
-// operation after Step 3 (see modules/post_step3_build.py on the backend).
+// Steps 3, 4 & 5 are intentionally absent:
+// - Step 3 is now part of the merged "Step 2 · QCM Extraction + Metadata"
+//   row — it fires as an invisible cascade after Step 2 succeeds
+//   (see modules/post_step2_metadata.py).
+// - Steps 4 & 5 are an invisible backend operation after Step 3
+//   (see modules/post_step3_build.py).
 const CONFIG_MAP: Record<string, React.FC<any>> = {
   '1': Step1Config,
   '1.5': StepRunOnly,
   '1.6': StepRunOnly,
-  '2': Step2Config,
-  '3': Step3Config,
+  '2': Step2_3Config,
   '6': Step6Config,
   '7': StepRunOnly,
   '8': Step8Config,
@@ -130,9 +132,12 @@ export function ConfigPanel() {
           model_fallback: s.model_fallback,
           extraction_guidance: s.extraction_guidance,
           clinical_case_hints: s.clinical_case_hints,
+          // Step 3 config is embedded in the merged Step 2 panel (under
+          // "Advanced") and forwarded to run_post_step2_metadata.
+          step3: store.step3Config,
         }
       }
-      if (activeStep.id === 3) config = store.step3Config
+      if (activeStep.id === 3) config = store.step3Config  // legacy: step 3 row removed, kept for safety
       if (activeStep.id === 6) config = {
         ...store.step6Config,
         pdf_path: activeProject?.pdf_path ?? ''

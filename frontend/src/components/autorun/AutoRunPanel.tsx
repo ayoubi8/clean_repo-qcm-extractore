@@ -4,7 +4,6 @@ import { StepRangeSelector } from './StepRangeSelector'
 import { ToggleSwitch } from './ToggleSwitch'
 import { YamlConfigSection } from './YamlConfigSection'
 import { FolderBatchIndicator } from './FolderBatchIndicator'
-import { Step3Config } from '../pipeline/configs/Step3Config'
 import { Step6Config } from '../pipeline/configs/Step6Config'
 import { startAutoRun } from '../../lib/api'
 import { usePipelineStore } from '../../store/pipelineStore'
@@ -20,14 +19,16 @@ export function AutoRunPanel({ onClose }: AutoRunPanelProps) {
 
   const isFolderBatch = store.useYaml && store.batchConfig?.folder_batch?.enabled === true
   const showPreflight = !store.useYaml
-  const showStep3Pre = showPreflight && store.startStep <= 3 && store.endStep >= 3
+  // Step 3 was merged into Step 2 — it no longer has its own pre-flight panel.
+  // Its metadata config is embedded in the merged Step 2 panel and forwarded
+  // as run_config.step2.step3 by the backend cascade (run_post_step2_metadata).
   const showStep6Pre = showPreflight && store.startStep <= 6 && store.endStep >= 6
 
   const handleStart = async () => {
     if (!appStore.activeProject) return
     store.setIsRunning(true)
 
-    // Serialization logic
+    // Serialization logic — Step 3 now travels inside Step 2's config.
     const serializeStep3 = (c: any) => {
       const CODE_MAP: any = { skip: 'S', global: 'G', per_qcm: 'P', per_group: 'CC' }
       const FIELD_MAP: any = { year: 'Year', source: 'Source', category: 'Category', subcategory: 'Subcategory', clinical_case: 'ClinicalCase' }
@@ -56,6 +57,11 @@ export function AutoRunPanel({ onClose }: AutoRunPanelProps) {
       }
     }
 
+    // Step 3 pre-flight visibility (legacy): if the range covers Step 2, the
+    // merged Step 2 cascade will pick up step3 config from the store and
+    // forward it via run_config.step2.step3.
+    const step2InRange = store.startStep <= 2 && store.endStep >= 2
+
     const payload = store.useYaml
       ? {
           mode: 'yaml',
@@ -65,9 +71,12 @@ export function AutoRunPanel({ onClose }: AutoRunPanelProps) {
           use_folder_batch: isFolderBatch,
           run_config: {
             step1: store.batchConfig!.extraction,
-            step2: store.batchConfig!.qcm_extraction,
-            step3: store.batchConfig!.metadata,
-            // Steps 4 & 5 run automatically in the backend after Step 3.
+            step2: {
+              ...store.batchConfig!.qcm_extraction,
+              // Forward the metadata config into Step 2's cascade.
+              step3: store.batchConfig!.metadata,
+            },
+            // Steps 3, 4 & 5 run automatically in the backend after Step 2.
             step6: store.batchConfig!.corrections,
           }
         }
@@ -78,7 +87,9 @@ export function AutoRunPanel({ onClose }: AutoRunPanelProps) {
           pause_for_verification: store.pauseForVerification,
           use_folder_batch: false,
           run_config: {
-            ...(showStep3Pre ? { step3: serializeStep3(pipelineStore.step3Config) } : {}),
+            ...(step2InRange
+              ? { step2: { step3: serializeStep3(pipelineStore.step3Config) } }
+              : {}),
             ...(showStep6Pre ? { step6: serializeStep6(pipelineStore.step6Config) } : {}),
           }
         }
@@ -149,15 +160,9 @@ export function AutoRunPanel({ onClose }: AutoRunPanelProps) {
                 <span className="text-[10px] uppercase tracking-[0.2em] text-outline font-black">Pre-flight Config</span>
               </div>
 
-              {showStep3Pre && (
-                <div className="space-y-6">
-                  <div className="flex items-center gap-2">
-                    <span className="material-symbols-outlined text-primary">analytics</span>
-                    <span className="text-xs font-black text-on-surface-variant uppercase tracking-widest">Step 3 · Metadata Strategy</span>
-                  </div>
-                  <Step3Config embedded />
-                </div>
-              )}
+              {/* Step 3 pre-flight panel removed — metadata is now configured
+                  inside the merged Step 2 panel ("Advanced · Metadata Strategy")
+                  and forwarded via run_config.step2.step3. */}
 
               {showStep6Pre && (
                 <div className="space-y-6">
@@ -169,7 +174,7 @@ export function AutoRunPanel({ onClose }: AutoRunPanelProps) {
                 </div>
               )}
 
-              {!showStep3Pre && !showStep6Pre && (
+              {!showStep6Pre && (
                 <div className="p-6 bg-surface-container-low rounded-xl border border-outline-variant/10 text-center">
                   <p className="text-[11px] text-outline italic font-medium">No pre-flight configuration required for steps {store.startStep}–{store.endStep}.</p>
                 </div>

@@ -2,9 +2,11 @@ import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import { AutoRunState } from '../types'
 
-// Steps 4 and 5 are intentionally absent — they run as an invisible backend
-// operation after Step 3 (see backend modules/post_step3_build.py).
-const ALLOWED_STEPS = [1, 2, 3, 6, 7, 8]
+// Steps 3, 4 and 5 are intentionally absent:
+// - Step 3 now fires inside Step 2's task (see backend
+//   modules/post_step2_metadata.py).
+// - Steps 4 & 5 fire inside that same cascade (modules/post_step3_build.py).
+const ALLOWED_STEPS = [1, 2, 6, 7, 8]
 const nearestAllowed = (n: number, fallback: number) =>
   ALLOWED_STEPS.includes(n) ? n : fallback
 
@@ -38,14 +40,17 @@ export const useAutorunStore = create<AutoRunState>()(
         batchConfig: state.batchConfig,
       }),
       migrate: (persisted: any) => {
-        // Coerce any legacy persisted startStep/endStep that pointed at the
-        // now-removed steps 4 or 5 back onto a valid allowed step.
+        // Coerce any legacy persisted startStep/endStep that pointed at a
+        // now-removed step (3, 4 or 5) back onto a valid allowed step.
+        // Step 3 was merged into Step 2, so legacy step-3 selections collapse
+        // onto Step 2; 4/5 were already handled at v1 but the helper now also
+        // covers 3.
         if (!persisted) return persisted
         const startStep = nearestAllowed(Number(persisted.startStep ?? 1), 1)
         const endStep = nearestAllowed(Number(persisted.endStep ?? 7), 7)
         return { ...persisted, startStep, endStep }
       },
-      version: 1,
+      version: 2,
     }
   )
 )

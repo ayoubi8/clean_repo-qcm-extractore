@@ -10,9 +10,11 @@ interface StepPickerProps {
 }
 
 function StepPicker({ label, value, onChange, min, max, id }: StepPickerProps) {
-  // Steps 4 and 5 are intentionally excluded — they run as an invisible
-  // backend operation after Step 3 (see backend modules/post_step3_build.py).
-  const ALLOWED_STEPS = [1, 2, 3, 6, 7, 8]
+  // Steps 3, 4 and 5 are intentionally excluded:
+  // - Step 3 now fires inside Step 2's task (see backend
+  //   modules/post_step2_metadata.py).
+  // - Steps 4 & 5 fire inside that same cascade (modules/post_step3_build.py).
+  const ALLOWED_STEPS = [1, 2, 6, 7, 8]
   const options = Array.from({ length: 8 }, (_, i) => i + 1)
     .filter(n => ALLOWED_STEPS.includes(n) && n >= min && n <= max)
 

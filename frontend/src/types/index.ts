@@ -7,9 +7,13 @@ export interface Project {
   pdf_path: string;      // absolute path to source PDF — persisted in project.json
 }
 
-// Steps 4 & 5 were merged into an invisible backend operation that fires
-// automatically after Step 3 succeeds (see backend modules/post_step3_build.py).
-// They are intentionally NOT exposed to the frontend.
+// Steps 3, 4 & 5 are no longer standalone visible steps:
+// - Step 3 was merged into Step 2 (the visible row is "Step 2 · QCM Extraction
+//   + Metadata"); it fires as an invisible cascade after Step 2 succeeds
+//   (see backend modules/post_step2_metadata.py). The `3` value is kept
+//   because backend status polling for "3" still works (GET /steps/3/status).
+// - Steps 4 & 5 are an invisible backend operation after Step 3
+//   (see modules/post_step3_build.py).
 export type StepId = 1 | 1.5 | 1.6 | 2 | 3 | 6 | 7 | 8
 export type StepStatus = 'idle' | 'running' | 'done' | 'error'
 
@@ -123,12 +127,14 @@ export interface AutoRunPayload {
   end_step: number
   pause_for_verification: boolean
   use_folder_batch: boolean
-  // Steps 4 & 5 run automatically in the backend after Step 3 — they are no
-  // longer part of the autorun sequence and have no client config.
+  // Steps 3, 4 & 5 are no longer part of the autorun sequence:
+  // - Step 3 now fires inside Step 2's task (see run_post_step2_metadata).
+  // - Steps 4 & 5 fire inside that same cascade (run_post_step3_build).
+  // Step 2 itself optionally receives a `step3` sub-config to forward to
+  // the cascade; clients sending a top-level step3/step4/step5 are ignored.
   run_config: {
     step1?: object
-    step2?: object
-    step3?: object
+    step2?: object    // may include a nested `step3` sub-config
     step6?: object
   }
 }

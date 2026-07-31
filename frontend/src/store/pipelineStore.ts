@@ -26,15 +26,17 @@ interface PipelineStore {
   setStep8Config: (c: Partial<Step8Config>) => void
 }
 
-// Steps 4 & 5 were merged into an invisible backend operation that fires
-// automatically after Step 3 succeeds (see backend modules/post_step3_build.py).
-// They are intentionally NOT listed here so the UI never shows them.
+// Steps 3, 4 & 5 are intentionally NOT listed here:
+// - Steps 4 & 5 are an invisible backend operation (see modules/post_step3_build.py).
+// - Step 3 is now part of the merged "Step 2 · QCM Extraction + Metadata" row —
+//   it fires as an invisible cascade after Step 2 succeeds
+//   (see modules/post_step2_metadata.py). The `3` StepId still exists for status
+//   polling, but the UI shows only one row.
 const INITIAL_STEPS: StepState[] = [
   { id: 1, label: 'Step 1 · Text Extraction', status: 'idle', outputExists: false },
   { id: 1.5, label: 'Step 1.5 · Text Fixer (auto)', status: 'idle', outputExists: false },
   { id: 1.6, label: 'Step 1.6 · OCR Corrector', status: 'idle', outputExists: false },
-  { id: 2, label: 'Step 2 · QCM Extraction', status: 'idle', outputExists: false },
-  { id: 3, label: 'Step 3 · Metadata Detection', status: 'idle', outputExists: false },
+  { id: 2, label: 'Step 2 · QCM Extraction + Metadata', status: 'idle', outputExists: false },
   { id: 6, label: 'Step 6 · Corrections', status: 'idle', outputExists: false },
   { id: 7, label: 'Step 7 · Categorization', status: 'idle', outputExists: false },
   { id: 8, label: 'Step 8 · Similarity Match', status: 'idle', outputExists: false },
@@ -118,7 +120,7 @@ step3Config: {
       setStep8Config: (c) => set((state) => ({ step8Config: { ...state.step8Config, ...c } })),
     }),
 {
-        name: 'qcm-pipeline-store-v2',
+        name: 'qcm-pipeline-store-v3',
         partialize: (state) => ({
           activeStepId: state.activeStepId,
           step1Config: state.step1Config,
@@ -127,6 +129,18 @@ step3Config: {
           step6Config: state.step6Config,
           step8Config: state.step8Config,
         }),
+        migrate: (persisted: any) => {
+          // Bump v2→v3: Step 3 row was merged into Step 2 and is no longer
+          // visible. If the user's persisted activeStepId was 3, move them
+          // onto the merged Step 2 row. step3Config itself is preserved
+          // because the merged Step 2 config panel embeds it under "Advanced".
+          if (!persisted) return persisted
+          if (persisted.activeStepId === 3) {
+            return { ...persisted, activeStepId: 2 }
+          }
+          return persisted
+        },
+        version: 3,
       }
   )
 )
