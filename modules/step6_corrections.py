@@ -438,8 +438,24 @@ QUESTIONS TO SOLVE:
             page_map.update(xtable)
             print(f"     ✨ X-table: {len(xtable)} corrections on page {page_num}")
 
-        # 2. Regex
-        pattern = r'(?:^|\||\s)(\d{1,3})\s*[:\.\-\s]+\s*([A-Ea-e]{1,5})(?:\s|\||$)'
+        # 2b. Direct-answer markdown table: | N° | answer |
+        # Handles the very common French "Corrigé Type" format where the
+        # answer letters are written directly in a single answer column
+        # (e.g. | 1 | E |, | 2 | ABE |) rather than as X-marks in A/B/C/D/E columns.
+        md_table_map: Dict[str, str] = {}
+        for m in re.finditer(r'\|\s*(\d{1,3})\s*\|\s*([A-Ea-e]{1,5})\s*\|', text):
+            num_str, letters = m.group(1), m.group(2).upper()
+            cleaned = ''.join(c for c in letters if c in 'ABCDE')
+            if cleaned:
+                md_table_map[str(int(num_str))] = cleaned
+        if md_table_map:
+            page_map.update(md_table_map)
+            print(f"     ✅ MD-table: {len(md_table_map)} corrections on page {page_num}. Total: {len(page_map)}")
+
+        # 2c. Regex — answers listed inline (1: ABE, 1. ABE, 1 ABE, | 1 ABE |)
+        # Fix B: include `|` in the separator class so the pattern can cross
+        # a markdown cell boundary between the number and the answer.
+        pattern = r'(?:^|\||\s)(\d{1,3})\s*[:\.\-\s\|]+\s*([A-Ea-e]{1,5})(?:\s|\||$)'
         matches = re.findall(pattern, text, re.MULTILINE)
         regex_map: Dict[str, str] = {}
         for num_str, correction in matches:
@@ -447,7 +463,7 @@ QUESTIONS TO SOLVE:
             if clean:
                 regex_map[str(int(num_str))] = clean
         if regex_map:
-            # X-table takes priority for overlapping keys
+            # Existing page_map (X-table / MD-table) takes priority for overlapping keys
             merged = {**regex_map, **page_map}
             page_map = merged
             print(f"     ✅ Regex: {len(regex_map)} corrections on page {page_num}. Total: {len(page_map)}")
@@ -467,6 +483,12 @@ If no corrections found, return {{}}
 PAGE {page_num} TEXT:
 {text}
 """
+            # Fix C: estimate how many answer rows the page actually contains
+            # (markdown-table rows like `| 1 | ... |`). If the AI returns far
+            # fewer than this, treat it as a partial result and retry with the
+            # fallback model instead of silently accepting 3/50 as "success".
+            expected_rows = len(re.findall(r'\|\s*\d{1,3}\s*\|', text))
+
             # Alternate primary -> fallback across attempts so a parse failure
             # on the primary model is retried with the fallback model.
             for attempt in range(2):
@@ -486,6 +508,13 @@ PAGE {page_num} TEXT:
                         if clean_v:
                             page_map[str(k)] = clean_v
                     print(f"     ✅ AI ({model_used}) found {len(page_map)} corrections on page {page_num}")
+                    # Fix C: completeness gate. If the page clearly contains
+                    # more answer rows than the AI returned, and we still have
+                    # a fallback attempt left, retry instead of accepting a
+                    # partial result.
+                    if expected_rows and len(page_map) < expected_rows * 0.5 and attempt == 0:
+                        print(f"     ⚠️  AI returned {len(page_map)}/{expected_rows} — below 50%, retrying with fallback ({fallback_model})...")
+                        continue  # do not break — let next attempt use fallback
                     break
                 except Exception as e:
                     print(f"     ⚠️  AI attempt {attempt+1} failed for page {page_num} ({model_used}): {e}")
