@@ -6,11 +6,19 @@ class ProjectContext:
     """
     Manages project-specific paths and context.
     All outputs for a project are stored in output/{project_name}/...
+    On HuggingFace the working directory is /app, so paths resolve to
+    /app/output/{project_name}/... On local dev, they resolve to output/...
     """
     
     def __init__(self, project_name: str = "default"):
         self.name = project_name
-        self.base_path = Path("output") / project_name
+        # Use absolute /app/output on HuggingFace, relative output/ locally.
+        # This fixes Step 6's _extract_from_page_text and _scan_all_pages
+        # which use context.get_path() to find step1_extraction/accepted/page_N.txt
+        if Path("/app").exists():
+            self.base_path = Path("/app/output") / project_name
+        else:
+            self.base_path = Path("output") / project_name
         
         # Ensure base project folder exists
         self.base_path.mkdir(parents=True, exist_ok=True)
