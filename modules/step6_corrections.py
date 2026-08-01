@@ -36,6 +36,58 @@ class Step6Corrections:
         # Nemotron is more reliable on OpenRouter (no provider routing issues)
         self.text_model = None
         self.openrouter.model = None
+
+    @staticmethod
+    def _parse_first_json_object(content: str) -> Dict[str, Any]:
+        """Robustly extract the FIRST complete JSON object from an LLM response.
+
+        Fixes the `Extra data: line 1 column N` errors caused by the previous
+        naive `find('{') + rfind('}')` slicing, which would include trailing
+        prose or a second concatenated JSON object in the slice. This uses a
+        brace-depth scanner (matching the pattern in step2_qcm_extract_batch.py)
+        so we stop at the exact closing brace of the first balanced object.
+
+        Returns an empty dict if no balanced object can be parsed.
+        """
+        # Strip markdown fences
+        content = re.sub(r'```(?:json)?\s*', '', content)
+        content = re.sub(r'```\s*', '', content).strip()
+
+        start = content.find('{')
+        if start == -1:
+            return {}
+
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, len(content)):
+            ch = content[i]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == '\\':
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    try:
+                        obj = json.loads(content[start:i + 1])
+                        return obj if isinstance(obj, dict) else {}
+                    except json.JSONDecodeError:
+                        # Keep scanning for a later valid object
+                        start = content.find('{', i + 1)
+                        if start == -1:
+                            return {}
+                        depth = 0
+                        i = start - 1  # loop will increment to start
+        return {}
         
     def run(self,
             input_file: str = None,
@@ -415,29 +467,28 @@ If no corrections found, return {{}}
 PAGE {page_num} TEXT:
 {text}
 """
+            # Alternate primary -> fallback across attempts so a parse failure
+            # on the primary model is retried with the fallback model.
             for attempt in range(2):
+                model_used = primary_model if attempt == 0 else fallback_model
                 try:
-                    try:
-                        response = self.openrouter.generate_completion(prompt, model=primary_model, max_tokens=max_tokens)
-                    except Exception:
-                        response = self.openrouter.generate_completion(prompt, model=fallback_model, max_tokens=max_tokens)
+                    response = self.openrouter.generate_completion(prompt, model=model_used, max_tokens=max_tokens)
                     content = (response.get("content") or "").strip()
-                    cost = response.get('cost', 0.0) or self.openrouter.estimate_cost(primary_model, response.get("usage", {}))
-                    self.cost_tracker.log_api_call(f"step6_page{page_num}_ai", primary_model, response.get("usage", {}), cost)
-                    content_clean = re.sub(r'```(?:json)?\s*', '', content)
-                    content_clean = re.sub(r'```\s*', '', content_clean).strip()
-                    start_idx = content_clean.find('{')
-                    end_idx = content_clean.rfind('}')
-                    if start_idx != -1 and end_idx != -1:
-                        raw = json.loads(content_clean[start_idx:end_idx + 1])
-                        for k, v in raw.items():
-                            clean_v = ''.join(c for c in str(v).upper() if c in 'ABCDE')
-                            if clean_v:
-                                page_map[str(k)] = clean_v
-                        print(f"     ✅ AI found {len(page_map)} corrections on page {page_num}")
-                        break
+                    if not content:
+                        raise ValueError("Model returned empty content.")
+                    cost = response.get('cost', 0.0) or self.openrouter.estimate_cost(model_used, response.get("usage", {}))
+                    self.cost_tracker.log_api_call(f"step6_page{page_num}_ai", model_used, response.get("usage", {}), cost)
+                    raw = self._parse_first_json_object(content)
+                    if not raw:
+                        raise json.JSONDecodeError("No JSON object found", content, 0)
+                    for k, v in raw.items():
+                        clean_v = ''.join(c for c in str(v).upper() if c in 'ABCDE')
+                        if clean_v:
+                            page_map[str(k)] = clean_v
+                    print(f"     ✅ AI ({model_used}) found {len(page_map)} corrections on page {page_num}")
+                    break
                 except Exception as e:
-                    print(f"     ⚠️  AI attempt {attempt+1} failed for page {page_num}: {e}")
+                    print(f"     ⚠️  AI attempt {attempt+1} failed for page {page_num} ({model_used}): {e}")
 
         return page_map
 
@@ -713,13 +764,9 @@ DOCUMENT TEXT:
                 content_clean = re.sub(r'```(?:json)?\s*', '', content)
                 content_clean = re.sub(r'```\s*', '', content_clean).strip()
 
-                # Find outermost JSON object
-                start = content_clean.find('{')
-                end   = content_clean.rfind('}')
-                if start == -1 or end == -1:
+                raw_map = self._parse_first_json_object(content_clean)
+                if not raw_map:
                     raise ValueError("No JSON object found in model response.")
-
-                raw_map: Dict = json.loads(content_clean[start:end + 1])
 
                 # Normalise: keys → str, values → uppercase A-E only
                 for k, v in raw_map.items():
@@ -1066,34 +1113,31 @@ TEXT:
                 # Parse JSON — strip markdown fences
                 content_clean = re.sub(r'```(?:json)?\s*', '', content)
                 content_clean = re.sub(r'```\s*', '', content_clean).strip()
-                start = content_clean.find('{')
-                end   = content_clean.rfind('}')
 
-                if start != -1 and end != -1:
-                    raw = json.loads(content_clean[start:end + 1])
-                    # Support both flat map and legacy {"corrections": {...}}
-                    corrections: Dict = raw.get('corrections', raw) if isinstance(raw, dict) else {}
+                raw = self._parse_first_json_object(content_clean)
+                if not raw:
+                    raise json.JSONDecodeError("No JSON object found in response", content_clean, 0)
+                # Support both flat map and legacy {"corrections": {...}}
+                corrections: Dict = raw.get('corrections', raw) if isinstance(raw, dict) else {}
 
-                    applied = 0
-                    for qcm in qcms:
-                        # FIX 2: str key lookup
-                        q_key = str(qcm.get('Num') or qcm.get('number') or '')
-                        if q_key in corrections:
-                            cleaned = ''.join(re.findall(r'[A-E]', str(corrections[q_key]).upper()))[:5]
-                            if cleaned:
-                                qcm['Correct'] = cleaned
-                                applied += 1
+                applied = 0
+                for qcm in qcms:
+                    # FIX 2: str key lookup
+                    q_key = str(qcm.get('Num') or qcm.get('number') or '')
+                    if q_key in corrections:
+                        cleaned = ''.join(re.findall(r'[A-E]', str(corrections[q_key]).upper()))[:5]
+                        if cleaned:
+                            qcm['Correct'] = cleaned
+                            applied += 1
 
-                    print(f"   ✅ Attempt {attempt+1}: {applied}/{len(qcms)} corrections applied via AI.")
+                print(f"   ✅ Attempt {attempt+1}: {applied}/{len(qcms)} corrections applied via AI.")
 
-                    if applied >= len(qcms) * 0.9:
-                        break  # Good enough — exit retry loop
-                    elif attempt < max_retries - 1:
-                        print(f"   ⚠️ Coverage below 90%, retrying...")
-                    else:
-                        print(f"   ⚠️ Final attempt: {applied}/{len(qcms)} corrections.")
+                if applied >= len(qcms) * 0.9:
+                    break  # Good enough — exit retry loop
+                elif attempt < max_retries - 1:
+                    print(f"   ⚠️ Coverage below 90%, retrying...")
                 else:
-                    print(f"   ⚠️ Attempt {attempt+1}: no JSON object found in response. Retrying...")
+                    print(f"   ⚠️ Final attempt: {applied}/{len(qcms)} corrections.")
 
             except json.JSONDecodeError as e:
                 print(f"   ⚠️ Attempt {attempt+1}: JSON parse error — {e}")
