@@ -168,9 +168,8 @@ class Step6Corrections:
 
         # Select correction source
         if auto_mode and config:
-            source_str = config.get("source", "1")
+            source_str = config.get("source", "auto_detect")
             source_mapping = {
-                "ai_knowledge": "1",
                 "page_text": "2",
                 "extracted_data": "3",
                 "vision": "4",
@@ -182,22 +181,18 @@ class Step6Corrections:
             print(f"\n⚙️  Using Auto-Mode Correction Source: {source_str}")
         else:
             print(f"\nSelect Correction Source for {len(qcms)} QCMs:")
-            print("  1. AI Knowledge (DeepSeek R1 solves them)")
             print("  2. Specific Page Text (Extract from a text file/page)")
             print("  3. Extracted Data (Find corrections within the original text)")
             print("  4. Highlighted in PDF (Vision AI detects marked options)")
             print("  5. Manual Entry (Interactive per QCM)")
             print("  6. By Page (Process pages one-by-one, detect gaps)")
-            choice = input("Choice [1-6]: ").strip()
+            choice = input("Choice [2-6]: ").strip()
 
         corrected_qcms = []
         if choice == "auto_detect":
             # NEW Auto-Detect — per-page DeepSeek scan with Step-2 QCM context
             print("\n🔍 Auto-Detect mode — per-page AI scan with Step-2 context.")
             corrected_qcms = self._scan_all_pages_per_page_ai(qcms, config or {})
-        elif choice == "1":
-            ai_mode = config.get("ai_mode", "S") if (auto_mode and config) else None
-            corrected_qcms = self._apply_ai_knowledge(qcms, auto_mode, ai_mode)
         elif choice == "2":
             search_mode = config.get("correction_search_mode", "specific_pages") if (auto_mode and config) else "specific_pages"
             if search_mode == "all_pages":
@@ -1783,10 +1778,9 @@ Format: {{"10": "ACE", "11": "BD"}}"""
             print(f"\n⚠️  {len(uncorrected)} QCMs still have no correction.")
             print("What would you like to do?")
             print("  1. Run on additional pages (enter new page numbers)")
-            print("  2. AI Knowledge for uncorrected QCMs only (DeepSeek R1)")
-            print("  3. Manual Entry for uncorrected QCMs only")
-            print("  4. Skip — save as-is")
-            recovery = input("Choice [1-4]: ").strip()
+            print("  2. Manual Entry for uncorrected QCMs only")
+            print("  3. Skip — save as-is")
+            recovery = input("Choice [1-3]: ").strip()
 
             if recovery == "1":
                 more_input = input("Enter additional pages (e.g. 7,8 or 10:12): ").strip()
@@ -1801,22 +1795,6 @@ Format: {{"10": "ACE", "11": "BD"}}"""
                     print(f"✅ Applied {applied}/{len(qcms)} corrections after extra pages.")
 
             elif recovery == "2":
-                print(f"\n🧠 Running AI Knowledge on {len(uncorrected)} uncorrected QCMs...")
-                # _apply_ai_knowledge mutates the list items in-place (dicts are references)
-                # so changes to uncorrected items propagate to qcms automatically.
-                # We pass a copy of uncorrected so the list structure isn't reordered.
-                ai_result = self._apply_ai_knowledge(list(uncorrected), auto_mode=False, ai_mode=None)
-                # Merge back: map by question number then write into main qcms list
-                ai_map = {
-                    str(q.get('Num') or q.get('number', '')): q.get('Correct', '')
-                    for q in ai_result if q.get('Correct', '').strip()
-                }
-                for qcm in qcms:
-                    key = str(qcm.get('Num') or qcm.get('number', ''))
-                    if key in ai_map and not qcm.get('Correct', '').strip():
-                        qcm['Correct'] = ai_map[key]
-
-            elif recovery == "3":
                 print(f"\n✏️  Manual Entry for {len(uncorrected)} uncorrected QCMs:")
                 self._manual_entry(uncorrected)
                 # Merge back

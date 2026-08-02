@@ -1476,7 +1476,8 @@ def _call_step(step_id: str, tracker, context, config: dict):
         if "choice:" in p:
             return ""
         
-        # Step 6 — correction mode
+        # Step 6 — correction mode (legacy AI-knowledge S/B prompt; no longer
+        # reachable from UI but kept for back-compat if source="ai_knowledge" leaks in).
         if "select mode [s/b]" in p:
             return "b" if config.get("correction_search_mode", "") == "all_pages" else "s"
         if "use these pages" in p:
@@ -1485,7 +1486,7 @@ def _call_step(step_id: str, tracker, context, config: dict):
             return config.get("correction_pages", "1")
         if "[u]se default" in p or "edit" in p:
             return "u"
-        if "choice [1-4]" in p or "recovery" in p:
+        if "choice [1-3]" in p or "recovery" in p:
             return "1"
         if "correction" in p and "enter" in p:
             return ""
@@ -1600,20 +1601,19 @@ def _call_step(step_id: str, tracker, context, config: dict):
 
     def _build_step6_config(cfg):
         source_map = {
-            "ai_knowledge": "ai_knowledge",
             "page_text":    "page_text",
             "auto_detect":  "auto_detect",   # NEW per-page DeepSeek scan
             "vision_ai":    "vision",        # legacy — kept for back-compat only
+            "ai_knowledge": "ai_knowledge",  # legacy — kept for back-compat (no UI)
         }
-        backend_source = source_map.get(cfg.get("source","page_text"),"page_text")
+        backend_source = source_map.get(cfg.get("source","auto_detect"),"auto_detect")
         # Auto-Detect is per-page; search_mode is forced to all_pages.
         if cfg.get("source") == "auto_detect":
             search_mode = "all_pages"
         else:
             search_mode = cfg.get("correction_search_mode","all_pages")
-        ai_mode = {"sequential":"S","batch":"B"}.get(cfg.get("ai_mode","sequential"),"S")
         return {
-            "source": backend_source, "ai_mode": ai_mode,
+            "source": backend_source,
             "correction_search_mode": search_mode,
             "pages": cfg.get("pages",""), "force_overwrite": cfg.get("force_overwrite",False),
             "vision": {"custom_prompt": cfg.get("vision_prompt","")},

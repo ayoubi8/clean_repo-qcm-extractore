@@ -4,7 +4,6 @@ import { useState, useEffect } from 'react'
 import { CorrectionSource, SearchMode } from '../../../types'
 
 const SOURCES: { id: CorrectionSource, label: string, icon: string, desc: string }[] = [
-  { id: 'ai_knowledge', label: 'AI Knowledge', icon: 'psychology', desc: 'DeepSeek R1 answers from memory' },
   { id: 'page_text',    label: 'Page Text',    icon: 'description', desc: 'Extract from a specific page' },
   { id: 'auto_detect',  label: 'Auto-Detect',  icon: 'search',     desc: 'Scan every page with DeepSeek + Step-2 context' },
 ]
@@ -18,8 +17,6 @@ export function Step6Config() {
   // Seed models from .env on first load
   useEffect(() => {
     if (!loading && models?.step6) {
-      if (!config.ai_model && models.step6.ai_model)
-        setConfig({ ai_model: models.step6.ai_model })
       if (!config.text_model && models.step6.text_model)
         setConfig({ text_model: models.step6.text_model })
       if (!config.all_pages_model && models.step6.all_pages_model)
@@ -29,20 +26,17 @@ export function Step6Config() {
 
   // Determine which model to show/edit based on source
   const getModelId = () => {
-    if (config.source === 'ai_knowledge') return config.ai_model || '';
     if (config.source === 'auto_detect') return config.all_pages_model || '';
     return config.text_model || '';
   };
 
   const setModelId = (val: string) => {
-    if (config.source === 'ai_knowledge') setConfig({ ai_model: val });
-    else if (config.source === 'auto_detect') setConfig({ all_pages_model: val });
+    if (config.source === 'auto_detect') setConfig({ all_pages_model: val });
     else setConfig({ text_model: val });
   };
 
   const getModelOptions = () => {
     if (!models?.step6) return [];
-    if (config.source === 'ai_knowledge') return [models.step6.ai_model, models.step6.ai_fallback].filter(Boolean);
     if (config.source === 'auto_detect') return [models.step6.all_pages_model, models.step6.all_pages_fallback].filter(Boolean);
     // page_text uses the text model
     return [models.step6.text_model, models.step6.text_fallback].filter(Boolean);
@@ -86,7 +80,7 @@ export function Step6Config() {
       {/* Model Selection */}
       <div className="space-y-2 p-5 bg-surface-container-low rounded-2xl border border-outline-variant/10">
         <label className="text-[10px] font-black uppercase tracking-[0.2em] text-outline">
-          {config.source === 'ai_knowledge' ? 'Reasoning Model' : config.source === 'auto_detect' ? 'Scan Model' : 'Extraction Model'}
+          {config.source === 'auto_detect' ? 'Scan Model' : 'Extraction Model'}
         </label>
         <select
           value={isCustom ? 'custom' : getModelId()}
@@ -121,28 +115,6 @@ export function Step6Config() {
 
       {/* Conditional Fields */}
       <div className="space-y-6">
-        {config.source === 'ai_knowledge' && (
-          <div className="space-y-3 p-5 bg-surface-container-low rounded-2xl border border-outline-variant/10">
-            <label className="text-[10px] font-black uppercase tracking-[0.2em] text-outline">AI Mode</label>
-            <div className="flex gap-2 p-1 bg-surface-container-lowest rounded-xl border border-outline-variant/20">
-              {['sequential', 'batch'].map((mode) => (
-                <button
-                  key={mode}
-                  onClick={() => setConfig({ ai_mode: mode as any })}
-                  className={`flex-1 py-2 text-xs font-bold rounded-lg capitalize transition-all ${
-                    config.ai_mode === mode 
-                      ? 'bg-primary text-on-primary shadow-lg' 
-                      : 'text-outline hover:text-on-surface'
-                  }`}
-                >
-                  {mode}
-                </button>
-              ))}
-            </div>
-          </div>
-        )}
-
-
         {config.source === 'page_text' && (
           <div className="space-y-2">
             <label className="text-[10px] font-black uppercase tracking-[0.2em] text-outline">Page Reference</label>

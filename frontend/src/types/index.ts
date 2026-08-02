@@ -65,15 +65,13 @@ export interface Step3Config {
   global_pages: string
 }
 
-export type CorrectionSource = 'ai_knowledge' | 'page_text' | 'auto_detect'
+export type CorrectionSource = 'page_text' | 'auto_detect'
 export type SearchMode = 'specific_pages' | 'all_pages'
 export interface Step6Config {
   source: CorrectionSource
-  ai_mode: 'sequential' | 'batch'
   correction_search_mode: SearchMode
   pages: string
   force_overwrite: boolean
-  ai_model: string
   text_model: string
   all_pages_model: string
   page_text_guidance: string

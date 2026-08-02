@@ -135,9 +135,8 @@ class FolderBatchProcessor:
                 pdf_path=str(pdf_path),
                 auto_mode=True,
                 config={
-                    "source": str(s6_cfg.get('source', '1')),
+                    "source": str(s6_cfg.get('source', 'auto_detect')),
                     "page_ref": str(pages),
-                    "ai_mode": s6_cfg.get('ai_mode', 'S')
                 }
             )
             # Re-run builder if corrected

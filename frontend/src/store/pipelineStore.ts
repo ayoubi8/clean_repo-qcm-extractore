@@ -77,11 +77,9 @@ step3Config: {
       },
       step6Config: {
         source: 'auto_detect',
-        ai_mode: 'sequential',
         correction_search_mode: 'all_pages',
         pages: '',
         force_overwrite: false,
-        ai_model: '',
         text_model: '',
         all_pages_model: '',
         page_text_guidance: '',
@@ -133,20 +131,21 @@ step3Config: {
           if (persisted.activeStepId === 3) {
             persisted = { ...persisted, activeStepId: 2 }
           }
-          // v3→v4: "Vision AI" source removed from Step 6. If a persisted
-          // step6Config still holds source='vision_ai', reset it to the new
-          // Auto-Detect (which is now the per-page AI scanner). Drop the
-          // obsolete vision_model / vision_prompt fields.
+          // v3→v4: "Vision AI" source removed from Step 6.
           if (persisted.step6Config) {
             const s6 = { ...persisted.step6Config }
             if (s6.source === 'vision_ai') s6.source = 'auto_detect'
             delete s6.vision_model
             delete s6.vision_prompt
+            // v4→v5: "AI Knowledge" source removed from Step 6.
+            if (s6.source === 'ai_knowledge') s6.source = 'auto_detect'
+            delete s6.ai_mode
+            delete s6.ai_model
             persisted = { ...persisted, step6Config: s6 }
           }
           return persisted
         },
-        version: 4,
+        version: 5,
       }
   )
 )

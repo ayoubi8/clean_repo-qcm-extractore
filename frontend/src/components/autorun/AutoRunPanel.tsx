@@ -46,10 +46,9 @@ export function AutoRunPanel({ onClose }: AutoRunPanelProps) {
     }
 
     const serializeStep6 = (c: any) => {
-      const SRC_MAP: any = { ai_knowledge: 'ai_knowledge', page_text: 'page_text', auto_detect: 'auto_detect' }
+      const SRC_MAP: any = { page_text: 'page_text', auto_detect: 'auto_detect' }
       return {
         source: SRC_MAP[c.source],
-        ...(c.ai_mode ? { ai_mode: c.ai_mode } : {}),
         ...(c.page_ref ? { page_ref: c.page_ref } : {}),
         correction_search_mode: c.correction_search_mode,
         ...(c.pages ? { pages: c.pages.split(',').map((p: string) => p.trim()) } : {}),
