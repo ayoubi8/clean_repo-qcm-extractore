@@ -176,6 +176,7 @@ class Step6Corrections:
                 "vision": "4",
                 "manual": "5",
                 "by_page": "6",
+                "auto_detect": "auto_detect",
             }
             choice = source_mapping.get(source_str, source_str)
             print(f"\n⚙️  Using Auto-Mode Correction Source: {source_str}")
@@ -190,7 +191,11 @@ class Step6Corrections:
             choice = input("Choice [1-6]: ").strip()
 
         corrected_qcms = []
-        if choice == "1":
+        if choice == "auto_detect":
+            # NEW Auto-Detect — per-page DeepSeek scan with Step-2 QCM context
+            print("\n🔍 Auto-Detect mode — per-page AI scan with Step-2 context.")
+            corrected_qcms = self._scan_all_pages_per_page_ai(qcms, config or {})
+        elif choice == "1":
             ai_mode = config.get("ai_mode", "S") if (auto_mode and config) else None
             corrected_qcms = self._apply_ai_knowledge(qcms, auto_mode, ai_mode)
         elif choice == "2":
@@ -425,10 +430,14 @@ QUESTIONS TO SOLVE:
                     break
 
 
-    def _extract_single_page_corrections(self, text: str, page_num: int) -> Dict[str, str]:
+    def _extract_single_page_corrections(self, text: str, page_num: int,
+                                         deterministic_only: bool = False) -> Dict[str, str]:
         """
         Extract corrections from a single page's text using X-table → regex → AI cascade.
         Returns Dict[str, str] with string keys (question numbers).
+
+        If `deterministic_only=True`, skip the AI fallback (used by Auto-Detect
+        which performs its own per-page DeepSeek call afterwards).
         """
         page_map: Dict[str, str] = {}
 
@@ -468,8 +477,8 @@ QUESTIONS TO SOLVE:
             page_map = merged
             print(f"     ✅ Regex: {len(regex_map)} corrections on page {page_num}. Total: {len(page_map)}")
 
-        # 3. AI fallback — only if nothing found yet
-        if not page_map:
+        # 3. AI fallback — only if nothing found yet (and not suppressed)
+        if not page_map and not deterministic_only:
             print(f"     🤖 No pattern match on page {page_num}, trying AI...")
             # We do a lightweight inline AI call here for just this page.
             primary_model = os.getenv("STEP6_TEXT_MODEL", "nvidia/nemotron-3-nano-30b-a3b:free")
@@ -835,6 +844,248 @@ DOCUMENT TEXT:
         if unmatched:
             print(f"   ℹ️  {len(unmatched)} corrections found for questions not in QCM list: {unmatched[:10]}")
 
+        return qcms
+
+    # ------------------------------------------------------------------
+    # AUTO-DETECT (NEW) — per-page DeepSeek scan with Step-2 context
+    # ------------------------------------------------------------------
+    def _scan_all_pages_per_page_ai(self, qcms: List[Dict], config: Dict) -> List[Dict]:
+        """
+        NEW Auto-Detect (replaces the old one-blob Gemini call).
+
+        For EACH page_*.txt in step1_extraction/accepted/:
+          1. Run the cheap deterministic cascade (MD-table → regex) first.
+          2. If the page is fully covered, skip the AI call.
+          3. If not, call DeepSeek (STEP6_ALL_PAGES_MODEL) with:
+               - the full QCM list from Step 2 (Num + text + propositions A-E)
+               - the running corrections found so far on previous pages
+               - the current page text
+             The AI identifies every correction on this page — either as
+             check marks (X / ✓ against an A-E column) or merged answer
+             letters (e.g. "ABE"). Crucially, the AI is told to use the
+             Step-2 QCM context to attribute a partial proposition row to
+             the right QCM number when a question is split across a page
+             break: e.g. if page N shows only A and B of an unknown
+             question, the AI looks at the QCM list + what previous pages
+             filled and returns the most likely QCM number for it.
+          4. Merge the page's corrections into the running map and continue.
+
+        After all pages: apply the merged correction_map to the QCMs via
+        _apply_corrections_with_fallback (which already has drift guards).
+        """
+        scan_cfg = config.get("all_pages_scan", {})
+        threshold = int(scan_cfg.get("candidate_threshold", 15))
+        include_neighbors = scan_cfg.get("include_neighbors", True)
+
+        primary_model = os.getenv("STEP6_ALL_PAGES_MODEL", "deepseek/deepseek-v4-flash")
+        fallback_model = os.getenv("STEP6_ALL_PAGES_FALLBACK_MODEL", "google/gemini-2.0-flash-001")
+        max_tokens = int(os.getenv("STEP6_ALL_PAGES_MAX_TOKENS", "4000"))
+        guidance = (config.get("page_text", {}) or {}).get("extraction_guidance", "")
+
+        if self.context:
+            step1_dir = self.context.get_path("step1_extraction", "accepted")
+        else:
+            step1_dir = Path("output/step1_extraction/accepted")
+        if not step1_dir.exists():
+            print(f"❌ Step 1 output not found: {step1_dir}")
+            return qcms
+
+        page_files = sorted(
+            step1_dir.glob("page_*.txt"),
+            key=lambda p: int(re.search(r'page_(\d+)', p.name).group(1))
+            if re.search(r'page_(\d+)', p.name) else 0
+        )
+        if not page_files:
+            print("❌ No page_*.txt files found for Auto-Detect scan.")
+            return qcms
+
+        print(f"\n🤖 Auto-Detect: per-page DeepSeek scan ({primary_model})")
+        print(f"   {len(page_files)} page(s), {len(qcms)} QCMs from Step 2.")
+        print(f"   Deterministic cascade first, AI fallback per page when incomplete.")
+
+        # ── Build Step-2 QCM context block (Num + text + propositions A-E) ──
+        qcm_context_lines = []
+        for q in qcms:
+            num = q.get("Num") or q.get("number") or "?"
+            text = (q.get("Text") or "").strip().replace("\n", " ")
+            if len(text) > 200:
+                text = text[:197] + "..."
+            props = []
+            for letter in ("A", "B", "C", "D", "E"):
+                val = q.get(letter)
+                if val:
+                    val_str = str(val).strip().replace("\n", " ")
+                    if len(val_str) > 80:
+                        val_str = val_str[:77] + "..."
+                    props.append(f"{letter}: {val_str}")
+            props_line = " | ".join(props) if props else "(no propositions)"
+            qcm_context_lines.append(f"Q{num}: {text}\n   {props_line}")
+        qcm_context_block = "\n".join(qcm_context_lines)
+
+        # ── Optionally filter pages by scorer (skips pure-prose pages) ──
+        # Keep every page by default — the new approach is to let the LLM
+        # judge each page. But if threshold > 0, low-score pages are still
+        # sent (the AI is cheap) — only the very bottom is dropped to save
+        # calls on fully-blank pages. Neighbors are always expanded when a
+        # page crosses the threshold so split-table coverage works.
+        page_texts: Dict[int, str] = {}
+        for pf in page_files:
+            m = re.search(r'page_(\d+)', pf.name)
+            if not m:
+                continue
+            page_texts[int(m.group(1))] = pf.read_text(encoding="utf-8")
+
+        # Score every page (kept for visibility/logging only)
+        if threshold > 0:
+            for pn, txt in page_texts.items():
+                _ = self._score_correction_page(txt)
+
+        # Pages to scan: all of them (the LLM does the judging).
+        # When include_neighbors is True and a page touches a high-scorer,
+        # we already include all pages anyway, so this is a no-op then.
+        all_pages = sorted(page_texts.keys())
+        if not include_neighbors:
+            # Respect candidate threshold: only send pages scoring >= threshold.
+            # (Neighbors option exists to keep split-table coverage when this
+            #  filter is on.)
+            high = {pn for pn, txt in page_texts.items()
+                    if self._score_correction_page(txt) >= threshold}
+            if high:
+                all_pages = sorted(high)
+            else:
+                print(f"   ⚠️  No page scored ≥ {threshold}; sending every page.")
+
+        # Running correction map accumulated across all pages
+        correction_map: Dict[str, str] = {}
+
+        for pn in all_pages:
+            text = page_texts.get(pn, "")
+            print(f"\n   📄 Page {pn} ({len(text)} chars)...")
+
+            # 1) Deterministic cascade first — fast, free, exact on clean tables
+            page_map = self._extract_single_page_corrections(text, pn, deterministic_only=True)
+
+            # 2) If deterministic covered all expected QCMs, skip AI for this page
+            expected_nums = {str(q.get("Num") or q.get("number")) for q in qcms
+                             if str(q.get("Num") or q.get("number", "")).isdigit()}
+            covered_here = set(page_map.keys()) & expected_nums
+            if expected_nums and page_map and len(covered_here) >= len(expected_nums):
+                print(f"     ✅ Deterministic pass covered all {len(covered_here)} QCMs — AI skipped for page {pn}.")
+                correction_map.update(page_map)
+                continue
+
+            # 3) AI pass — DeepSeek with full QCM context + running map + page text
+            missing_nums = sorted(expected_nums - set(correction_map.keys()) - set(page_map.keys()),
+                                  key=lambda x: int(x) if x.isdigit() else 0)
+            note = ""
+            if page_map:
+                note = f"\nDeterministic parser already found on this page: {json.dumps(page_map, ensure_ascii=False)}. Trust and extend it."
+            found_so_far = json.dumps(correction_map, ensure_ascii=False) if correction_map else "{}"
+
+            prompt = f"""You are scoring a French medical QCM exam answer key, page by page.
+
+You are given:
+- The full list of QCMs extracted in Step 2 (number + question text + propositions A-E).
+- The corrections found on PREVIOUS pages so far (running map).
+- The text of the CURRENT page only.
+
+TASK
+Identify every correction present on the current page. A correction is one of:
+  - CHECK MARKS: a table with X / ✓ / ✓ in a column flagged A, B, C, D, E (the marked letters are the answer).
+  - MERGED LETTERS: a single answer cell that lists the correct letters together (e.g. "ABE", "BCD", "E").
+
+CRITICAL — SPLIT QUESTIONS
+A QCM may be split across a page break: the current page may show only part of a question
+(e.g. only propositions A and B of a question whose other propositions were on the
+previous page). When that happens, use the QCM list + the running map to figure out
+WHICH QCM number these partial propositions belong to. Return that QCM number with
+the letters visibly marked/answered on THIS page (later we merge across pages).
+
+If a partial proposition is ambiguous and you cannot confidently attribute it to a
+QCM number from the list, omit it rather than guess.
+
+OUTPUT
+Return ONLY a flat JSON object mapping question-number strings to answer-letter
+strings (uppercase A-E). Example: {{"7": "BCD", "12": "ACE"}}
+If no corrections on this page, return {{}}.
+Do NOT add markdown, prose, or explanation — only the JSON object.
+
+QCM LIST FROM STEP 2 (use to attribute splits):
+{qcm_context_block}
+
+CORRECTIONS FOUND ON PREVIOUS PAGES (running map — do not re-emit unless this page changes them):
+{found_so_far}
+
+{("EXTRA GUIDANCE: " + guidance) if guidance else ""}
+
+{note}
+
+PAGE {pn} TEXT:
+{text}
+"""
+            got = None
+            for attempt in range(2):
+                model_used = primary_model if attempt == 0 else fallback_model
+                try:
+                    resp = self.openrouter.generate_completion(
+                        prompt, model=model_used, max_tokens=max_tokens
+                    )
+                    content = (resp.get("content") or "").strip()
+                    if not content:
+                        raise ValueError("Model returned empty content.")
+                    cost = resp.get("cost", 0.0) or self.openrouter.estimate_cost(
+                        model_used, resp.get("usage", {}))
+                    self.cost_tracker.log_api_call(
+                        f"step6_autodetect_p{pn}", model_used, resp.get("usage", {}), cost)
+                    raw = self._parse_first_json_object(content)
+                    if not raw:
+                        raise json.JSONDecodeError("No JSON object found", content, 0)
+                    got = {}
+                    for k, v in raw.items():
+                        clean_v = "".join(c for c in str(v).upper() if c in "ABCDE")
+                        if clean_v and str(k).isdigit():
+                            got[str(int(k))] = clean_v
+                    print(f"     🤖 AI ({model_used}) attempt {attempt+1}: "
+                          f"{len(got)} corrections on page {pn}.")
+                    # If the AI returned very little but the deterministic pass
+                    # had partial results, retry on the fallback model.
+                    expected_here_hint = len(re.findall(r'\|\s*\d{1,3}\s*\|', text))
+                    if expected_here_hint and got and len(got) < expected_here_hint * 0.5 and attempt == 0:
+                        print(f"     ⚠️  AI returned {len(got)}/{expected_here_hint} row hints — retrying with fallback.")
+                        continue
+                    break
+                except Exception as e:
+                    print(f"     ⚠️  AI attempt {attempt+1} failed for page {pn} ({model_used}): {e}")
+
+            # Merge: deterministic page_map first, then AI results override/extend
+            if got:
+                page_map.update(got)
+            if page_map:
+                correction_map.update(page_map)
+                print(f"     → Page {pn}: merged {len(page_map)} correction(s). Running total: {len(correction_map)}")
+            else:
+                print(f"     → Page {pn}: no corrections found.")
+
+        # ── Apply the accumulated correction map ──
+        if not correction_map:
+            print("\n❌ No corrections found across any page.")
+            return qcms
+
+        print(f"\n✅ Auto-Detect total: {len(correction_map)} corrections collected across {len(all_pages)} pages.")
+
+        # Standalone mode (no QCMs): save the map
+        if not qcms:
+            if self.context:
+                out_path = self.context.get_path("step6_corrections") / "correction_map.json"
+            else:
+                out_path = Path("output/step6_corrections/correction_map.json")
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(correction_map, f, indent=2, ensure_ascii=False)
+            print(f"💾 Standalone correction map saved to: {out_path}")
+            return []
+
+        applied = self._apply_corrections_with_fallback(qcms, correction_map)
+        print(f"\n✅ Applied {applied}/{len(qcms)} corrections to structured data.")
         return qcms
 
     def _score_correction_page(self, text: str) -> int:

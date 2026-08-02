@@ -65,7 +65,7 @@ export interface Step3Config {
   global_pages: string
 }
 
-export type CorrectionSource = 'ai_knowledge' | 'page_text' | 'auto_detect' | 'vision_ai'
+export type CorrectionSource = 'ai_knowledge' | 'page_text' | 'auto_detect'
 export type SearchMode = 'specific_pages' | 'all_pages'
 export interface Step6Config {
   source: CorrectionSource
@@ -75,9 +75,7 @@ export interface Step6Config {
   force_overwrite: boolean
   ai_model: string
   text_model: string
-  vision_model: string
   all_pages_model: string
-  vision_prompt: string
   page_text_guidance: string
   candidate_threshold: number
   include_neighbors: boolean

@@ -1599,9 +1599,18 @@ def _call_step(step_id: str, tracker, context, config: dict):
         Step4Format(tracker, context).run(auto_template=name)
 
     def _build_step6_config(cfg):
-        source_map = {"ai_knowledge":"ai_knowledge","page_text":"page_text","auto_detect":"page_text","vision_ai":"vision"}
+        source_map = {
+            "ai_knowledge": "ai_knowledge",
+            "page_text":    "page_text",
+            "auto_detect":  "auto_detect",   # NEW per-page DeepSeek scan
+            "vision_ai":    "vision",        # legacy — kept for back-compat only
+        }
         backend_source = source_map.get(cfg.get("source","page_text"),"page_text")
-        search_mode = "all_pages" if cfg.get("source")=="auto_detect" else cfg.get("correction_search_mode","all_pages")
+        # Auto-Detect is per-page; search_mode is forced to all_pages.
+        if cfg.get("source") == "auto_detect":
+            search_mode = "all_pages"
+        else:
+            search_mode = cfg.get("correction_search_mode","all_pages")
         ai_mode = {"sequential":"S","batch":"B"}.get(cfg.get("ai_mode","sequential"),"S")
         return {
             "source": backend_source, "ai_mode": ai_mode,

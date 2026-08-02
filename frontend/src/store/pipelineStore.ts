@@ -83,9 +83,7 @@ step3Config: {
         force_overwrite: false,
         ai_model: '',
         text_model: '',
-        vision_model: '',
         all_pages_model: '',
-        vision_prompt: '',
         page_text_guidance: '',
         candidate_threshold: 15,
         include_neighbors: true,
@@ -130,17 +128,25 @@ step3Config: {
           step8Config: state.step8Config,
         }),
         migrate: (persisted: any) => {
-          // Bump v2→v3: Step 3 row was merged into Step 2 and is no longer
-          // visible. If the user's persisted activeStepId was 3, move them
-          // onto the merged Step 2 row. step3Config itself is preserved
-          // because the merged Step 2 config panel embeds it under "Advanced".
+          // v2→v3: Step 3 row merged into Step 2 — move legacy activeStepId 3 over.
           if (!persisted) return persisted
           if (persisted.activeStepId === 3) {
-            return { ...persisted, activeStepId: 2 }
+            persisted = { ...persisted, activeStepId: 2 }
+          }
+          // v3→v4: "Vision AI" source removed from Step 6. If a persisted
+          // step6Config still holds source='vision_ai', reset it to the new
+          // Auto-Detect (which is now the per-page AI scanner). Drop the
+          // obsolete vision_model / vision_prompt fields.
+          if (persisted.step6Config) {
+            const s6 = { ...persisted.step6Config }
+            if (s6.source === 'vision_ai') s6.source = 'auto_detect'
+            delete s6.vision_model
+            delete s6.vision_prompt
+            persisted = { ...persisted, step6Config: s6 }
           }
           return persisted
         },
-        version: 3,
+        version: 4,
       }
   )
 )

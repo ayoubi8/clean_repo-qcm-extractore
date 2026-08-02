@@ -5,9 +5,8 @@ import { CorrectionSource, SearchMode } from '../../../types'
 
 const SOURCES: { id: CorrectionSource, label: string, icon: string, desc: string }[] = [
   { id: 'ai_knowledge', label: 'AI Knowledge', icon: 'psychology', desc: 'DeepSeek R1 answers from memory' },
-  { id: 'page_text', label: 'Page Text', icon: 'description', desc: 'Extract from specific page' },
-  { id: 'auto_detect', label: 'Auto-Detect', icon: 'search', desc: 'Scan for correction tables' },
-  { id: 'vision_ai', label: 'Vision AI', icon: 'visibility', desc: 'Detect marks in scanned PDF' },
+  { id: 'page_text',    label: 'Page Text',    icon: 'description', desc: 'Extract from a specific page' },
+  { id: 'auto_detect',  label: 'Auto-Detect',  icon: 'search',     desc: 'Scan every page with DeepSeek + Step-2 context' },
 ]
 
 export function Step6Config() {
@@ -31,21 +30,21 @@ export function Step6Config() {
   // Determine which model to show/edit based on source
   const getModelId = () => {
     if (config.source === 'ai_knowledge') return config.ai_model || '';
-    if (config.source === 'vision_ai') return config.vision_model || '';
+    if (config.source === 'auto_detect') return config.all_pages_model || '';
     return config.text_model || '';
   };
 
   const setModelId = (val: string) => {
     if (config.source === 'ai_knowledge') setConfig({ ai_model: val });
-    else if (config.source === 'vision_ai') setConfig({ vision_model: val });
+    else if (config.source === 'auto_detect') setConfig({ all_pages_model: val });
     else setConfig({ text_model: val });
   };
 
   const getModelOptions = () => {
     if (!models?.step6) return [];
     if (config.source === 'ai_knowledge') return [models.step6.ai_model, models.step6.ai_fallback].filter(Boolean);
-    if (config.source === 'vision_ai') return [models.step6.all_pages_model, models.step6.all_pages_fallback].filter(Boolean);
-    // page_text + auto_detect use the text model
+    if (config.source === 'auto_detect') return [models.step6.all_pages_model, models.step6.all_pages_fallback].filter(Boolean);
+    // page_text uses the text model
     return [models.step6.text_model, models.step6.text_fallback].filter(Boolean);
   };
 
@@ -87,7 +86,7 @@ export function Step6Config() {
       {/* Model Selection */}
       <div className="space-y-2 p-5 bg-surface-container-low rounded-2xl border border-outline-variant/10">
         <label className="text-[10px] font-black uppercase tracking-[0.2em] text-outline">
-          {config.source === 'ai_knowledge' ? 'Reasoning Model' : config.source === 'vision_ai' ? 'Vision Model' : 'Extraction Model'}
+          {config.source === 'ai_knowledge' ? 'Reasoning Model' : config.source === 'auto_detect' ? 'Scan Model' : 'Extraction Model'}
         </label>
         <select
           value={isCustom ? 'custom' : getModelId()}
@@ -165,19 +164,6 @@ export function Step6Config() {
               onChange={(e) => setConfig({ page_text_guidance: e.target.value })}
               placeholder="e.g. Focus on rows with X marks in columns A-E..."
               rows={2}
-              className="w-full bg-surface-container-lowest border border-outline-variant/20 rounded-xl px-4 py-3 text-sm focus:border-primary outline-none transition-all resize-none"
-            />
-          </div>
-        )}
-
-        {config.source === 'vision_ai' && (
-          <div className="space-y-2">
-            <label className="text-[10px] font-black uppercase tracking-[0.2em] text-outline">Vision Prompt</label>
-            <textarea
-              rows={2}
-              value={config.vision_prompt || ''}
-              onChange={(e) => setConfig({ vision_prompt: e.target.value })}
-              placeholder="Detect circled propositions..."
               className="w-full bg-surface-container-lowest border border-outline-variant/20 rounded-xl px-4 py-3 text-sm focus:border-primary outline-none transition-all resize-none"
             />
           </div>
