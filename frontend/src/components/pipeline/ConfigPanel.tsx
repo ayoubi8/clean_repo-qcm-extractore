@@ -124,17 +124,18 @@ export function ConfigPanel() {
       }
       if (activeStep.id === 2) {
         const s = store.step2Config
-        const page_range = s.extraction_mode === 'auto_loop'
-          ? `${s.chunk_size}-${s.chunk_size}-${s.chunk_size}`   // e.g. "3-3-3"
-          : s.page_range || 'all'
         config = {
-          page_range,
+          // Auto-Loop mode is the only mode now (single_batch removed). The
+          // page_range pattern "{n}-{n}-{n}" makes Step2QCMExtractBatch.run
+          // take the _run_loop_mode branch. Hardcoded to 1-1-1 (one page per
+          // chunk) for safest extraction on long PDFs.
+          page_range: '1-1-1',
           model_primary: s.model_primary,
           model_fallback: s.model_fallback,
           extraction_guidance: s.extraction_guidance,
           clinical_case_hints: s.clinical_case_hints,
-          // Step 3 config is embedded in the merged Step 2 panel (under
-          // "Advanced") and forwarded to run_post_step2_metadata.
+          // Step 3 config is embedded in the merged Step 2 panel and
+          // forwarded to run_post_step2_metadata. Includes huge_edit flag.
           step3: store.step3Config,
         }
       }

@@ -55,17 +55,15 @@ export const usePipelineStore = create<PipelineStore>()(
         model: ''   // seeded from .env STEP1_MODEL by Step1Config useEffect
       },
       step2Config: {
-        extraction_mode: 'single_batch',
-        chunk_size: 3,
-        page_range: '',
         model_primary: '',
         model_fallback: '',
         extraction_guidance: '',
         clinical_case_hints: false,
       },
-step3Config: {
+      step3Config: {
         model: '',
         model_fallback: '',
+        huge_edit: false,
         fields: {
           year:           { strategy: 'per_qcm', value: null },
           source:         { strategy: 'skip',    value: 'Externat' },
@@ -126,26 +124,40 @@ step3Config: {
           step8Config: state.step8Config,
         }),
         migrate: (persisted: any) => {
-          // v2→v3: Step 3 row merged into Step 2 — move legacy activeStepId 3 over.
           if (!persisted) return persisted
+          // v2->v3: Step 3 row merged into Step 2 — move legacy activeStepId 3 over.
           if (persisted.activeStepId === 3) {
             persisted = { ...persisted, activeStepId: 2 }
           }
-          // v3→v4: "Vision AI" source removed from Step 6.
+          // v3->v4 / v4->v5: Vision AI + AI Knowledge sources removed from Step 6.
           if (persisted.step6Config) {
             const s6 = { ...persisted.step6Config }
             if (s6.source === 'vision_ai') s6.source = 'auto_detect'
+            if (s6.source === 'ai_knowledge') s6.source = 'auto_detect'
             delete s6.vision_model
             delete s6.vision_prompt
-            // v4→v5: "AI Knowledge" source removed from Step 6.
-            if (s6.source === 'ai_knowledge') s6.source = 'auto_detect'
             delete s6.ai_mode
             delete s6.ai_model
             persisted = { ...persisted, step6Config: s6 }
           }
+          // v5->v6: Step 2 "Extraction Mode" removed; Auto-Loop is hardcoded to
+          // 1-1-1 server-side. Drop the obsolete fields. Step 3 gains a
+          // `huge_edit` flag for the audit log (default false).
+          if (persisted.step2Config) {
+            const s2 = { ...persisted.step2Config }
+            delete s2.extraction_mode
+            delete s2.chunk_size
+            delete s2.page_range
+            persisted = { ...persisted, step2Config: s2 }
+          }
+          if (persisted.step3Config) {
+            const s3 = { ...persisted.step3Config }
+            if (s3.huge_edit === undefined) s3.huge_edit = false
+            persisted = { ...persisted, step3Config: s3 }
+          }
           return persisted
         },
-        version: 5,
+        version: 6,
       }
   )
 )

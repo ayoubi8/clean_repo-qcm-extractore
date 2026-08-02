@@ -72,6 +72,9 @@ export function AutoRunPanel({ onClose }: AutoRunPanelProps) {
             step1: store.batchConfig!.extraction,
             step2: {
               ...store.batchConfig!.qcm_extraction,
+              // Auto-Loop 1-1-1 is now hardcoded — even a YAML/persisted
+              // value sneaking through cannot bring back single_batch.
+              page_range: '1-1-1',
               // Forward the metadata config into Step 2's cascade.
               step3: store.batchConfig!.metadata,
             },

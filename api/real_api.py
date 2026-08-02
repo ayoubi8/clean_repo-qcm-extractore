@@ -1464,7 +1464,7 @@ def _call_step(step_id: str, tracker, context, config: dict):
         
         # Step 2 — page range
         if "your choice" in p or "page range" in p:
-            return config.get("page_range", "all")
+            return config.get("page_range", "1-1-1")
         
         # Step 2/6 — review prompts → always accept/skip
         if "[a]ccept" in p or "[r/c]" in p:
@@ -1633,7 +1633,7 @@ def _call_step(step_id: str, tracker, context, config: dict):
         "1.5": lambda: Step1_5BatchTextFixer(tracker, context).run(),
         "1.6": lambda: Step1_6IntelligentTextFixer(tracker, context).run(),
         "2":   lambda: Step2QCMExtractBatch(tracker, context).run(
-                    page_range=config.get("page_range") or "all",
+                    page_range=config.get("page_range") or "1-1-1",
                     config={
                         "qcm_extraction": {
                             "extraction_guidance": config.get("extraction_guidance", ""),

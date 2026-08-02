@@ -104,7 +104,7 @@ class FolderBatchProcessor:
         # Step 2: QCM Batch Extraction
         s2_cfg = self.config.get('qcm_extraction', {})
         s2_result = Step2QCMExtractBatch(self.tracker, context).run(
-            page_range=s2_cfg.get('page_range', 'all')
+            page_range=s2_cfg.get('page_range', '1-1-1')
         )
         
         # Step 3: Metadata

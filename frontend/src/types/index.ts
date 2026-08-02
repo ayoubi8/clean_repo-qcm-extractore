@@ -38,9 +38,6 @@ export interface Step1Config {
 }
 
 export interface Step2Config {
-  extraction_mode: 'single_batch' | 'auto_loop'
-  chunk_size: number
-  page_range: string
   model_primary: string
   model_fallback: string
   extraction_guidance: string
@@ -55,6 +52,7 @@ export interface MetaFieldConfig {
 export interface Step3Config {
   model: string
   model_fallback: string
+  huge_edit: boolean
   fields: {
     year: MetaFieldConfig
     source: MetaFieldConfig

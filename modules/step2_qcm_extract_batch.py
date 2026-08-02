@@ -69,14 +69,12 @@ class Step2QCMExtractBatch:
         
         # Handle page range
         if not page_range:
-            print(f"\n📋 Page range: 1-{len(txt_files)}")
-            print(f"   Options:")
-            print(f"   • '1-{len(txt_files)}'  → single batch (all pages at once)")
-            print(f"   • '1-5'         → single batch (pages 1–5 only)")
-            print(f"   • '3-3-3'       → auto-loop: 3 pages per chunk")
-            print(f"   • '5-5-5'       → auto-loop: 5 pages per chunk")
-            print(f"   • '1-1-1'       → auto-loop: 1 page per chunk (safest)")
-            page_range = input(f"\nYour choice: ").strip()
+            # Auto-run / CLI-mode default: 1-1-1 (one page per chunk) — safest.
+            # The single_batch UI option was removed; this default replaces the
+            # old interactive prompt that asked the user for a page range.
+            page_range = "1-1-1"
+            print(f"\n📋 [AUTO] No page_range supplied — defaulting to {page_range} "
+                  f"(auto-loop, 1 page per chunk).")
         else:
             print(f"\n📋 [AUTO] Using page range: {page_range}")
         
