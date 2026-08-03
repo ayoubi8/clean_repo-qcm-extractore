@@ -1529,8 +1529,15 @@ def _call_step(step_id: str, tracker, context, config: dict):
     if step_id == "2":
         if config.get("model_primary"):
             os.environ["STEP2_MODEL"] = config["model_primary"]
+            # Sync Step 2's model to Step 3 so the metadata cascade (which
+            # fires inside Step 2's run via run_post_step2_metadata) uses the
+            # same model the user picked — there is now a single model
+            # selector pair in the UI that applies to both QCM extraction
+            # and metadata detection.
+            os.environ["STEP3_MODEL"] = config["model_primary"]
         if config.get("model_fallback"):
             os.environ["STEP2_FALLBACK_MODEL"] = config["model_fallback"]
+            os.environ["STEP3_FALLBACK_MODEL"] = config["model_fallback"]
     if step_id == "3":
         if config.get("model"):
             os.environ["STEP3_MODEL"] = config["model"]

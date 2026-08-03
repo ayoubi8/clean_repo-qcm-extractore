@@ -1,6 +1,4 @@
 import { usePipelineStore } from '../../../store/pipelineStore'
-import { useStepModels } from '../../../hooks/useStepModels'
-import { useState, useEffect } from 'react'
 import { MetaStrategy } from '../../../types'
 
 const STRATEGIES: Record<string, { label: string, icon: string, color: string, order: MetaStrategy[] }> = {
@@ -27,7 +25,7 @@ const STRATEGY_STYLING: Record<MetaStrategy, { label: string, icon: string, styl
 
 function CycleButton({ field, strategy, onCycle }: { field: string, strategy: MetaStrategy, onCycle: () => void }) {
   const meta = STRATEGY_STYLING[strategy]
-  
+
   return (
     <button
       id={`btn-cycle-${field}`}
@@ -43,25 +41,12 @@ function CycleButton({ field, strategy, onCycle }: { field: string, strategy: Me
 export function Step3Config({ embedded }: { embedded?: boolean }) {
   const config = usePipelineStore(s => s.step3Config)
   const setConfig = usePipelineStore(s => s.setStep3Config)
-  const { models, loading } = useStepModels()
-  const [isCustom, setIsCustom] = useState(false)
-  const [isCustomFallback, setIsCustomFallback] = useState(false)
-
-  // Seed models from .env on first load
-  useEffect(() => {
-    if (!loading && models?.step3) {
-      if (!config.model && models.step3.primary)
-        setConfig({ model: models.step3.primary })
-      if (!config.model_fallback && models.step3.fallback)
-        setConfig({ model_fallback: models.step3.fallback })
-    }
-  }, [loading, models])
 
   const handleCycle = (field: keyof typeof config.fields) => {
     const order = field === 'clinical_case' ? STRATEGIES.clinical_case.order : STRATEGIES.default.order
     const currentIndex = order.indexOf(config.fields[field].strategy)
     const nextStrategy = order[(currentIndex + 1) % order.length]
-    
+
     setConfig({
       fields: {
         ...config.fields,
@@ -74,78 +59,6 @@ export function Step3Config({ embedded }: { embedded?: boolean }) {
 
   return (
     <div className="space-y-8 animate-in fade-in slide-in-from-bottom-2 duration-300">
-      {/* Model Selection */}
-      <div className="grid grid-cols-2 gap-4">
-        <div className="space-y-2">
-          <label className="text-[10px] font-black uppercase tracking-[0.2em] text-outline">Reasoning Model</label>
-          <select
-            value={isCustom ? 'custom' : config.model}
-            onChange={(e) => {
-              if (e.target.value === 'custom') {
-                setIsCustom(true);
-              } else {
-                setIsCustom(false);
-                setConfig({ model: e.target.value });
-              }
-            }}
-            disabled={loading}
-            className="w-full bg-surface-container-lowest border border-outline-variant/20 rounded-xl px-4 py-3 text-sm focus:border-primary outline-none transition-all appearance-none disabled:opacity-50"
-          >
-            {loading ? <option>Loading models...</option> : (
-              <>
-                <option value={models?.step3?.primary}>{models?.step3?.primary} (Primary)</option>
-                <option value={models?.step3?.fallback}>{models?.step3?.fallback} (Fallback)</option>
-                <option value="custom">Custom...</option>
-              </>
-            )}
-          </select>
-          {isCustom && (
-            <input
-              type="text"
-              value={config.model}
-              onChange={(e) => setConfig({ model: e.target.value })}
-              placeholder="Enter model ID..."
-              className="w-full mt-2 bg-surface-container-lowest border border-outline-variant/20 rounded-xl px-4 py-3 text-sm focus:border-primary outline-none transition-all animate-in fade-in"
-            />
-          )}
-        </div>
-
-        <div className="space-y-2">
-          <label className="text-[10px] font-black uppercase tracking-[0.2em] text-outline">Fallback Model</label>
-          <select
-            id="select-step3-model-fallback"
-            value={isCustomFallback ? 'custom' : config.model_fallback}
-            onChange={(e) => {
-              if (e.target.value === 'custom') {
-                setIsCustomFallback(true);
-              } else {
-                setIsCustomFallback(false);
-                setConfig({ model_fallback: e.target.value });
-              }
-            }}
-            disabled={loading}
-            className="w-full bg-surface-container-lowest border border-outline-variant/20 rounded-xl px-4 py-3 text-sm focus:border-primary outline-none transition-all appearance-none disabled:opacity-50"
-          >
-            {loading ? <option>Loading models...</option> : (
-              <>
-                <option value={models?.step3?.primary}>{models?.step3?.primary}</option>
-                <option value={models?.step3?.fallback}>{models?.step3?.fallback} (Fallback)</option>
-                <option value="custom">Custom...</option>
-              </>
-            )}
-          </select>
-          {isCustomFallback && (
-            <input
-              type="text"
-              value={config.model_fallback}
-              onChange={(e) => setConfig({ model_fallback: e.target.value })}
-              placeholder="Enter model ID..."
-              className="w-full mt-2 bg-surface-container-lowest border border-outline-variant/20 rounded-xl px-4 py-3 text-sm focus:border-primary outline-none transition-all animate-in fade-in"
-            />
-          )}
-        </div>
-      </div>
-
       {/* Strategy Table */}
       <div className="space-y-3">
         <label className="text-[10px] font-black uppercase tracking-[0.2em] text-outline">Metadata Strategies</label>
@@ -153,10 +66,10 @@ export function Step3Config({ embedded }: { embedded?: boolean }) {
           {(Object.keys(config.fields) as Array<keyof typeof config.fields>).map((field) => (
             <div key={field} className="flex items-center justify-between p-4">
               <span className="text-sm font-bold capitalize text-on-surface-variant w-32">{field.replace('_', ' ')}</span>
-              <CycleButton 
-                field={field} 
-                strategy={config.fields[field].strategy} 
-                onCycle={() => handleCycle(field)} 
+              <CycleButton
+                field={field}
+                strategy={config.fields[field].strategy}
+                onCycle={() => handleCycle(field)}
               />
             </div>
           ))}

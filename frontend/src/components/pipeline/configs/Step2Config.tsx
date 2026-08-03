@@ -30,10 +30,19 @@ export function Step2Config() {
         </p>
       </div>
 
-      {/* ── Models ── */}
+      {/* ── Models (applies to QCM extraction + metadata cascade) ── */}
+      <div className="space-y-2">
+        <label className="text-[10px] font-black uppercase tracking-[0.2em] text-outline">
+          Extraction Model <span className="text-primary normal-case font-medium">· applies to QCM + Metadata</span>
+        </label>
+        <p className="text-[10px] text-outline px-1 -mt-1">
+          The primary/fallback model below is used for both QCM extraction (this step) and
+          the metadata auto-detection cascade (Step 3) that runs right after.
+        </p>
+      </div>
       <div className="grid grid-cols-2 gap-4">
         <div className="space-y-2">
-          <label className="text-[10px] font-black uppercase tracking-[0.2em] text-outline">Primary Model</label>
+          <label className="text-[10px] font-black uppercase tracking-[0.2em] text-outline">Primary</label>
           <select
             id="select-step2-model-primary"
             value={isCustomPrimary ? 'custom' : config.model_primary}
@@ -67,7 +76,7 @@ export function Step2Config() {
         </div>
 
         <div className="space-y-2">
-          <label className="text-[10px] font-black uppercase tracking-[0.2em] text-outline">Fallback Model</label>
+          <label className="text-[10px] font-black uppercase tracking-[0.2em] text-outline">Fallback</label>
           <select
             id="select-step2-model-fallback"
             value={isCustomFallback ? 'custom' : config.model_fallback}
