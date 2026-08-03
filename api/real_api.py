@@ -1573,6 +1573,11 @@ def _call_step(step_id: str, tracker, context, config: dict):
             os.environ["MATCH_COLOR_GREEN"] = str(config["color_green"])
         if config.get("color_yellow") is not None:
             os.environ["MATCH_COLOR_YELLOW"] = str(config["color_yellow"])
+        # NEW: tag-merge phase config (auto-merge floor + self-scan flag)
+        if config.get("auto_merge_floor") is not None:
+            os.environ["MATCH_AUTO_MERGE_FLOOR"] = str(config["auto_merge_floor"])
+        if config.get("self_scan") is not None:
+            os.environ["MATCH_SELF_SCAN"] = "1" if config["self_scan"] else "0"
 
     # Late imports to avoid circular deps and only load what's needed
     from modules.step1_extraction import Step1Extraction
@@ -2207,6 +2212,65 @@ async def _export_step8_task(project: str, email: str, body: dict):
     except Exception as e:
         job_manager.set_error(project, "8-export")
         log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "error", "text": f"❌ Export failed: {str(e)}"})
+
+# --- Step 8 merge-outputs manifest (PR-S8-2) ---
+
+@app.get("/projects/{name}/step8/merge-outputs")
+async def step8_merge_outputs(name: str, user: dict = Depends(get_current_user)):
+    """Return a manifest of the 4 merge-phase artifacts produced by Step 8:
+    `<ref>_UPDATED.xlsx`, `merge_report.json`, `unmerged_qcms.xlsx`, and the
+    summary. Files themselves are served by the generic per-step file route:
+    /projects/{name}/steps/8/download/<filename>.
+
+    If Step 8 has not produced any merge outputs yet, returns an empty
+    manifest with HTTP 200 (the frontend treats this as "not yet run").
+    """
+    _apply_user_env(user)
+    ctx_data = get_or_create(name, user["id"])
+    context = ctx_data["context"]
+    out_dir = context.base_path / "step8_matches"
+
+    def _info(filename: str):
+        p = out_dir / filename
+        if not p.exists():
+            return None
+        try:
+            size = p.stat().st_size
+        except OSError:
+            size = 0
+        return {"filename": filename, "size_bytes": size,
+                "url": f"/projects/{name}/steps/8/download/{filename}"}
+
+    manifest: dict = {"files": {}}
+
+    # Always try the summary — it tells the UI whether a merge happened.
+    summary_path = out_dir / "step8_summary.json"
+    summary_info = _info("step8_summary.json")
+    if summary_info:
+        manifest["files"]["summary"] = summary_info
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            manifest["summary"] = summary
+            merge_block = summary.get("merge", {})
+            if merge_block:
+                # Find the ref_UPDATED filename from the merge block (ref_db_name-based)
+                ref_updated_name = merge_block.get("ref_updated_filename")
+                merge_report_name = merge_block.get("merge_report_filename")
+                unmerged_name = merge_block.get("unmerged_filename")
+                if ref_updated_name:
+                    info = _info(ref_updated_name)
+                    if info: manifest["files"]["ref_updated"] = info
+                if merge_report_name:
+                    info = _info(merge_report_name)
+                    if info: manifest["files"]["merge_report"] = info
+                if unmerged_name:
+                    info = _info(unmerged_name)
+                    if info: manifest["files"]["unmerged"] = info
+        except Exception as e:
+            print(f"[STEP8-MANIFEST] Could not parse summary: {e}")
+
+    return manifest
+
 
 # --- Auto Run Logic ---
 

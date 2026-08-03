@@ -1,7 +1,9 @@
 import { useState, useEffect } from 'react'
 import { usePipelineStore } from '../../../store/pipelineStore'
+import { useAppStore } from '../../../store/appStore'
 import { MatchMode } from '../../../types'
 import { fetchRefDbs, uploadRefDb, deleteRefDb } from '../../../lib/api'
+import { MergeResultsPanel } from '../../step8/MergeResultsPanel'
 
 // Helper for formatting file size
 const formatBytes = (bytes: number) => {
@@ -21,6 +23,7 @@ const MODES: { id: MatchMode; label: string; desc: string }[] = [
 export function Step8Config() {
   const config = usePipelineStore(s => s.step8Config)
   const setConfig = usePipelineStore(s => s.setStep8Config)
+  const activeProject = useAppStore(s => s.activeProject)
 
   const [files, setFiles] = useState<any[]>([])
   const [loading, setLoading] = useState(false)
@@ -77,6 +80,11 @@ export function Step8Config() {
 
   return (
     <div className="space-y-8 animate-in fade-in slide-in-from-bottom-2 duration-300">
+
+      {/* Tag-merge results panel (shows recent merges from the last Step 8 run) */}
+      {activeProject && config.ref_db_path && (
+        <MergeResultsPanel projectName={activeProject.name} />
+      )}
 
       {/* Reference DB Section */}
       <div className="space-y-3">
@@ -293,7 +301,63 @@ export function Step8Config() {
         </div>
       </div>
 
-      {/* Custom Export Section */}
+      {/* Auto-Merge Floor (NEW) */}
+      <div className="space-y-3 p-5 bg-surface-container-low rounded-2xl border border-outline-variant/10">
+        <div className="flex items-center justify-between">
+          <label className="text-[10px] font-black uppercase tracking-[0.2em] text-outline">Auto-Merge Floor</label>
+          <span className="text-sm font-black text-primary">{Math.round(config.auto_merge_floor * 100)}%</span>
+        </div>
+        <input
+          type="range" min="50" max="99" step="1"
+          value={Math.round(config.auto_merge_floor * 100)}
+          onChange={(e) => setConfig({ auto_merge_floor: parseInt(e.target.value) / 100 })}
+          className="w-full accent-primary"
+        />
+        <div className="flex justify-between text-[10px] text-outline">
+          <span>50% (aggressive)</span>
+          <span>97% (default)</span>
+          <span>99% (conservative)</span>
+        </div>
+        <p className="text-[10px] text-outline leading-relaxed">
+          QCMs with similarity ≥ this floor are auto-merged into the reference DB
+          (their tags are absorbed and the result is downloadable as
+          <code className="bg-surface-container-highest px-1 rounded mx-1">_UPDATED.xlsx</code>).
+          Below = manual review via
+          <code className="bg-surface-container-highest px-1 rounded mx-1">unmerged_qcms.xlsx</code>. Default 97%.
+        </p>
+      </div>
+
+      {/* Self-Scan mode (NEW, only relevant when a reference DB is selected) */}
+      {config.ref_db_path && (
+        <div
+          className={`space-y-3 p-5 rounded-2xl border transition-all ${
+            config.self_scan
+              ? 'bg-primary/5 border-primary/30 shadow-[0_0_15px_rgba(76,215,246,0.1)]'
+              : 'bg-surface-container-low border-outline-variant/10'
+          }`}
+        >
+          <label className="flex items-start gap-3 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={config.self_scan}
+              onChange={(e) => setConfig({ self_scan: e.target.checked })}
+              className="mt-0.5 w-4 h-4 accent-primary flex-shrink-0"
+            />
+            <div className="flex-1">
+              <p className="text-xs font-black text-on-surface">Self-Scan (Reference vs Itself)</p>
+              <p className="text-[10px] text-outline leading-relaxed mt-1">
+                Runs the selected reference DB against itself to find internal
+                duplicates. The project's Step 6/5 source is ignored for this run.
+                Output: <code className="bg-surface-container-highest px-1 rounded">_UPDATED.xlsx</code>
+                + <code className="bg-surface-container-highest px-1 rounded">merge_report.json</code> (no unmerged file).
+              </p>
+            </div>
+          </label>
+        </div>
+      )}
+
+      {/* Custom Export Section (hidden in self-scan mode — no project source to export) */}
+      {!config.self_scan && (
       <div className="space-y-4 pt-4 border-t border-outline-variant/10">
         <label className="text-[10px] font-black uppercase tracking-[0.2em] text-outline">Custom Export (after run)</label>
         <div className="grid grid-cols-2 gap-3">
@@ -322,6 +386,7 @@ export function Step8Config() {
           className="w-full bg-surface-container-lowest border border-outline-variant/20 rounded-xl px-4 py-2.5 text-xs focus:border-primary outline-none"
         />
       </div>
+      )}
 
     </div>
   )

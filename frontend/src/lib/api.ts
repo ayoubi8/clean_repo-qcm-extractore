@@ -297,6 +297,34 @@ export async function exportExisting(projectName: string, body?: object): Promis
   return res.json()
 }
 
+// GET /projects/{name}/step8/merge-outputs — manifest of the tag-merge phase
+export interface Step8MergeManifest {
+  files: Record<string, { filename: string; size_bytes: number; url: string } | undefined>
+  summary?: {
+    merge?: {
+      auto_merge_floor: number
+      self_scan: boolean
+      ref_db_name?: string
+      source_step?: string
+      total_pairs_considered?: number
+      total_merges?: number
+      total_deletions?: number
+      total_unmerged?: number
+      per_tier_stats?: Record<string, { merges: number; deletions: number }>
+      ref_updated_filename?: string | null
+      merge_report_filename?: string | null
+      unmerged_filename?: string | null
+    }
+  }
+}
+export async function fetchStep8MergeOutputs(projectName: string): Promise<Step8MergeManifest> {
+  const res = await fetchWithRefresh(`${BASE}/projects/${encodeURIComponent(projectName)}/step8/merge-outputs`, {
+    headers: { ...getAuthHeaders() },
+  })
+  if (!res.ok) throw new Error('Failed to fetch Step 8 merge outputs')
+  return res.json()
+}
+
 // GET /env
 export async function fetchEnvKeys(): Promise<any> {
   const res = await fetchWithRefresh(`${BASE}/env`, {

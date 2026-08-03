@@ -96,6 +96,8 @@ export const usePipelineStore = create<PipelineStore>()(
         export_from: 0.0,
         export_to: 0.6,
         export_filename: 'custom_export',
+        auto_merge_floor: 0.97,
+        self_scan: false,
       },
 
       setStepStatus: (id, s) => set((state) => ({
@@ -160,9 +162,16 @@ export const usePipelineStore = create<PipelineStore>()(
             if (s3.huge_edit === undefined) s3.huge_edit = false
             persisted = { ...persisted, step3Config: s3 }
           }
+          // v7->v8: Step 8 gains tag-merge phase config (auto_merge_floor + self_scan).
+          if (persisted.step8Config) {
+            const s8 = { ...persisted.step8Config }
+            if (s8.auto_merge_floor === undefined) s8.auto_merge_floor = 0.97
+            if (s8.self_scan === undefined) s8.self_scan = false
+            persisted = { ...persisted, step8Config: s8 }
+          }
           return persisted
         },
-        version: 7,
+        version: 8,
       }
   )
 )

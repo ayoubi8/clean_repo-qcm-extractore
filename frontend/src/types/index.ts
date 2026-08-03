@@ -92,6 +92,9 @@ export interface Step8Config {
   export_from: number      // 0.0 – 1.0
   export_to: number        // 0.0 – 1.0
   export_filename: string
+  // Tag-merge & auto-dedup phase (PR-S8-3)
+  auto_merge_floor: number  // 0.50 – 0.99, default 0.97
+  self_scan: boolean        // default false — run reference DB against itself
 }
 
 export interface BatchConfig {
