@@ -19,8 +19,6 @@ import { useStepHistory } from '../../hooks/useStepHistory'
 //   (see modules/post_step3_build.py).
 const CONFIG_MAP: Record<string, React.FC<any>> = {
   '1': Step1Config,
-  '1.5': StepRunOnly,
-  '1.6': StepRunOnly,
   '2': Step2_3Config,
   '6': Step6Config,
   '7': StepRunOnly,
@@ -176,7 +174,7 @@ export function ConfigPanel() {
   }
 
   const ConfigComponent = CONFIG_MAP[activeStep.id.toString()]
-  const isRunDisabled = loading || (activeStep.outputExists && !overwriteConfirmed) || activeStep.id === 1.5
+  const isRunDisabled = loading || (activeStep.outputExists && !overwriteConfirmed)
 
   return (
     <section className="flex-1 overflow-y-auto bg-surface custom-scrollbar">
@@ -196,7 +194,7 @@ export function ConfigPanel() {
           />
         )}
 
-        {activeStep.id !== 1.5 && (
+        {activeStep.id !== 1.5 && (  // legacy guard — 1.5 no longer in CONFIG_MAP, but keep for safety
           <div className="mt-12 pt-8 border-t border-outline-variant/10">
             <button
               id="btn-run-step-config"

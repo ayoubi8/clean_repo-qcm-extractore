@@ -26,7 +26,9 @@ interface PipelineStore {
   setStep8Config: (c: Partial<Step8Config>) => void
 }
 
-// Steps 3, 4 & 5 are intentionally NOT listed here:
+// Steps 1.5, 1.6, 3, 4 & 5 are intentionally NOT listed here:
+// - Steps 1.5 & 1.6 fire as invisible backend steps in the autorun sequence
+//   when the range covers Step 1 → Step 2 (real_api.py sequence ["1","1.5","1.6","2",...]).
 // - Steps 4 & 5 are an invisible backend operation (see modules/post_step3_build.py).
 // - Step 3 is now part of the merged "Step 2 · QCM Extraction + Metadata" row —
 //   it fires as an invisible cascade after Step 2 succeeds
@@ -34,8 +36,6 @@ interface PipelineStore {
 //   polling, but the UI shows only one row.
 const INITIAL_STEPS: StepState[] = [
   { id: 1, label: 'Step 1 · Text Extraction', status: 'idle', outputExists: false },
-  { id: 1.5, label: 'Step 1.5 · Text Fixer (auto)', status: 'idle', outputExists: false },
-  { id: 1.6, label: 'Step 1.6 · OCR Corrector', status: 'idle', outputExists: false },
   { id: 2, label: 'Step 2 · QCM Extraction + Metadata', status: 'idle', outputExists: false },
   { id: 6, label: 'Step 6 · Corrections', status: 'idle', outputExists: false },
   { id: 7, label: 'Step 7 · Categorization', status: 'idle', outputExists: false },
@@ -129,6 +129,11 @@ export const usePipelineStore = create<PipelineStore>()(
           if (persisted.activeStepId === 3) {
             persisted = { ...persisted, activeStepId: 2 }
           }
+          // v6->v7: Steps 1.5 & 1.6 hidden from the UI. If a persisted
+          // session had either as the active step, fall back to Step 1.
+          if (persisted.activeStepId === 1.5 || persisted.activeStepId === 1.6) {
+            persisted = { ...persisted, activeStepId: 1 }
+          }
           // v3->v4 / v4->v5: Vision AI + AI Knowledge sources removed from Step 6.
           if (persisted.step6Config) {
             const s6 = { ...persisted.step6Config }
@@ -157,7 +162,7 @@ export const usePipelineStore = create<PipelineStore>()(
           }
           return persisted
         },
-        version: 6,
+        version: 7,
       }
   )
 )

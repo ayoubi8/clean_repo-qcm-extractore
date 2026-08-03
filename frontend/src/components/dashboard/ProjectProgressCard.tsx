@@ -17,14 +17,14 @@ export function ProjectProgressCard({ project, allProjects, loading }: ProjectPr
     )
   }
 
-  // Steps 4 & 5 are intentionally absent — they run as an invisible backend
-  // auto-build after Step 3 succeeds (see backend modules/post_step3_build.py).
-  const steps = [1, 1.5, 1.6, 2, 3, 6, 7, 8]
-  // last_step from backend may be 4 or 5 (auto-build marked them done). Map
-  // those hidden step ids back to the visible Step 3 so the bar reflects what
-  // the user actually sees in the UI.
-  const rawLastStep = project?.last_step ?? 0
-  const lastStep = (rawLastStep === 4 || rawLastStep === 5) ? 3 : rawLastStep
+// Steps 1.5, 1.6, 4 & 5 are intentionally absent — they run as invisible
+// backend steps (1.5/1.6 in the autorun sequence; 4/5 inside Step 3's cascade).
+const steps = [1, 2, 3, 6, 7, 8]
+// last_step from backend may be 4 or 5 (auto-build marked them done). Map
+// those hidden step ids back to the visible Step 3 so the bar reflects what
+// the user actually sees in the UI.
+const rawLastStep = project?.last_step ?? 0
+const lastStep = (rawLastStep === 4 || rawLastStep === 5) ? 3 : rawLastStep
 
   return (
     <div className="bg-surface-container rounded-2xl p-6 border border-outline-variant/10 flex flex-col h-[240px] shadow-sm">

@@ -82,34 +82,6 @@ export function StepRow({ step, isActive, onClick }: StepRowProps) {
           setStepStatus(step.id, status.status)
           setStepOutputExists(step.id, status.output_exists)
           setPipelineStatus('idle')
-          
-          // Auto-trigger Step 1.5 if Step 1 finishes
-          // Auto-trigger Step 1.5 if Step 1 finishes
-          if (step.id === 1 && status.status === 'done') {
-            (async () => {
-              try {
-                setStepStatus(1.5, 'running')
-                appendLog({ 
-                  ts: new Date().toLocaleTimeString(), 
-                  type: 'info', 
-                  text: '⚡ Auto-triggering Step 1.5 (Text Fixer)...' 
-                })
-                await runStep(activeProject.name, 1.5, {})
-                connectLogStream(
-                  activeProject.name,
-                  1.5,
-                  (line) => appendLog(line),
-                  async () => {
-                    const s = await getStepStatus(activeProject.name, 1.5)
-                    setStepStatus(1.5, s.status)
-                    setStepOutputExists(1.5, s.output_exists)
-                  }
-                )
-              } catch (e) {
-                setStepStatus(1.5, 'error')
-              }
-            })()
-          }
         }
       )
     } catch (err: any) {
@@ -122,7 +94,7 @@ export function StepRow({ step, isActive, onClick }: StepRowProps) {
     }
   }
 
-  const showRunButton = isActive && step.status !== 'running' && step.id !== 1.5
+  const showRunButton = isActive && step.status !== 'running'
 
   return (
     <div 
@@ -139,7 +111,7 @@ export function StepRow({ step, isActive, onClick }: StepRowProps) {
       <div className="flex-1 min-w-0">
         <p className={`text-xs font-bold truncate ${isActive ? 'text-primary' : 'text-on-surface'}`}>
           {step.label}
-          {step.id === 1.5 && <span className="ml-1 text-[10px] text-outline font-normal">(auto)</span>}
+          {step.id === 1 && <span className="ml-1 text-[10px] text-outline font-normal">(+ auto 1.5/1.6)</span>}
         </p>
       </div>
 
