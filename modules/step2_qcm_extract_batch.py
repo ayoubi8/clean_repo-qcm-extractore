@@ -256,61 +256,86 @@ Return ONLY the JSON array, no markdown, no explanation.
         
         primary_model = os.getenv("STEP2_MODEL", "google/gemini-2.5-flash-lite-preview-09-2025")
         fallback_model = os.getenv("STEP2_FALLBACK_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
-        max_tokens = int(os.getenv("STEP2_MAX_TOKENS", "20000"))
-        
-        print(f"[API] Trying primary model: {primary_model}...")
-        try:
+        base_max_tokens = int(os.getenv("STEP2_MAX_TOKENS", "20000"))
+        max_retries = int(os.getenv("STEP2_MAX_RETRIES", "3"))
+        retries = max(1, max_retries)  # at least 1 attempt
+
+        result_qcms: List[Dict] = []
+        for attempt in range(1, retries + 1):
+            # Escalate max_token per retry: the most common failure is a
+            # *truncated* JSON response (model hits its token cap mid-array).
+            # A larger budget on the retry lets the model finish writing all QCMs.
+            max_tokens = int(base_max_tokens * attempt)
+            # Clamp to a safe ceiling so we never send an absurd value.
+            max_tokens = min(max_tokens, int(os.getenv("STEP2_MAX_TOKENS_CEILING", "64000")))
+            attempt_note = f"  (attempt {attempt}/{retries})" if retries > 1 else ""
+
+            print(f"[API] Trying primary model: {primary_model}...{attempt_note}")
             try:
-                response = self.client.generate_completion(
-                    prompt, 
-                    model=primary_model,
-                    max_tokens=max_tokens
-                )
-                model_used = primary_model
-            except Exception as e:
-                print(f"[WARN] Primary model failed: {e}")
-                print(f"[INFO] Retrying with fallback: {fallback_model}")
-                response = self.client.generate_completion(
-                    prompt,
-                    model=fallback_model,
-                    max_tokens=max_tokens
-                )
-                model_used = fallback_model
-                
-        except Exception as e2:
-            print(f"❌ Both primary and fallback models failed. Final error: {e2}")
-            return []
-        
-        # Parse response
-        content = response["content"]
-        cost = response.get('cost', 0.0) or self.client.estimate_cost(model_used, response["usage"])
-        
-        self.cost_tracker.log_api_call(
-            f"step2_batch_p{start_page}-{end_page}",
-            model_used,
-            response["usage"],
-            cost
-        )
-        
-        print(f"[OK] Used {model_used} (${cost:.4f})")
-        
-        # Parse JSON
-        qcms = self._parse_json(content)
-        
-        if qcms:
-            print(f"[SUCCESS] Extracted {len(qcms)} QCMs")
-            
-            # Show preview
-            for q in qcms[:3]:
-                num = q.get('number', '?')
-                text = (q.get('text', '') or '')[:50]
-                prop_count = len(q.get('propositions', {}))
-                print(f"  Q{num}: {text}... ({prop_count} props)")
-            
-            if len(qcms) > 3:
-                print(f"  ... and {len(qcms)-3} more")
-        
-        return qcms
+                try:
+                    response = self.client.generate_completion(
+                        prompt,
+                        model=primary_model,
+                        max_tokens=max_tokens
+                    )
+                    model_used = primary_model
+                except Exception as e:
+                    print(f"[WARN] Primary model failed: {e}")
+                    print(f"[INFO] Retrying with fallback: {fallback_model}")
+                    response = self.client.generate_completion(
+                        prompt,
+                        model=fallback_model,
+                        max_tokens=max_tokens
+                    )
+                    model_used = fallback_model
+
+            except Exception as e2:
+                print(f"❌ Both primary and fallback models failed. Final error: {e2}")
+                if attempt < retries:
+                    print(f"   ↻ Retrying page (attempt next) after API failure...")
+                    continue
+                return []
+
+            # Parse response
+            content = response["content"]
+            cost = response.get('cost', 0.0) or self.client.estimate_cost(model_used, response["usage"])
+
+            self.cost_tracker.log_api_call(
+                f"step2_batch_p{start_page}-{end_page}",
+                model_used,
+                response["usage"],
+                cost
+            )
+
+            print(f"[OK] Used {model_used} (${cost:.4f})")
+
+            # Parse JSON
+            qcms = self._parse_json(content)
+
+            if qcms:
+                result_qcms = qcms
+                print(f"[SUCCESS] Extracted {len(qcms)} QCMs")
+
+                # Show preview
+                for q in qcms[:3]:
+                    num = q.get('number', '?')
+                    text = (q.get('text', '') or '')[:50]
+                    prop_count = len(q.get('propositions', {}))
+                    print(f"  Q{num}: {text}... ({prop_count} props)")
+
+                if len(qcms) > 3:
+                    print(f"  ... and {len(qcms)-3} more")
+                break
+            else:
+                if attempt < retries:
+                    print(f"⚠️  No QCMs parsed on attempt {attempt}/{retries} "
+                          f"(chunk pages {start_page}–{end_page}). Retrying "
+                          f"with more output tokens...")
+                else:
+                    print(f"❌ Failed to extract any QCMs after {retries} attempts "
+                          f"for pages {start_page}–{end_page}.")
+
+        return result_qcms
     
     def _parse_json(self, content: str) -> List[Dict]:
         """Parse JSON from LLM response. Truncation-safe: extracts all
