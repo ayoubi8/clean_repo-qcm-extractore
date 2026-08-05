@@ -1206,16 +1206,99 @@ def _record_step_costs(user_id: str, project: str, step_id: str, tracker) -> Non
         print(f"[PERSIST] _record_step_costs failed for step {step_id}: {e}")
 
 
+# --- PERSISTENCE_FIX_PLAN PR-2: SQL-first read helpers -----------------
+
+def _latest_step_result_row(user_id: str, project: str, step_id: str | None = None) -> dict | None:
+    """Return the newest `step_results` row, optionally filtered to one step.
+
+    Survives a fresh container: queries SQL instead of walking the local FS
+    or recursing Supabase Storage. Returns None if the table is missing /
+    empty / the project_id can't be resolved — callers must fall back to
+    the existing Storage/FS paths in that case (preserving back-compat).
+    """
+    try:
+        project_id = _resolve_project_id(user_id, project)
+        if not project_id:
+            return None
+        sb = get_supabase()
+        q = sb.table("step_results").select(
+            "id,step_number,run_id,badge,duration_seconds,storage_prefix,file_manifest,payload,created_at"
+        ).eq("project_id", project_id)
+        if step_id is not None:
+            q = q.eq("step_number", str(step_id))
+        q = q.order("created_at", desc=True).limit(1)
+        res = q.execute()
+        data = getattr(res, "data", None) or []
+        return data[0] if data else None
+    except Exception as e:
+        print(f"[PERSIST] _latest_step_result_row failed ({user_id}/{project}/{step_id}): {e}")
+        return None
+
+
+def _all_step_history_rows(user_id: str, project: str) -> list:
+    """Return all `step_history` rows for a project, newest first."""
+    try:
+        project_id = _resolve_project_id(user_id, project)
+        if not project_id:
+            return []
+        sb = get_supabase()
+        res = (sb.table("step_history")
+                 .select("step_number,run_at,badge,duration_seconds,metadata")
+                 .eq("project_id", project_id)
+                 .order("run_at", desc=True)
+                 .execute())
+        return getattr(res, "data", None) or []
+    except Exception as e:
+        print(f"[PERSIST] _all_step_history_rows failed ({user_id}/{project}): {e}")
+        return []
+
+
+def _all_cost_rows(user_id: str, project: str) -> list:
+    """Return all `costs` rows for a project, newest first."""
+    try:
+        project_id = _resolve_project_id(user_id, project)
+        if not project_id:
+            return []
+        sb = get_supabase()
+        res = (sb.table("costs")
+                 .select("step_number,cost_usd,tokens,recorded_at")
+                 .eq("project_id", project_id)
+                 .order("recorded_at", desc=True)
+                 .execute())
+        return getattr(res, "data", None) or []
+    except Exception as e:
+        print(f"[PERSIST] _all_cost_rows failed ({user_id}/{project}): {e}")
+        return []
+
+
 @app.get("/projects/{name}/step-history")
 def get_step_history(name: str, user: dict = Depends(get_current_user)):
-    # Try Supabase Storage first
+    # PERSISTENCE_FIX_PLAN PR-2: SQL step_history table first (one round-trip,
+    # restart-proof). Reshape into the dict-of-step→list-of-entries contract
+    # that the frontend already expects from the JSON blob.
+    sql_rows = _all_step_history_rows(user["id"], name)
+    if sql_rows:
+        history: dict = {}
+        for r in sql_rows:
+            sid = str(r.get("step_number"))
+            meta = r.get("metadata") or {}
+            entry = {
+                "run_at": r.get("run_at") or meta.get("run_at") or "",
+                "badge": r.get("badge", "success"),
+                "duration_seconds": r.get("duration_seconds", 0),
+                **{k: v for k, v in meta.items() if k not in ("run_id", "folder")},
+            }
+            history.setdefault(sid, []).append(entry)
+        if history:
+            return history
+
+    # Fallback: legacy JSON blob in Storage (then local FS).
     storage_path = f"{user['id']}/{name}/step_history.json"
     try:
         if file_exists(storage_path):
             return json.loads(read_file(storage_path))
     except Exception:
         pass
-    # Fallback to local filesystem
     path = Path(f"/app/output/{user['id']}/{name}/step_history.json")
     if not path.exists():
         return {}
@@ -1865,8 +1948,20 @@ def get_step_status(name: str, step_id: str, user: dict = Depends(get_current_us
     if mem_status in ("running", "done", "error"):
         return {"status": mem_status, "output_exists": mem_output}
 
-    # mem_status == "idle": the container may have restarted and lost job state.
-    # Fall back to Supabase Storage to check if outputs were already uploaded.
+    # PERSISTENCE_FIX_PLAN PR-2: SQL-first check. After a container restart
+    # the in-memory JobManager is empty, but a step_results SQL row (written
+    # by _record_step_result on every successful run) survives. One round-trip
+    # instead of 8 recursive Storage walks per step.
+    sql_row = _latest_step_result_row(user["id"], name, step_id)
+    if sql_row:
+        badge = sql_row.get("badge")
+        if badge == "success":
+            return {"status": "done", "output_exists": True}
+        if badge == "error":
+            return {"status": "error", "output_exists": bool(sql_row.get("file_manifest"))}
+
+    # mem_status == "idle" and no SQL row: fall back to Supabase Storage
+    # (handles pre-fix projects that have outputs in Storage but no SQL row yet).
     storage_done = _check_step_done_in_storage(user["id"], name, step_id)
     if storage_done:
         return {"status": "done", "output_exists": True}
@@ -1919,7 +2014,38 @@ async def ws_log(websocket: WebSocket, project: str, step_id: str, token: str = 
 
 @app.get("/projects/{name}/costs")
 def get_project_costs(name: str, user: dict = Depends(get_current_user)):
-    # Try Supabase Storage first
+    # PERSISTENCE_FIX_PLAN PR-2: SQL costs table first (one round-trip,
+    # restart-proof). Reconstructs the summary shape the frontend expects
+    # from total_costs.json. per_model is left empty because the SQL costs
+    # table doesn't track per-model granularity (the blob does).
+    sql_rows = _all_cost_rows(user["id"], name)
+    if sql_rows:
+        per_step: dict = {}
+        total_cost = 0.0
+        total_tokens = 0
+        for r in sql_rows:
+            sid = str(r.get("step_number"))
+            cost = float(r.get("cost_usd") or 0)
+            tk = int(r.get("tokens") or 0)
+            slot = per_step.setdefault(sid, {
+                "total_cost": 0.0, "call_count": 0,
+                "total_tokens": {"prompt": 0, "completion": 0},
+            })
+            slot["total_cost"] += cost
+            slot["call_count"] += 1
+            # SQL `costs.tokens` is a single int (prompt + completion combined);
+            # stash it on the completion slot so the sum shape matches the blob.
+            slot["total_tokens"]["completion"] += tk
+            total_cost += cost
+            total_tokens += tk
+        return {
+            "per_model": {},
+            "per_step": per_step,
+            "total_cost": total_cost,
+            "total_tokens": total_tokens,
+        }
+
+    # Fallback: Storage blob → local FS → in-memory tracker (existing path).
     storage_path = f"{user['id']}/{name}/total_costs.json"
     try:
         if file_exists(storage_path):
@@ -2088,6 +2214,31 @@ def get_step_output_files(name: str, step_id: str, user: dict = Depends(get_curr
                     "path": str(f).replace("\\", "/"),
                     "created_at": datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
                 })
+        if files:
+            return {"files": files}
+
+    # PERSISTENCE_FIX_PLAN PR-2: SQL-first manifest. After a container restart
+    # the local FS is empty. If a step_results row exists, its file_manifest
+    # lists every file with its size_bytes — no Storage recursive walk needed.
+    sql_row = _latest_step_result_row(user["id"], name, step_id)
+    if sql_row and sql_row.get("file_manifest"):
+        storage_prefix = sql_row.get("storage_prefix") or f"{user['id']}/{name}/{folder_name}"
+        created_at = (sql_row.get("created_at") or "")
+        # ISO timestamp "2026-08-05T14:28:31+00:00" → "2026-08-05 14:28"
+        try:
+            created_at = created_at[:16].replace("T", " ")
+        except Exception:
+            created_at = ""
+        files = [
+            {
+                "name": e.get("path", ""),
+                "size_bytes": e.get("size_bytes", 0),
+                "path": f"{storage_prefix}/{e.get('path', '')}",
+                "created_at": created_at,
+            }
+            for e in sql_row["file_manifest"]
+            if e.get("path")
+        ]
         if files:
             return {"files": files}
 

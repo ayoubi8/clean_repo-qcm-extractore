@@ -128,11 +128,11 @@ def list_projects(email: str) -> list:
             sb = get_supabase()
             db_uid = get_db_user_id({"id": email})
             res = (sb.table("projects")
-                     .select("name,created_at,last_activity_at,pdf_storage_path")
-                     .eq("user_id", db_uid)
-                     .order("last_activity_at", desc=True)
-                     .order("created_at", desc=True)
-                     .execute())
+                      .select("id,name,created_at,last_activity_at,pdf_storage_path")
+                      .eq("user_id", db_uid)
+                      .order("last_activity_at", desc=True)
+                      .order("created_at", desc=True)
+                      .execute())
             db_projects = res.data or []
             break
         except Exception as e:
@@ -145,10 +145,10 @@ def list_projects(email: str) -> list:
                     sb = get_supabase()
                     db_uid = get_db_user_id({"id": email})
                     res = (sb.table("projects")
-                             .select("name,created_at,pdf_storage_path")
-                             .eq("user_id", db_uid)
-                             .order("created_at", desc=True)
-                             .execute())
+                              .select("id,name,created_at,pdf_storage_path")
+                              .eq("user_id", db_uid)
+                              .order("created_at", desc=True)
+                              .execute())
                     db_projects = res.data or []
                     print("[list_projects] falling back to created_at (last_activity_at missing)")
                     break
@@ -158,6 +158,45 @@ def list_projects(email: str) -> list:
             elif attempt == 1:
                 db_projects = []
 
+    # PERSISTENCE_FIX_PLAN PR-2: batch SQL query for `last_step`.
+    # Single round-trip computes the highest user-visible step per project,
+    # so we skip the (8 steps × N projects) recursive Storage walks that
+    # make list_projects crawl for tens of seconds on a freshly restarted
+    # container. Steps 4 & 5 are intentionally excluded (UI-hidden — the
+    # user-visible progression jumps 3 → 6 directly).
+    last_step_by_pid: dict = {}
+    try:
+        pid_list = [r.get("id") for r in db_projects if r.get("id")]
+        if pid_list:
+            from supabase_client import get_supabase
+            sb = get_supabase()
+            sql_last: dict = {}
+            CHUNK = 200
+            for i in range(0, len(pid_list), CHUNK):
+                chunk = pid_list[i:i + CHUNK]
+                res = (sb.table("step_results")
+                         .select("project_id,step_number")
+                         .in_("project_id", chunk)
+                         .eq("badge", "success")
+                         .execute())
+                for row in (getattr(res, "data", None) or []):
+                    pid = row.get("project_id")
+                    sid = str(row.get("step_number"))
+                    if pid and sid:
+                        sql_last.setdefault(pid, set()).add(sid)
+            # Priority: highest user-visible step first, skip 4 & 5.
+            PRIORITY = [(8, "8"), (7, "7"), (6, "6"), (3, "3"), (2, "2"),
+                        (1.6, "1.6"), (1.5, "1.5"), (1, "1")]
+            for pid, sids in sql_last.items():
+                for snum, sid in PRIORITY:
+                    if sid in sids:
+                        last_step_by_pid[pid] = snum
+                        break
+                else:
+                    last_step_by_pid[pid] = 0
+    except Exception as e:
+        print(f"[list_projects] step_results batch query failed (will fall back to FS/Storage): {e}")
+
     # Process DB projects
     if db_projects:
         for row in db_projects:
@@ -165,36 +204,45 @@ def list_projects(email: str) -> list:
             seen.add(pname)
             pdf_path = row.get("pdf_storage_path", "")
             last_modified = row.get("last_activity_at") or row.get("created_at", "")
-            
-            # Check local FS first for last_step and tokens (fast path)
-            local_pdir = Path(f"/app/output/{email}/{pname}")
-            last_step = 0
-            total_tokens = 0
-            
-            STEP_ORDER = [
-                (8, "step8_matcher"), (7, "step7_categories"), (6, "step6_corrections"),
-                (5, "step5_json"), (4, "step4_format"), (3, "step3_metadata"), (2, "step2_qcm"),
-                (1.6, "step1_extraction"), (1.5, "step1_extraction"), (1, "step1_extraction"),
-            ]
-            
-            if local_pdir.exists():
-                for step_num, folder_name in STEP_ORDER:
-                    folder_path = local_pdir / folder_name
-                    if folder_path.exists() and any(folder_path.iterdir()):
-                        last_step = step_num
-                        break
+            pid = row.get("id")
 
-            # If not found locally, probe Storage
+            # PERSISTENCE_FIX_PLAN PR-2: prefer the batch SQL result for
+            # `last_step`. Skip the FS walk + Storage recursive fallback
+            # entirely when SQL already has a hit — that's the fast path
+            # that makes list_projects instant after a container restart.
+            last_step = last_step_by_pid.get(pid, 0)
+
+            local_pdir = Path(f"/app/output/{email}/{pname}")
+            total_tokens = 0
+
+            # Slow path: SQL had no row for this project (pre-fix project,
+            # or the step_results table isn't created yet) — fall back to
+            # the FS walk + recursive Storage probe (existing behaviour).
             if last_step == 0:
-                STEP_CHECK_ORDER = [
-                    (8, "8"), (7, "7"), (6, "6"), (5, "5"),
-                    (4, "4"), (3, "3"), (2, "2"), (1.6, "1.6"),
-                    (1.5, "1.5"), (1, "1"),
+                STEP_ORDER = [
+                    (8, "step8_matcher"), (7, "step7_categories"), (6, "step6_corrections"),
+                    (5, "step5_json"), (4, "step4_format"), (3, "step3_metadata"), (2, "step2_qcm"),
+                    (1.6, "step1_extraction"), (1.5, "step1_extraction"), (1, "step1_extraction"),
                 ]
-                for snum, sid in STEP_CHECK_ORDER:
-                    if step_output_exists(pname, sid, email):
-                        last_step = snum
-                        break
+
+                if local_pdir.exists():
+                    for step_num, folder_name in STEP_ORDER:
+                        folder_path = local_pdir / folder_name
+                        if folder_path.exists() and any(folder_path.iterdir()):
+                            last_step = step_num
+                            break
+
+                # If not found locally, probe Storage
+                if last_step == 0:
+                    STEP_CHECK_ORDER = [
+                        (8, "8"), (7, "7"), (6, "6"), (5, "5"),
+                        (4, "4"), (3, "3"), (2, "2"), (1.6, "1.6"),
+                        (1.5, "1.5"), (1, "1"),
+                    ]
+                    for snum, sid in STEP_CHECK_ORDER:
+                        if step_output_exists(pname, sid, email):
+                            last_step = snum
+                            break
 
             # Restore project.json locally so pipeline works
             if not local_pdir.exists() or not (local_pdir / "project.json").exists():
