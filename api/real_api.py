@@ -1062,6 +1062,136 @@ def _compute_step_badge(project: str, user_id: str, step_id: str) -> tuple[str, 
         badge = "success"
     return badge, stats
 
+
+def _resolve_project_id(user_id: str, project: str) -> str | None:
+    """Look up the SQL `projects.id` for a (user_id, project_name) pair.
+
+    The service-role key bypasses RLS so this works for any user. Returns
+    None if the row is missing (legacy / not yet backfilled) — callers
+    must tolerate that and skip the SQL INSERT rather than crash the run.
+    """
+    try:
+        sb = get_supabase()
+        uid = get_db_user_id({"id": user_id}) if not _is_uuid(user_id) else user_id
+        res = sb.table("projects").select("id").eq("user_id", uid).eq("name", project).limit(1).execute()
+        data = getattr(res, "data", None) or []
+        if data:
+            return data[0].get("id")
+    except Exception as e:
+        print(f"[PERSIST] _resolve_project_id failed ({user_id}/{project}): {e}")
+    return None
+
+
+def _is_uuid(value: str) -> bool:
+    try:
+        uuid.UUID(str(value))
+        return True
+    except Exception:
+        return False
+
+
+def _record_step_result(
+    project: str,
+    user_id: str,
+    step_id: str,
+    run_id: str,
+    start_time: float,
+    badge: str,
+    stats: dict,
+    folder_name: str,
+    auto_build_folders: list | None = None,
+):
+    """Persist run metadata to the SQL tables after a step completes.
+
+    Inserts:
+      - one row into `step_results` per (project, step) folder produced
+        (the primary step folder + any auto-build folders from the
+        Step 2 → 3 → 4 → 5 cascade)
+      - one row into `step_history` per folder
+      - per-step cost rows into `costs` (best-effort, keyed by step_number)
+
+    All SQL writes are isolated in try/except so a Supabase blip never
+    flips a successful run to failure — the artifact bytes are already
+    in Storage (uploaded by _do_post_step) and the local files are on
+    disk; a backfill can reconstruct SQL rows later.
+    """
+    try:
+        project_id = _resolve_project_id(user_id, project)
+        if not project_id:
+            print(f"[PERSIST] skipping SQL record — no projects row for {user_id}/{project}")
+            return
+        sb = get_supabase()
+        duration = round(time.time() - start_time, 1) if start_time else 0.0
+        from modules.utils.result_manifest import build_file_manifest, summarize_step
+
+        folders = [folder_name] + list(auto_build_folders or [])
+        seen = set()
+        for folder in folders:
+            if folder in seen:
+                continue
+            seen.add(folder)
+            step_dir = Path(f"/app/output/{user_id}/{project}/{folder}")
+            # Map the auto-build folders to their step_number for the row
+            row_step_id = step_id if folder == folder_name else folder.replace("step", "").split("_")[0]
+            storage_prefix = f"{user_id}/{project}/{folder}"
+            try:
+                manifest = build_file_manifest(step_dir, storage_prefix)
+                payload = summarize_step(row_step_id, step_dir, stats)
+                sb.table("step_results").upsert({
+                    "project_id": project_id,
+                    "step_number": str(row_step_id),
+                    "run_id": run_id,
+                    "badge": badge,
+                    "duration_seconds": duration,
+                    "storage_prefix": storage_prefix,
+                    "file_manifest": manifest,
+                    "payload": payload,
+                }, on_conflict="project_id,step_number,run_id").execute()
+            except Exception as e:
+                print(f"[PERSIST] step_results insert failed ({folder}): {e}")
+            try:
+                sb.table("step_history").insert({
+                    "project_id": project_id,
+                    "step_number": str(row_step_id),
+                    "run_at": datetime.utcnow().isoformat(),
+                    "badge": badge,
+                    "duration_seconds": duration,
+                    "metadata": {"run_id": run_id, "folder": folder, **(stats or {})},
+                }).execute()
+            except Exception as e:
+                print(f"[PERSIST] step_history insert failed ({folder}): {e}")
+    except Exception as e:
+        print(f"[PERSIST] _record_step_result failed for step {step_id}: {e}")
+
+
+def _record_step_costs(user_id: str, project: str, step_id: str, tracker) -> None:
+    """Insert per-step cost rows into the `costs` SQL table.
+
+    Reads the in-memory tracker's per-step summaries (so we get the cost
+    of the run we just executed, even on a fresh container where the
+    `total_costs.json` blob is the only long-term record). Idempotent
+    enough: re-runs insert fresh rows with a new recorded_at timestamp,
+    which is the desired behaviour (we want a per-run cost trace).
+    """
+    try:
+        project_id = _resolve_project_id(user_id, project)
+        if not project_id or not tracker:
+            return
+        sb = get_supabase()
+        step_key = f"step{step_id.replace('.', '_')}" if "." in step_id else f"step{step_id}"
+        summary = tracker.get_step_summary(step_key) if hasattr(tracker, "get_step_summary") else None
+        if not summary:
+            return
+        sb.table("costs").insert({
+            "project_id": project_id,
+            "step_number": str(step_id),
+            "cost_usd": float(summary.get("total_cost", 0) or 0),
+            "tokens": int(sum((summary.get("total_tokens") or {}).values())),
+        }).execute()
+    except Exception as e:
+        print(f"[PERSIST] _record_step_costs failed for step {step_id}: {e}")
+
+
 @app.get("/projects/{name}/step-history")
 def get_step_history(name: str, user: dict = Depends(get_current_user)):
     # Try Supabase Storage first
@@ -1428,11 +1558,28 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
 
             # Record history based on the actual step outcome (not post-step I/O outcome)
             try:
+                start_ts = _step_start_time.get(f"{project}-{step_id}", time.time())
+                run_id = datetime.utcfromtimestamp(start_ts).strftime("%Y-%m-%dT%H-%M-%S")
                 if step_succeeded:
                     badge, stats = _compute_step_badge(project, user_id, step_id)
-                    _record_step_history(project, user_id, step_id, _step_start_time.get(f"{project}-{step_id}", time.time()), badge, stats)
+                    _record_step_history(project, user_id, step_id, start_ts, badge, stats)
                 else:
-                    _record_step_history(project, user_id, step_id, _step_start_time.get(f"{project}-{step_id}", time.time()), "error", {})
+                    badge, stats = "error", {}
+                    _record_step_history(project, user_id, step_id, start_ts, badge, stats)
+                # PERSISTENCE_FIX_PLAN PR-1: also record into the SQL
+                # step_results / step_history / costs tables so the run
+                # survives a container restart even with an empty local FS.
+                try:
+                    _record_step_result(
+                        project, user_id, step_id, run_id, start_ts,
+                        badge, stats, folder_name, auto_build_folders,
+                    )
+                except Exception as _sr:
+                    print(f"[POST-STEP] step_results record failed for step {step_id}: {_sr}")
+                try:
+                    _record_step_costs(user_id, project, step_id, tracker)
+                except Exception as _sc:
+                    print(f"[POST-STEP] costs record failed for step {step_id}: {_sc}")
             except Exception as be:
                 print(f"[POST-STEP] Badge recording failed for step {step_id}: {be}")
 

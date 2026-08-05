@@ -24,6 +24,12 @@ CREATE TABLE IF NOT EXISTS projects (
     UNIQUE(user_id, name)
 );
 
+-- Activity tracking (S-2)
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMPTZ DEFAULT NOW();
+CREATE INDEX IF NOT EXISTS projects_user_activity_idx
+  ON projects (user_id, last_activity_at DESC);
+
+
 -- STEP_HISTORY table
 CREATE TABLE IF NOT EXISTS step_history (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -55,12 +61,36 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
 );
 
 
+-- STEP_RESULTS table (PERSISTENCE_FIX_PLAN PR-1)
+-- Artifact metadata for each step run. Binary bytes stay in Supabase Storage
+-- (storage_prefix points at {uid}/{project}/{folder}); this row stores the
+-- file manifest + small payload summary so list/status are a single SELECT
+-- and survive container restarts even when local FS is wiped.
+CREATE TABLE IF NOT EXISTS step_results (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id      UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    step_number     TEXT NOT NULL,
+    run_id          TEXT NOT NULL,
+    badge           TEXT DEFAULT 'success',
+    duration_seconds FLOAT DEFAULT 0,
+    storage_prefix  TEXT NOT NULL,
+    file_manifest   JSONB DEFAULT '[]',
+    payload         JSONB DEFAULT '{}',
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (project_id, step_number, run_id)
+);
+
+CREATE INDEX IF NOT EXISTS step_results_proj_step_idx
+    ON step_results (project_id, step_number, created_at DESC);
+
+
 -- Row Level Security
 ALTER TABLE users ENABLE ROW LEVEL SECURITY;
 ALTER TABLE projects ENABLE ROW LEVEL SECURITY;
 ALTER TABLE step_history ENABLE ROW LEVEL SECURITY;
 ALTER TABLE costs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE refresh_tokens ENABLE ROW LEVEL SECURITY;
+ALTER TABLE step_results ENABLE ROW LEVEL SECURITY;
 
 -- Note: Frontend never touches Supabase directly, all access goes through FastAPI 
 -- which uses the service role key (bypasses RLS). 
