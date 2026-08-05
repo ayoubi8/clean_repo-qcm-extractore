@@ -120,15 +120,24 @@ def _test_resolve_project_id_hits_supabase():
     print("\n--- Test 6: _resolve_project_id queries projects table ---")
     real_api = _import_real_api()
     uid = str(uuid.uuid4())
-    fake_sb = MagicMock()
-    # Build the chain so execute().data is a real list with one row
+    # PR-4 routed _resolve_project_id through project_manager.lookup_project_id,
+    # which imports supabase_client.get_supabase at call-time — so we must patch
+    # it at the source module (not real_api.get_supabase, which is bypassed).
+    import project_manager
+    import supabase_client
     fake_chain = MagicMock()
-    fake_chain.limit.return_value.execute.return_value = MagicMock(data=[{"id": "proj-uuid-1"}])
+    fake_chain.limit.return_value.execute.return_value = MagicMock(data=[{"id": "proj-uuid-1", "user_id": uid, "name": "myproj"}])
     fake_chain.eq.return_value = fake_chain  # second .eq returns same chain
+    fake_sb = MagicMock()
     fake_sb.table.return_value.select.return_value = fake_chain
-    real_api.get_supabase = lambda: fake_sb
+    orig_get_sb = supabase_client.get_supabase
+    supabase_client.get_supabase = lambda: fake_sb
+    project_manager.PROJECT_REGISTRY.clear()  # force cache miss → SQL fill
     real_api.get_db_user_id = MagicMock()
-    pid = real_api._resolve_project_id(uid, "myproj")
+    try:
+        pid = real_api._resolve_project_id(uid, "myproj")
+    finally:
+        supabase_client.get_supabase = orig_get_sb
     assert pid == "proj-uuid-1", pid
     print(f"✅ resolved project_id={pid}")
 

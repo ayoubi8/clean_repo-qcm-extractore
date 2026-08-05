@@ -269,6 +269,19 @@ def _backfill_projects_to_db():
 async def startup_event():
     _migrate_legacy_projects()
     _backfill_projects_to_db()
+    # PERSISTENCE_FIX_PLAN PR-4: prefetch the projects table into an
+    # in-memory registry so the first /projects call after a restart is a
+    # dict hit. One SELECT, no per-project round-trips.
+    _eager_rebuild_registry()
+    # PERSISTENCE_FIX_PLAN PR-4: backfill synthetic step_results rows for
+    # pre-fix projects whose outputs already live in Storage but who never
+    # re-ran since PR-1 was deployed. Idempotent — re-runs no-op.
+    try:
+        inserted = _backfill_step_results_from_storage()
+        if inserted:
+            print(f"[STARTUP] ✅ backfilled {inserted} synthetic step_results row(s) from Storage")
+    except Exception as e:
+        print(f"[STARTUP] ⚠️ step_results backfill failed: {e}")
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -1080,20 +1093,19 @@ def _compute_step_badge(project: str, user_id: str, step_id: str) -> tuple[str, 
 def _resolve_project_id(user_id: str, project: str) -> str | None:
     """Look up the SQL `projects.id` for a (user_id, project_name) pair.
 
-    The service-role key bypasses RLS so this works for any user. Returns
-    None if the row is missing (legacy / not yet backfilled) — callers
-    must tolerate that and skip the SQL INSERT rather than crash the run.
+    PERSISTENCE_FIX_PLAN PR-4: goes through the in-memory PROJECT_REGISTRY
+    (populated eagerly on startup by rebuild_project_registry_from_db) so
+    the common case is a dict hit with no round-trip. On miss falls back
+    to lookup_project_id which does a single SELECT and populates the cache.
+    Returns None if the row is missing (legacy / not yet backfilled).
     """
     try:
-        sb = get_supabase()
+        from project_manager import lookup_project_id
         uid = get_db_user_id({"id": user_id}) if not _is_uuid(user_id) else user_id
-        res = sb.table("projects").select("id").eq("user_id", uid).eq("name", project).limit(1).execute()
-        data = getattr(res, "data", None) or []
-        if data:
-            return data[0].get("id")
+        return lookup_project_id(uid, project)
     except Exception as e:
         print(f"[PERSIST] _resolve_project_id failed ({user_id}/{project}): {e}")
-    return None
+        return None
 
 
 def _is_uuid(value: str) -> bool:
@@ -1272,6 +1284,140 @@ def _all_cost_rows(user_id: str, project: str) -> list:
 
 
 # --- PERSISTENCE_FIX_PLAN PR-3: byte-serving from Storage --------------
+
+def _eager_rebuild_registry():
+    """PR-4: prefetch every projects.id into the in-memory PROJECT_REGISTRY.
+
+    Called from the startup hook so the very first /projects call after a
+    container restart is a dict hit instead of a SQL round-trip per project.
+    """
+    try:
+        from project_manager import rebuild_project_registry_from_db
+        rebuild_project_registry_from_db()
+    except Exception as e:
+        print(f"[STARTUP] ⚠️ eager registry rebuild failed (will lazy-resolve): {e}")
+
+
+# Step-folder name → step_number, mirroring STEP_FOLDER_MAP in reverse.
+# Used by the backfill to label synthetic rows. We deliberately exclude
+# step4/5 because they're UI-hidden auto-builds; if both folders exist
+# we still emit a "3" row (their effective trigger) so list_projects
+# surfaces that the project reached Step 3.
+_BACKFILL_STEP_FOLDERS = [
+    ("step8_matches",    "8"),
+    ("step7_categories", "7"),
+    ("step6_corrections", "6"),
+    ("step5_json",        "5"),
+    ("step4_format",      "4"),
+    ("step3_metadata",    "3"),
+    ("step2_qcm",         "2"),
+    ("step1_extraction",  "1"),
+]
+
+
+def _backfill_step_results_from_storage() -> int:
+    """PR-4: one-off synthetic row backfill for pre-fix projects.
+
+    Walks every projects row, and for each step-folder visible in Supabase
+    Storage under {user_id}/{project}/{folder}, inserts a `step_results`
+    row with `run_id='backfill'` IF (a) the project has no step_results row
+    for that step yet (skip projects that already wrote rows on a real run)
+    and (b) the step_results table exists. The walk is a single flat
+    list_files per folder (the artifacts themselves are already in Storage
+    from the existing _upload_step_folder_to_storage on every prior run).
+
+    Returns the number of rows inserted. Idempotent: re-running the
+    startup just no-ops for (project, step) pairs that already have a
+    backfill row (UNIQUE constraint project_id,step_number,run_id).
+    """
+    from project_manager import PROJECT_REGISTRY, lookup_project_id
+    from modules.utils.result_manifest import build_file_manifest  # noqa: F401 (kept for symmetry; the backfill uses Storage listing, not local FS)
+    inserted = 0
+    try:
+        sb = get_supabase()
+        # Probe the table once — skip silently if missing (PR-1 migration not run yet).
+        try:
+            sb.table("step_results").select("id").limit(1).execute()
+        except Exception as e:
+            print(f"[BACKFILL-SR] step_results table missing — skipping backfill: {e}")
+            return 0
+
+        # Iterate the registry built eagerly by rebuild_project_registry_from_db.
+        # When the eager rebuild failed (Supabase blip), PROJECT_REGISTRY is
+        # empty and we skip quietly rather than re-walking Storage.
+        if not PROJECT_REGISTRY:
+            print("[BACKFILL-SR] PROJECT_REGISTRY empty — nothing to backfill")
+            return 0
+
+        # First, load which (project_id, step_number) rows already exist so
+        # we don't upsert over rows a real run wrote (preserves run_id != backfill).
+        existing: set = set()
+        try:
+            # Batched fetch of all rows (modest table). Add a `run_id` filter
+            # so we only see backfill candidates or real-run rows; either way
+            # we skip emitting a fresh backfill row when one already exists
+            # for that (project_id, step_number).
+            res = sb.table("step_results").select("project_id,step_number").execute()
+            for r in (getattr(res, "data", None) or []):
+                existing.add((r.get("project_id"), str(r.get("step_number"))))
+        except Exception as e:
+            print(f"[BACKFILL-SR] could not load existing rows (will still attempt): {e}")
+
+        # For each project, probe each step folder in Storage.
+        for key, meta in PROJECT_REGISTRY.items():
+            storage_id = meta.get("user_id")
+            pname = meta.get("name")
+            pid = meta.get("project_id")
+            if not (storage_id and pname and pid):
+                continue
+            for folder, sid in _BACKFILL_STEP_FOLDERS:
+                if (pid, sid) in existing:
+                    continue
+                prefix = f"{storage_id}/{pname}/{folder}"
+                try:
+                    items = list_files(prefix)
+                    # Filter to actual files (Storage returns folder placeholders
+                    # with id=None; real files have an id).
+                    real_files = [it for it in items if it.get("id")]
+                    if not real_files:
+                        continue
+                except Exception as e:
+                    # Quiet — most prefixes simply don't exist for steps the
+                    # project hasn't reached yet.
+                    continue
+                # Build a minimal manifest from the Storage listing. We don't
+                # download the bytes (the real download is on demand via PR-3).
+                manifest = [
+                    {
+                        "path": it.get("name", ""),
+                        "size_bytes": int((it.get("metadata") or {}).get("size", 0) or 0),
+                        "sha256": "",  # unknown without downloading; left blank
+                        "kind": "json" if it.get("name", "").endswith(".json") else "other",
+                    }
+                    for it in real_files
+                    if it.get("name")
+                ]
+                try:
+                    sb.table("step_results").upsert({
+                        "project_id": pid,
+                        "step_number": sid,
+                        "run_id": "backfill",
+                        "badge": "success",
+                        "duration_seconds": 0,
+                        "storage_prefix": prefix,
+                        "file_manifest": manifest,
+                        "payload": {"file_count": len(manifest), "backfill": True},
+                    }, on_conflict="project_id,step_number,run_id").execute()
+                    inserted += 1
+                    existing.add((pid, sid))
+                except Exception as e:
+                    print(f"[BACKFILL-SR] upsert failed for {pname}/{sid}: {e}")
+        print(f"[BACKFILL-SR] inserted {inserted} synthetic step_results row(s)")
+        return inserted
+    except Exception as e:
+        print(f"[BACKFILL-SR] aborted: {e}")
+        return inserted
+
 
 def _stream_file_from_storage(storage_path: str, local_dest: Path) -> bytes | None:
     """Pull `storage_path` from Supabase Storage and cache it at `local_dest`.

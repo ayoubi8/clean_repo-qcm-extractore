@@ -38,6 +38,81 @@ from auth import get_db_user_id
 # In-memory registry: project_name → {"context": ..., "tracker": ...}
 _registry = {}
 
+# PERSISTENCE_FIX_PLAN PR-4: in-memory cache of (user_id, project_name) →
+# the SQL `projects.id` for the row. Populated eagerly from SQL on startup
+# so the very first `get_or_create` / `_resolve_project_id` / `list_projects`
+# after a container restart resolves the project_id without a round-trip.
+# Project names are unique per (user_id, name) so the key is f"{uid}/{name}".
+PROJECT_REGISTRY: dict = {}
+
+
+def rebuild_project_registry_from_db() -> int:
+    """PR-4: eager startup prefetch of every projects.id into PROJECT_REGISTRY.
+
+    One SELECT across all users. Returns the number of rows cached. Caller
+    wraps in try/except so a Supabase blip never breaks the startup.
+    Subsequent get_or_create() calls fall back to a single SELECT when the
+    cache misses (legacy project not in SQL yet).
+    """
+    try:
+        from supabase_client import get_supabase
+        sb = get_supabase()
+        # Drop the previous cache (container restart → fresh state).
+        PROJECT_REGISTRY.clear()
+        # We pull one row per project across all users. The service-role key
+        # bypasses RLS. Keep the row small: just the ids + names.
+        res = (sb.table("projects")
+                 .select("id,user_id,name")
+                 .execute())
+        rows = getattr(res, "data", None) or []
+        for r in rows:
+            uid = r.get("user_id")
+            name = r.get("name")
+            pid = r.get("id")
+            if uid and name and pid:
+                PROJECT_REGISTRY[f"{uid}/{name}"] = {"project_id": pid, "user_id": uid, "name": name}
+        print(f"[STARTUP] ✅ PROJECT_REGISTRY cached {len(PROJECT_REGISTRY)} project(s) from SQL")
+        return len(PROJECT_REGISTRY)
+    except Exception as e:
+        print(f"[STARTUP] ⚠️ PROJECT_REGISTRY rebuild failed (will fall back to lazy SELECT): {e}")
+        return 0
+
+
+def lookup_project_id(user_id: str, project_name: str) -> str | None:
+    """PR-4: fast in-memory lookup of projects.id.
+
+    Mirrors the SQL _resolve_project_id helper in real_api.py but goes
+    through the eager cache first; on miss does a single SELECT and
+    populates the cache so subsequent calls are free.
+    """
+    key = f"{user_id}/{project_name}"
+    cached = PROJECT_REGISTRY.get(key)
+    if cached:
+        return cached.get("project_id")
+    # Cache miss → single SELECT to populate the row.
+    try:
+        from supabase_client import get_supabase
+        sb = get_supabase()
+        res = (sb.table("projects")
+                 .select("id,user_id,name")
+                 .eq("user_id", user_id)
+                 .eq("name", project_name)
+                 .limit(1)
+                 .execute())
+        data = getattr(res, "data", None) or []
+        if data:
+            row = data[0]
+            PROJECT_REGISTRY[key] = {
+                "project_id": row.get("id"),
+                "user_id": row.get("user_id"),
+                "name": row.get("name"),
+            }
+            return row.get("id")
+    except Exception as e:
+        print(f"[PR4] lookup_project_id failed for {key}: {e}")
+    return None
+
+
 def get_or_create(project_name: str, email: str) -> dict:
     registry_key = f"{email}/{project_name}"
     if registry_key not in _registry:
