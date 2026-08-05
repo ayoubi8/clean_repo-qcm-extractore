@@ -1271,6 +1271,35 @@ def _all_cost_rows(user_id: str, project: str) -> list:
         return []
 
 
+# --- PERSISTENCE_FIX_PLAN PR-3: byte-serving from Storage --------------
+
+def _stream_file_from_storage(storage_path: str, local_dest: Path) -> bytes | None:
+    """Pull `storage_path` from Supabase Storage and cache it at `local_dest`.
+
+    Returns the raw bytes on success (caller can serve them directly) or
+    None if the object doesn't exist / download failed. The local file is
+    written *best-effort* — if the cache write fails (e.g. read-only FS on
+    a fresh container path), we still return the bytes; the next read just
+    has to fetch from Storage again.
+
+    `local_dest.parents` are created if missing so this works on a wiped
+    /app/output tree after a container restart.
+    """
+    try:
+        data = read_bytes_file(storage_path)
+    except Exception as e:
+        print(f"[PR3] Storage download failed for {storage_path}: {e}")
+        return None
+    if data is None:
+        return None
+    try:
+        local_dest.parent.mkdir(parents=True, exist_ok=True)
+        local_dest.write_bytes(data)
+    except Exception as we:
+        print(f"[PR3] local cache write skipped for {local_dest}: {we}")
+    return data
+
+
 @app.get("/projects/{name}/step-history")
 def get_step_history(name: str, user: dict = Depends(get_current_user)):
     # PERSISTENCE_FIX_PLAN PR-2: SQL step_history table first (one round-trip,
@@ -2268,7 +2297,10 @@ def get_step_file_content(name: str, step_id: str, filename: str, user: dict = D
 
     ext = Path(filename).suffix.lower()
 
-    # Try local first
+    # PERSISTENCE_FIX_PLAN PR-3: local FS fast-path (active session).
+    # On a wiped /app/output tree (post-restart) the FS misses → we stream
+    # from Storage via _stream_file_from_storage which ALSO caches the
+    # bytes locally so the next read is a hit.
     if file_path.exists() and file_path.is_file():
         if not str(file_path).startswith(f"/app/output/{user['id']}/{name}"):
             raise HTTPException(status_code=403, detail="Access denied")
@@ -2276,20 +2308,29 @@ def get_step_file_content(name: str, step_id: str, filename: str, user: dict = D
             return {"content": file_path.read_text(encoding="utf-8")}
         return {"binary": True, "size": file_path.stat().st_size}
 
-    # Fallback: read from Supabase Storage
+    # Fallback: read from Supabase Storage (and cache locally).
     storage_path = f"{user['id']}/{name}/{folder_name}/{filename}"
-    try:
-        if ext in (".txt", ".json", ".yaml", ".yml", ".md"):
-            return {"content": read_file(storage_path)}
-        data = read_bytes_file(storage_path)
-        return {"binary": True, "size": len(data)}
-    except Exception:
+    data = _stream_file_from_storage(storage_path, file_path)
+    if data is None:
         raise HTTPException(status_code=404, detail="File not found")
+    if ext in (".txt", ".json", ".yaml", ".yml", ".md"):
+        try:
+            return {"content": data.decode("utf-8")}
+        except UnicodeDecodeError:
+            # Binary file with a text extension — surface it as binary.
+            return {"binary": True, "size": len(data)}
+    return {"binary": True, "size": len(data)}
 
 
 @app.get("/projects/{name}/steps/{step_id}/view/{filename:path}")
 def view_step_file(name: str, step_id: str, filename: str, user: dict = Depends(get_current_user)):
-    """Serve a file for inline viewing — local FS first, then Supabase signed URL."""
+    """Serve a file for inline viewing — local FS first, then Supabase signed URL.
+
+    PERSISTENCE_FIX_PLAN PR-3: on a wiped /app/output (container restart) this
+    used to silently 404 if get_signed_url raised. Now it best-effort warms
+    the local cache from Storage before issuing the redirect, so the next
+    caller hits the FS directly.
+    """
     _SFMAP = {
         "1": "step1_extraction", "1.5": "step1_extraction", "1.6": "step1_extraction",
         "2": "step2_qcm", "3": "step3_metadata", "4": "step4_format",
@@ -2300,11 +2341,20 @@ def view_step_file(name: str, step_id: str, filename: str, user: dict = Depends(
     if file_path.exists() and file_path.is_file():
         mime_type, _ = mimetypes.guess_type(str(file_path))
         return FileResponse(path=str(file_path), media_type=mime_type or "text/plain")
-    # Fallback: Supabase signed URL
+    # Storage path; warm the cache best-effort then redirect to the signed URL.
+    storage_path = f"{user['id']}/{name}/{folder_name}/{filename}"
     try:
-        url = get_signed_url(f"{user['id']}/{name}/{folder_name}/{filename}")
+        _stream_file_from_storage(storage_path, file_path)
+    except Exception:
+        pass  # cache warm is best-effort; redirect below will still work
+    try:
+        url = get_signed_url(storage_path)
         return RedirectResponse(url)
     except Exception:
+        # Last resort: if we warmed the cache during this call, serve from there.
+        if file_path.exists() and file_path.is_file():
+            mime_type, _ = mimetypes.guess_type(str(file_path))
+            return FileResponse(path=str(file_path), media_type=mime_type or "text/plain")
         raise HTTPException(status_code=404, detail="File not found")
 
 @app.get("/projects/{name}/steps/{step_id}/download/{filename:path}")
@@ -2321,11 +2371,21 @@ def download_step_file(name: str, step_id: str, filename: str, user: dict = Depe
         return FileResponse(path=str(file_path), media_type=mime_type or "application/octet-stream",
                             filename=file_path.name,
                             headers={"Content-Disposition": f'attachment; filename="{file_path.name}"'})
-    # Fallback: Supabase signed URL
+    # Storage path; warm the cache best-effort then redirect to the signed URL.
+    storage_path = f"{user['id']}/{name}/{folder_name}/{filename}"
     try:
-        url = get_signed_url(f"{user['id']}/{name}/{folder_name}/{filename}")
+        _stream_file_from_storage(storage_path, file_path)
+    except Exception:
+        pass
+    try:
+        url = get_signed_url(storage_path)
         return RedirectResponse(url)
     except Exception:
+        if file_path.exists() and file_path.is_file():
+            mime_type, _ = mimetypes.guess_type(str(file_path))
+            return FileResponse(path=str(file_path), media_type=mime_type or "application/octet-stream",
+                                filename=file_path.name,
+                                headers={"Content-Disposition": f'attachment; filename="{file_path.name}"'})
         raise HTTPException(status_code=404, detail="File not found")
 
 @app.get("/projects/{name}/steps/{step_id}/history")
@@ -2398,7 +2458,11 @@ def get_step_output_history(name: str, step_id: str, user: dict = Depends(get_cu
 
 @app.get("/projects/{name}/steps/{step_id}/history/{run_id}/{filename:path}")
 def get_history_file(name: str, step_id: str, run_id: str, filename: str, user: dict = Depends(get_current_user)):
-    """Serve a history file — local FS first, then Supabase signed URL."""
+    """Serve a history file — local FS first, then Supabase signed URL.
+
+    PERSISTENCE_FIX_PLAN PR-3: warms the local cache from Storage on a miss
+    so subsequent reads of the same history file are local.
+    """
     _SFMAP = {
         "1": "step1_extraction", "1.5": "step1_extraction", "1.6": "step1_extraction",
         "2": "step2_qcm", "3": "step3_metadata", "4": "step4_format",
@@ -2414,10 +2478,18 @@ def get_history_file(name: str, step_id: str, run_id: str, filename: str, user: 
     if local_path.exists():
         mime_type, _ = mimetypes.guess_type(str(local_path))
         return FileResponse(str(local_path), media_type=mime_type or "application/octet-stream")
+    # Warm cache best-effort before redirecting to the signed URL.
+    try:
+        _stream_file_from_storage(storage_path, local_path)
+    except Exception:
+        pass
     try:
         url = get_signed_url(storage_path)
         return RedirectResponse(url)
     except Exception:
+        if local_path.exists():
+            mime_type, _ = mimetypes.guess_type(str(local_path))
+            return FileResponse(str(local_path), media_type=mime_type or "application/octet-stream")
         raise HTTPException(status_code=404, detail="File not found")
 
 @app.post("/projects/{name}/steps/{step_id}/open-sheets")
@@ -2536,34 +2608,74 @@ async def step8_merge_outputs(name: str, user: dict = Depends(get_current_user))
 
     If Step 8 has not produced any merge outputs yet, returns an empty
     manifest with HTTP 200 (the frontend treats this as "not yet run").
+
+    PERSISTENCE_FIX_PLAN PR-3: when the local FS is wiped after a container
+    restart, falls back to (a) the step_results row's file_manifest to surface
+    the artifact filenames and (b) reading step8_summary.json from Supabase
+    Storage. The per-file download URLs still resolve via the generic
+    /download route, which itself now streams from Storage.
     """
     _apply_user_env(user)
     ctx_data = get_or_create(name, user["id"])
     context = ctx_data["context"]
     out_dir = context.base_path / "step8_matches"
+    storage_prefix = f"{user['id']}/{name}/step8_matches"
 
     def _info(filename: str):
         p = out_dir / filename
-        if not p.exists():
-            return None
+        if p.exists():
+            try:
+                size = p.stat().st_size
+            except OSError:
+                size = 0
+            return {"filename": filename, "size_bytes": size,
+                    "url": f"/projects/{name}/steps/8/download/{filename}"}
+        # PERSIST PR-3: look the file up in the SQL manifest or Storage.
+        sql_row = _latest_step_result_row(user["id"], name, "8")
+        if sql_row:
+            for e in (sql_row.get("file_manifest") or []):
+                if e.get("path") == filename:
+                    return {"filename": filename, "size_bytes": int(e.get("size_bytes") or 0),
+                            "url": f"/projects/{name}/steps/8/download/{filename}"}
+        # Last resort: probe Storage directly.
         try:
-            size = p.stat().st_size
-        except OSError:
-            size = 0
-        return {"filename": filename, "size_bytes": size,
-                "url": f"/projects/{name}/steps/8/download/{filename}"}
+            if file_exists(f"{storage_prefix}/{filename}"):
+                return {"filename": filename, "size_bytes": 0,
+                        "url": f"/projects/{name}/steps/8/download/{filename}"}
+        except Exception:
+            pass
+        return None
 
     manifest: dict = {"files": {}}
 
-    # Always try the summary — it tells the UI whether a merge happened.
+    # Always try the summary - it tells the UI whether a merge happened.
     summary_path = out_dir / "step8_summary.json"
     summary_info = _info("step8_summary.json")
+    summary = None
     if summary_info:
         manifest["files"]["summary"] = summary_info
         try:
-            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            if summary_path.exists():
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            else:
+                # Pull from Storage and decode (don't cache large summary locally;
+                # it's tiny so decoding in-memory is fine).
+                summary_text = read_file(f"{storage_prefix}/step8_summary.json")
+                summary = json.loads(summary_text)
+        except Exception as e:
+            print(f"[STEP8-MANIFEST] Could not parse summary: {e}")
+        if summary is None:
+            # Last-ditch fallback: the step_results.payload JSONB stores the
+            # same fields when the folder was empty.
+            try:
+                sql_row = _latest_step_result_row(user["id"], name, "8")
+                if sql_row and sql_row.get("payload"):
+                    summary = sql_row["payload"]
+            except Exception:
+                pass
+        if summary is not None:
             manifest["summary"] = summary
-            merge_block = summary.get("merge", {})
+            merge_block = summary.get("merge", {}) if isinstance(summary, dict) else {}
             if merge_block:
                 # Find the ref_UPDATED filename from the merge block (ref_db_name-based)
                 ref_updated_name = merge_block.get("ref_updated_filename")
@@ -2578,8 +2690,6 @@ async def step8_merge_outputs(name: str, user: dict = Depends(get_current_user))
                 if unmerged_name:
                     info = _info(unmerged_name)
                     if info: manifest["files"]["unmerged"] = info
-        except Exception as e:
-            print(f"[STEP8-MANIFEST] Could not parse summary: {e}")
 
     return manifest
 
