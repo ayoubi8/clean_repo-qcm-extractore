@@ -89,6 +89,20 @@ async def _startup():
     else:
         print(f"[STARTUP] ❌ Google client secret file MISSING at {GOOGLE_CLIENT_SECRET_PATH}")
 
+    # PERSISTENCE_FIX_PLAN PR-1: probe for the step_results table so the
+    # operator gets one clear log line telling them to run the new
+    # migration. Writes are wrapped in try/except anyway, so a missing
+    # table degrades gracefully — this probe just makes the gap visible.
+    try:
+        sb = get_supabase()
+        try:
+            sb.table("step_results").select("id").limit(1).execute()
+            print("[STARTUP] ✅ step_results table present — run metadata will persist to SQL")
+        except Exception as _e:
+            print(f"[STARTUP] ⚠️ step_results table missing — run the new CREATE TABLE block in api/migration.sql via the Supabase SQL editor. Run metadata will stay in Storage/JSON until then. (probe error: {_e})")
+    except Exception as _e2:
+        print(f"[STARTUP] ⚠️ Supabase unreachable for step_results probe: {_e2}")
+
 
 def _migrate_legacy_projects():
     """Move folders from /app/output/ to /app/output/admin_email/ if they aren't isolated yet."""
