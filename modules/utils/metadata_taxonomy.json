@@ -1,0 +1,23 @@
+{
+  "system_instruction": "Extract 'module', 'level', and 'source' metadata from Algerian medical exam PDFs.",
+  "valid_faculties": [
+    "Alger", "Oran", "Constantine", "Annaba", "S\u00e9tif", "Tlemcen",
+    "Sidi Bel Abb\u00e8s", "Blida", "Tizi Ouzou", "B\u00e9ja\u00efa", "Batna",
+    "Mostaganem", "Laghouat", "Ouargla", "B\u00e9char"
+  ],
+  "valid_modules": {
+    "1\u00e8re ann\u00e9e (Lvl 1)": ["Anatomie", "Biochimie", "Biostatistique", "Chimie", "Biophysiques", "Cytologie", "Embryologie", "Histologie", "Physiologie g\u00e9n\u00e9rale", "SSH"],
+    "2\u00e8me ann\u00e9e (Lvl 2)": ["G\u00e9n\u00e9tique", "Immunologie", "Appareil Digestif", "Endocrinologie", "Syst\u00e8me Nerveux et Organes des Sens", "Appareil Urinaire", "Appareil Cardio-Respiratoire"],
+    "3\u00e8me ann\u00e9e (Lvl 3)": ["Immunologie 3\u00e8me", "Anatomie Pathologique", "Microbiologie", "Parasitologie-Mycologie", "Pharmacologie", "Appareil Digestif et H\u00e9matologie", "Appareil Endocrinien de Reproduction et Urinaire", "Appareil Cardiovasculaire et Respiratoire", "Appareil Neurologique Locomoteur et Cutan\u00e9"],
+    "4\u00e8me ann\u00e9e (Lvl 4)": ["Cardiologie", "H\u00e9matologie et Oncologie", "Gastro-ent\u00e9rologie", "Infectiologie", "Neurologie", "Pneumologie"],
+    "5\u00e8me ann\u00e9e (Lvl 5)": ["Endocrinologie", "Gyn\u00e9cologie-Obst\u00e9trique", "Urologie N\u00e9phrologie", "OTR et MPR", "Psychiatrie", "P\u00e9diatrie"],
+    "6\u00e8me ann\u00e9e (Lvl 6)": ["Dermatologie", "\u00c9pid\u00e9miologie", "G\u00e9riatrie", "Maladies de Syst\u00e8me", "M\u00e9decine du Travail", "M\u00e9decine L\u00e9gale", "Ophtalmologie", "ORL", "UMC"]
+  },
+  "rules": [
+    "Year: '2025/2026' -> '2025', '2024/2025' -> '2024'. Always use the START year of the pair.",
+    "Faculty: must match one of valid_faculties exactly (case-insensitive, accent-tolerant).",
+    "If a module matches valid_modules -> source = 'Externat {Faculty}'.",
+    "If no module matches, OR the document indicates a residency exam (Residanat), -> module = null and source = 'Residanat {Faculty}'.",
+    "Level: infer from the matched module's level label (e.g. Cardiologie -> '4eme annee (Lvl 4)'). null if unknown."
+  ]
+}

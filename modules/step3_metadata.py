@@ -852,17 +852,37 @@ PAGE TEXT:
         print("═" * 60)
 
     def _extract_metadata_with_ai(self, text: str, fields: List[str], context_desc: str) -> Dict:
-        """Generic AI extraction for standard metadata fields."""
+        """Generic AI extraction for standard metadata fields.
+
+        Taxonomy-enriched: the Algerian medical exam taxonomy (faculties +
+        modules-by-level + rules) is injected into the prompt, and the LLM's
+        free-text answer is validated/canonicalized by the Python helpers in
+        modules.utils.metadata_context. The LLM is the recommender; Python is
+        the validator — hallucinations outside the closed list are rejected to None.
+        """
+        from modules.utils.metadata_context import (
+            build_context_block, normalize_module, normalize_year,
+            normalize_faculty, find_faculty_in_text, derive_source,
+        )
+
         field_list = ", ".join(fields)
+        taxonomy_block = build_context_block()
         prompt = f"""TASK: Extract specific metadata: {field_list}
 CONTEXT: {context_desc}
+
+{taxonomy_block}
+
 INPUT TEXT:
 {text}
 
 INSTRUCTIONS:
-- Return ONLY JSON.
-- Keys: {field_list}
-- If not found, use null.
+- Return ONLY JSON. Keys: {field_list}, "faculty"
+- "Category": the canonical module name from VALID MODULES BY LEVEL (exactly as written). null if unknown.
+- "Year": the START year of any "YYYY/YYYY" pair (e.g. "2025/2026" -> "2025"). Plain 4-digit year stays as-is.
+- "Source": derive per RULES — "Externat {{faculty}}" if Category matched, else "Residanat {{faculty}}". null if faculty unknown.
+- "Subcategory": specific topic if present, else null.
+- "faculty": the matched faculty from VALID FACULTIES (intermediate field, used to derive Source).
+If a field is not found or ambiguous, use null.
 """
         primary_model = os.getenv("STEP3_MODEL", "qwen/qwen3.6-plus-preview:free")
         fallback_model = os.getenv("STEP3_FALLBACK_MODEL", "google/gemini-2.0-flash-lite-001")
@@ -889,6 +909,24 @@ INSTRUCTIONS:
                     data = json.loads(json_str)
                     cost = resp.get('cost', 0.0) or self.client.estimate_cost(model_used, resp["usage"])
                     self.cost_tracker.log_api_call("step3_meta", model_used, resp["usage"], cost)
+
+                    # Post-process: validate / canonicalize against the taxonomy.
+                    # Accept both capitalized (LLM-returned-per-prompt) and lowercase keys.
+                    raw_cat = data.get("Category") or data.get("category")
+                    data["Category"] = normalize_module(raw_cat) if raw_cat else None
+
+                    raw_yr = data.get("Year") or data.get("year")
+                    data["Year"] = normalize_year(raw_yr) if raw_yr else None
+
+                    # Faculty: prefer the LLM's answer; fall back to a text scan.
+                    raw_fac = data.get("faculty") or find_faculty_in_text(text)
+                    faculty = normalize_faculty(raw_fac) if raw_fac else None
+                    data["Source"] = derive_source(data.get("Category"), faculty)
+
+                    # Subcategory passthrough — keep as-is (free-text topic).
+                    # Drop the intermediate "faculty" key so it doesn't leak as a QCM field.
+                    data.pop("faculty", None)
+
                     return data
                 except json.JSONDecodeError:
                     print(f"⚠️ Metadata JSON decode failed. Raw: {json_str[:50]}...")

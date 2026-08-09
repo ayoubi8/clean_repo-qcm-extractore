@@ -3,6 +3,10 @@ import os
 import re
 from typing import Dict, List, Optional
 from modules.openrouter_client import OpenRouterClient
+from modules.utils.metadata_context import (
+    build_context_block, normalize_module, normalize_year,
+    normalize_faculty, find_faculty_in_text, derive_source,
+)
 
 class AIMetadataDetector:
     """AI-powered metadata detection with confidence scoring."""
@@ -28,27 +32,32 @@ class AIMetadataDetector:
         """
         # Normalize fields to lowercase for internal processing but keep display names
         prompt_fields = [f.lower() for f in fields]
+        taxonomy_block = build_context_block()
         
         prompt = f"""Analyze this medical exam text and extract metadata.
+
+{taxonomy_block}
 
 TEXT:
 {text[:4000]}
 
 TASK: Extract the following fields with confidence scores (0.0-1.0):
-{', '.join(fields)}
+{', '.join(fields)}, "faculty"
 
 INSTRUCTIONS:
-- Year: Publication year or exam year (e.g., 2024, 2023)
-- Source: Book name, exam series, university, or publisher (e.g., "Training Book Series", "Résidanat Oran")
-- Category: Medical specialty (e.g., "Pédiatrie", "Cardiologie", "Médecine Interne")
-- Subcategory: Sub-specialty or specific topic if present (e.g., "Néonatologie", "HTA")
+- "category": the canonical module name from VALID MODULES BY LEVEL (exactly as written). null if unknown.
+- "year": the START year of any "YYYY/YYYY" pair (e.g. "2025/2026" -> "2025"). Plain 4-digit year stays as-is.
+- "source": derive per RULES — "Externat {{faculty}}" if category matched, else "Residanat {{faculty}}". null if faculty unknown.
+- "subcategory": specific topic if present, else null.
+- "faculty": the matched faculty from VALID FACULTIES (intermediate field, used to derive source).
 
 Return ONLY JSON:
 {{
   "year": {{"value": "2024", "confidence": 0.95}},
-  "source": {{"value": "Training Book Series", "confidence": 0.88}},
-  "category": {{"value": "Pédiatrie", "confidence": 0.92}},
-  "subcategory": {{"value": null, "confidence": 0.0}}
+  "source": {{"value": "Externat Oran", "confidence": 0.88}},
+  "category": {{"value": "Cardiologie", "confidence": 0.92}},
+  "subcategory": {{"value": null, "confidence": 0.0}},
+  "faculty": {{"value": "Oran", "confidence": 0.9}}
 }}
 
 If a field is not found or ambiguous, use null with confidence 0.0.
@@ -85,7 +94,31 @@ If a field is not found or ambiguous, use null with confidence 0.0.
                 # Log cost
                 cost = response.get('cost', 0.0) or self.client.estimate_cost(model_used, response["usage"])
                 self.cost_tracker.log_api_call("ai_metadata_detect", model_used, response["usage"], cost)
-                
+
+                # Post-process: validate / canonicalize against the taxonomy.
+                # The LLM is the recommender; Python is the validator.
+                self._canon(data, "category", "category", normalize_module)
+                self._canon(data, "year", "year", normalize_year)
+
+                # Faculty is an intermediate field used to derive source.
+                fac_entry = data.get("faculty") or {}
+                raw_fac = fac_entry.get("value") if isinstance(fac_entry, dict) else fac_entry
+                if not raw_fac:
+                    raw_fac = find_faculty_in_text(text[:4000])
+                faculty = normalize_faculty(raw_fac) if raw_fac else None
+
+                # Source is derived deterministically from module + faculty.
+                cat_entry = data.get("category") or {}
+                mod_val = cat_entry.get("value") if isinstance(cat_entry, dict) else cat_entry
+                if "source" not in data or not isinstance(data["source"], dict):
+                    data["source"] = {"value": None, "confidence": 0.0}
+                data["source"]["value"] = derive_source(mod_val, faculty)
+                # Boost source confidence when we derived it from a known faculty.
+                if data["source"]["value"]:
+                    data["source"]["confidence"] = max(data["source"].get("confidence", 0.0), 0.8)
+
+                data.pop("faculty", None)
+
                 return data
             else:
                 print("⚠️ No JSON found in AI response")
@@ -94,6 +127,19 @@ If a field is not found or ambiguous, use null with confidence 0.0.
         except Exception as e:
             print(f"❌ AI metadata detection failed: {e}")
             return self._empty_result(prompt_fields)
+
+    @staticmethod
+    def _canon(data: dict, key: str, alt_key: Optional[str], normalizer) -> None:
+        """In-place: canonicalize data[key] / data[alt_key] "value" via `normalizer`.
+        If the normalizer rejects the LLM value (returns None), set confidence 0.0."""
+        entry = data.get(key) or (data.get(alt_key) if alt_key else None)
+        if not isinstance(entry, dict):
+            return
+        raw = entry.get("value")
+        canon = normalizer(raw) if raw else None
+        entry["value"] = canon
+        if canon is None:
+            entry["confidence"] = 0.0
     
     def _empty_result(self, fields: List[str]) -> Dict:
         """Return empty result structure."""
