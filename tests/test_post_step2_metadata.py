@@ -26,7 +26,7 @@ from modules.post_step2_metadata import (
     run_post_step2_metadata,
     DEFAULT_STEP3_CONFIG,
     _accepted_qcms_exist,
-    _metadata_already_done,
+    _step3_covers_current_step2,
 )
 
 
@@ -99,16 +99,16 @@ def _test_missing_step3_calls_step3(monkey_post_step3_build):
 
 
 def _test_fast_path_skips_step3(monkey_post_step3_build):
-    """3. Q8: when metadata already exists → Step 3 skipped, build still chained."""
-    print("\n--- Test 3: Q8 fast path (metadata exists → skip Step 3) ---")
+    """3. Q8: when metadata already covers the same uid-set → Step 3 skipped, build still chained."""
+    print("\n--- Test 3: Q8 fast path (metadata covers step2 uids → skip Step 3) ---")
     tmp = Path(tempfile.mkdtemp())
     try:
         ctx = FakeContext(tmp)
         tracker = CostTracker()
-        _seed_qcms(ctx, [{"number": 1, "text": "Q1"}])
-        # Pre-seed step3 accepted so the fast path triggers
+        _seed_qcms(ctx, [{"number": 1, "text": "Q1", "uid": "1_0_0"}])
+        # Pre-seed step3 accepted so the fast path triggers (same uid-set as step2)
         d = ctx.get_path("step3_metadata", "accepted")
-        (d / "page_1.json").write_text("{}", encoding="utf-8")
+        (d / "page_1.json").write_text(json.dumps([{"number": 1, "text": "Q1", "uid": "1_0_0"}]), encoding="utf-8")
 
         with patch("modules.post_step2_metadata.Step3Metadata") as MockSM:
             MockSM.return_value.run = MagicMock(side_effect=AssertionError("Step 3 must NOT run in fast-path"))
@@ -172,6 +172,50 @@ def _test_step3_failure_propagates():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _test_step3_reruns_when_step2_grew(monkey_post_step3_build):
+    """6. Q8 invalidation: if step2 all_qcms grew beyond the step3 uid-set,
+    Step 3 MUST re-run (not skip) so the new QCMs get enriched."""
+    print("\n--- Test 6: step2 grew → Step 3 re-runs (uid-set mismatch) ---")
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        ctx = FakeContext(tmp)
+        tracker = CostTracker()
+        # step2 has 3 QCMs now
+        _seed_qcms(ctx, [
+            {"number": 1, "text": "Q1", "uid": "1_0_0"},
+            {"number": 2, "text": "Q2", "uid": "1_0_1"},
+            {"number": 3, "text": "Q3", "uid": "2_0_0"},
+        ])
+        # step3 was previously enriched for only the first 2 → stale subset
+        d = ctx.get_path("step3_metadata", "accepted")
+        (d / "page_1.json").write_text(
+            json.dumps([{"number": 1, "uid": "1_0_0"}, {"number": 2, "uid": "1_0_1"}]),
+            encoding="utf-8",
+        )
+
+        step3_ran = False
+        def fake_step3_run(auto_mode=False, config=None, global_pages=None, **kw):
+            nonlocal step3_ran
+            step3_ran = True
+            # overwrite page_1 + add page_2 so all 3 uids are covered after re-run
+            (d / "page_1.json").write_text(
+                json.dumps([{"number": 1, "uid": "1_0_0"}, {"number": 2, "uid": "1_0_1"}]),
+                encoding="utf-8",
+            )
+            (d / "page_2.json").write_text(json.dumps([{"number": 3, "uid": "2_0_0"}]), encoding="utf-8")
+            return {"config": config, "global_values": {}}
+
+        with patch("modules.post_step2_metadata.Step3Metadata") as MockSM:
+            MockSM.return_value.run = fake_step3_run
+            res = run_post_step2_metadata(tracker, ctx, "admin", "testproj", DEFAULT_STEP3_CONFIG)
+
+        assert res["step3"] == "done", f"expected done, got {res['step3']}"
+        assert step3_ran, "Step 3 must re-run when step2 uid-set is a superset of step3"
+        print("✅ step2 growth invalidates fast-path → Step 3 re-ran.")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _run_all():
     monkey = {"called": False}
     def fake_build(*a, **kw):
@@ -188,6 +232,7 @@ def _run_all():
         monkey["called"] = False
         _test_default_config_used_when_none(monkey)
         _test_step3_failure_propagates()
+        _test_step3_reruns_when_step2_grew(monkey)
 
     print("\n" + "=" * 60)
     print("ALL run_post_step2_metadata TESTS PASSED")

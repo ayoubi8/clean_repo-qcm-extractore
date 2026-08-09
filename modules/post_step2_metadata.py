@@ -9,11 +9,13 @@ step. This module runs Step 3 (metadata) then chains the Step 4+5 build, so
 the whole extraction → enrichment → build pipeline fires as one cascade
 inside the Step 2 background task.
 
-Idempotent / fast-path (Q8): if `step3_metadata/accepted/*.json` already
-exists, Step 3 is skipped — re-running Step 2 only re-extracts QCMs and lets
-the previously-detected metadata stand. To force re-enrichment, delete the
+Idempotent / fast-path (Q8): Step 3 is skipped ONLY when accepted metadata
+already exists AND it covers the same uid-set as the current Step 2
+`all_qcms.json`. If Step 2 has grown (e.g. a re-run added new QCMs), Step 3
+re-runs so the new QCMs get enriched. To force full re-enrichment, delete the
 `step3_metadata/accepted/` folder before re-running Step 2.
 """
+import json
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -48,15 +50,62 @@ def _accepted_qcms_exist(context) -> bool:
     return any(Path(d).glob("*.json"))
 
 
-def _metadata_already_done(context) -> bool:
-    """Q8 fast-path: True if Step 3 already produced accepted metadata."""
+def _step2_uid_set(context) -> set:
+    """Return the set of uids in the current Step 2 all_qcms.json (empty if missing)."""
     try:
-        d = context.get_path("step3_metadata", "accepted")
+        s2_file = Path(context.get_path("step2_qcm", "accepted")) / "all_qcms.json"
+    except Exception:
+        return set()
+    if not s2_file.exists():
+        return set()
+    try:
+        with open(s2_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {q.get("uid") for q in data if q.get("uid") is not None}
+    except Exception:
+        return set()
+
+
+def _step3_uid_set(context) -> set:
+    """Return the union of uids across all step3_metadata/accepted/*.json
+    files (excluding merged_* files mirrored back by the auto-build)."""
+    try:
+        d = Path(context.get_path("step3_metadata", "accepted"))
+    except Exception:
+        return set()
+    if not d.exists():
+        return set()
+    uids: set = set()
+    for q_file in d.glob("*.json"):
+        if q_file.name.startswith("merged_"):
+            continue
+        try:
+            with open(q_file, "r", encoding="utf-8") as f:
+                for q in json.load(f):
+                    if q.get("uid") is not None:
+                        uids.add(q.get("uid"))
+        except Exception:
+            continue
+    return uids
+
+
+def _step3_covers_current_step2(context) -> bool:
+    """Q8 fast-path guard: True only when Step 3 already produced accepted
+    metadata AND that metadata covers every uid currently in Step 2's
+    all_qcms.json (and vice-versa). If the sets differ (Step 2 grew, or Step 3
+    was for a different extraction), Step 3 must re-run.
+    """
+    try:
+        d = Path(context.get_path("step3_metadata", "accepted"))
     except Exception:
         return False
-    if not Path(d).exists():
+    if not d.exists() or not any(d.glob("*.json")):
         return False
-    return any(Path(d).glob("*.json"))
+    s2_uids = _step2_uid_set(context)
+    s3_uids = _step3_uid_set(context)
+    if not s2_uids:
+        return False
+    return s2_uids == s3_uids
 
 
 def run_post_step2_metadata(tracker, context, user_id: str, project: str,
@@ -81,11 +130,15 @@ def run_post_step2_metadata(tracker, context, user_id: str, project: str,
         print("[AUTO-ENRICH] No accepted QCMs found after Step 2 — skipping cascade.")
         return {"status": "no_qcms", "step3": "skipped"}
 
-    # 2. Step 3 (metadata) — skip if already done (Q8 fast-path).
-    if _metadata_already_done(context):
-        print("[AUTO-ENRICH] Step 3 accepted metadata already present — "
-              "skipping Step 3 (Q8 fast-path). To force re-enrichment, delete "
-              "step3_metadata/accepted/ before re-running Step 2.")
+    # 2. Step 3 (metadata) — skip only if Step 3 already enriched the SAME
+    #    uid-set as the current all_qcms.json (Q8 fast-path). If Step 2 grew
+    #    (e.g. re-run added new QCMs), Step 3 re-runs so the new QCMs get
+    #    enriched — otherwise they'd silently bypass metadata and the merge.
+    if _step3_covers_current_step2(context):
+        print("[AUTO-ENRICH] Step 3 accepted metadata already covers the current "
+              "Step 2 QCM set — skipping Step 3 (Q8 fast-path). To force "
+              "re-enrichment, delete step3_metadata/accepted/ before re-running "
+              "Step 2.")
         step3_status = "skipped"
     else:
         cfg = step3_config or DEFAULT_STEP3_CONFIG
