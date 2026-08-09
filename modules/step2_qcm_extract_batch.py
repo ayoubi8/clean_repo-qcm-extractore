@@ -338,36 +338,57 @@ Return ONLY the JSON array, no markdown, no explanation.
         return result_qcms
     
     def _parse_json(self, content: str) -> List[Dict]:
-        """Parse JSON from LLM response. Truncation-safe: extracts all
-        complete objects even if the closing ] is missing."""
-        # Remove markdown code blocks
-        content = re.sub(r'```json\s*', '', content)
-        content = re.sub(r'```\s*', '', content)
-        content = content.strip()
-        
-        # Find JSON array
-        start = content.find('[')
-        end = content.rfind(']')
-        
-        if start == -1:
-            print(f"[ERROR] No JSON array found in response")
+        """Parse JSON from LLM response. Truncation-safe AND bracket-safe:
+        extracts all complete {...} objects even if the closing ] is missing
+        OR if the model returned bare objects / a single object with no array
+        wrapper at all."""
+        if not content:
+            print(f"[ERROR] Empty response from model")
             return []
-        
-        # Happy path - well-formed array
-        if end != -1:
+
+        # Remove markdown code blocks
+        cleaned = re.sub(r'```json\s*', '', content)
+        cleaned = re.sub(r'```\s*', '', cleaned)
+        cleaned = cleaned.strip()
+
+        if not cleaned:
+            print(f"[ERROR] Empty response after stripping markdown")
+            return []
+
+        # 1) Try parsing the whole content (handles a bare object or a clean array)
+        try:
+            parsed = json.loads(cleaned)
+            if isinstance(parsed, list):
+                return parsed
+            if isinstance(parsed, dict):
+                return [parsed]
+        except json.JSONDecodeError:
+            pass
+
+        # 2) Find a JSON array [ ... ]
+        start = cleaned.find('[')
+        end = cleaned.rfind(']')
+
+        if start != -1 and end != -1:
             try:
-                json_str = content[start:end+1]
+                json_str = cleaned[start:end+1]
                 qcms = json.loads(json_str)
-                return qcms if isinstance(qcms, list) else []
+                if isinstance(qcms, list):
+                    return qcms
             except json.JSONDecodeError:
-                pass # fall through to partial recovery
-        
-        # Partial recovery - truncated response: scan for complete {...} objects
-        print("[WARN] JSON array truncated — attempting partial object recovery")
+                pass  # fall through to object scan
+
+        # 3) Object scan: extract complete {...} objects anywhere in the content.
+        # Works with OR without array brackets, and with truncated arrays.
+        if start == -1:
+            print("[WARN] No JSON array brackets found — scanning for bare QCM objects")
+        else:
+            print("[WARN] JSON array truncated — attempting partial object recovery")
+        search_from = 0 if start == -1 else start
         recovered = []
         depth = 0
         obj_start = None
-        for i, ch in enumerate(content[start:], start=start):
+        for i, ch in enumerate(cleaned[search_from:], start=search_from):
             if ch == '{':
                 if depth == 0:
                     obj_start = i
@@ -376,17 +397,20 @@ Return ONLY the JSON array, no markdown, no explanation.
                 depth -= 1
                 if depth == 0 and obj_start is not None:
                     try:
-                        obj = json.loads(content[obj_start:i+1])
+                        obj = json.loads(cleaned[obj_start:i+1])
                         if isinstance(obj, dict):
                             recovered.append(obj)
                     except json.JSONDecodeError:
                         pass
                     obj_start = None
         if recovered:
-            print(f"[RECOVER] Salvaged {len(recovered)} QCMs from truncated response")
-        else:
-            print(f"[ERROR] Could not recover any QCMs from response")
-        return recovered
+            print(f"[RECOVER] Salvaged {len(recovered)} QCMs from response")
+            return recovered
+
+        # 4) Nothing parseable — dump a preview so we can see what the model returned
+        preview = cleaned[:300].replace('\n', ' ')
+        print(f"[ERROR] No JSON found in response. Preview ({len(cleaned)} chars): {preview}")
+        return []
     
     def _sanitize_qcms(self, qcms: List[Dict]) -> List[Dict]:
         """
