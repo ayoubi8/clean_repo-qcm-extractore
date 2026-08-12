@@ -84,6 +84,26 @@ CREATE INDEX IF NOT EXISTS step_results_proj_step_idx
     ON step_results (project_id, step_number, created_at DESC);
 
 
+-- REFERENCE_DATABASES table (Step 8 — QCM reference matching)
+-- Stores metadata for each user-uploaded reference database file.
+-- The file bytes themselves live in Supabase Storage at storage_path
+-- ({uid}/ref_dbs/{filename}); this row holds the searchable metadata
+-- so list/upload/delete are single SELECTs and survive container restarts.
+CREATE TABLE IF NOT EXISTS reference_databases (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    filename      TEXT NOT NULL,
+    storage_path  TEXT NOT NULL,
+    size_bytes    INTEGER DEFAULT 0,
+    line_count    INTEGER DEFAULT 0,
+    created_at    TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (user_id, filename)
+);
+
+CREATE INDEX IF NOT EXISTS reference_databases_user_idx
+    ON reference_databases (user_id, created_at DESC);
+
+
 -- Row Level Security
 ALTER TABLE users ENABLE ROW LEVEL SECURITY;
 ALTER TABLE projects ENABLE ROW LEVEL SECURITY;
@@ -91,6 +111,7 @@ ALTER TABLE step_history ENABLE ROW LEVEL SECURITY;
 ALTER TABLE costs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE refresh_tokens ENABLE ROW LEVEL SECURITY;
 ALTER TABLE step_results ENABLE ROW LEVEL SECURITY;
+ALTER TABLE reference_databases ENABLE ROW LEVEL SECURITY;
 
 -- Note: Frontend never touches Supabase directly, all access goes through FastAPI 
 -- which uses the service role key (bypasses RLS). 

@@ -2693,13 +2693,164 @@ def open_in_google_sheets(name: str, step_id: str, body: dict, user: dict = Depe
         uploaded = drive_service.files().create(body=file_metadata, media_body=media,
                                                 fields="id,webViewLink").execute()
         sheets_url = uploaded.get("webViewLink")
+        sheet_id = uploaded.get("id")
         print(f"[SHEETS] Success! URL={sheets_url}")
-        return {"url": sheets_url, "id": uploaded.get("id")}
+
+        _sheets_meta_path = Path(f"/app/output/{user['id']}/{name}/{folder}/_sheets_meta.json")
+        try:
+            _sheets_meta_path.parent.mkdir(parents=True, exist_ok=True)
+            _sheets_meta_path.write_text(json.dumps({
+                "sheet_id": sheet_id,
+                "filename": filename,
+                "opened_at": datetime.now().isoformat(),
+            }), encoding="utf-8")
+            try:
+                write_file(f"{user['id']}/{name}/{folder}/_sheets_meta.json", _sheets_meta_path.read_text())
+            except Exception as _e:
+                print(f"[SHEETS] meta upload skipped: {_e}")
+        except Exception as _e:
+            print(f"[SHEETS] could not persist sheet meta: {_e}")
+
+        return {"url": sheets_url, "id": sheet_id}
     except Exception as e:
         import traceback
         traceback.print_exc()
         print(f"[SHEETS] Upload failed: {e}")
         raise HTTPException(status_code=500, detail=f"Google Sheets upload failed: {str(e)}")
+
+
+@app.post("/projects/{name}/steps/6/sync-from-sheets")
+def sync_step6_from_sheets(name: str, user: dict = Depends(get_current_user)):
+    """Pull the edited Google Sheet for Step 6 back into corrected_qcms.json
+    (local + Supabase Storage) so Step 7 reads the user's manual edits.
+
+    Triggered automatically by the frontend when the user returns to our tab
+    after editing in Google Sheets (see visibilitychange in OutputViewer.tsx),
+    or manually via the 'Sync from Sheets' fallback button.
+    """
+    import io
+    from modules.utils.xlsx_exporter import export_qcms_to_xlsx
+
+    folder = "step6_corrections"
+    user_id = user["id"]
+    local_dir = Path(f"/app/output/{user_id}/{name}/{folder}")
+
+    # 1. Look up the Google Sheet ID from _sheets_meta.json
+    meta_path = local_dir / "_sheets_meta.json"
+    meta = None
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"[SYNC6] meta file unreadable: {e}")
+    if not meta:
+        try:
+            meta_text = read_file(f"{user_id}/{name}/{folder}/_sheets_meta.json")
+            meta = json.loads(meta_text)
+        except Exception as _e:
+            print(f"[SYNC6] meta not in Storage either: {_e}")
+    if not meta or not meta.get("sheet_id"):
+        raise HTTPException(status_code=409, detail="No Google Sheet associated with this step yet. Open the file in Google Sheets first.")
+
+    sheet_id = meta["sheet_id"]
+
+    # 2. Load Google credentials
+    user_db_id = get_db_user_id(user)
+    creds = _get_google_creds(user_db_id)
+    if not creds:
+        raise HTTPException(status_code=401, detail="NOT_AUTHORIZED")
+
+    # 3. Read the edited sheet
+    try:
+        sheets_service = build("sheets", "v4", credentials=creds)
+        result = sheets_service.spreadsheets().values().get(
+            spreadsheetId=sheet_id, range="A:Z"
+        ).execute()
+        rows = result.get("values", [])
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"[SYNC6] Sheets API failed: {e}")
+        raise HTTPException(status_code=502, detail=f"Google Sheets read failed: {str(e)}")
+
+    if not rows:
+        raise HTTPException(status_code=422, detail="Sheet is empty — nothing to sync.")
+
+    # 4. Convert rows -> list of QCM dicts using header-row mapping
+    header = [(str(c).strip() if c is not None else "") for c in rows[0]]
+    if not any(header):
+        raise HTTPException(status_code=422, detail="Sheet has no header row — cannot map columns.")
+
+    new_qcms = []
+    for row in rows[1:]:
+        if all((v is None or str(v).strip() == "") for v in row):
+            continue  # skip entirely empty rows
+        qcm = {}
+        for idx, col_name in enumerate(header):
+            if not col_name:
+                continue
+            val = row[idx] if idx < len(row) else ""
+            qcm[col_name] = val if val is not None else ""
+        new_qcms.append(qcm)
+
+    if not new_qcms:
+        raise HTTPException(status_code=422, detail="No data rows found in sheet.")
+
+    # 5. Diff vs existing corrected_qcms.json to count newly-corrected entries
+    local_json_path = local_dir / "corrected_qcms.json"
+    old_qcms = []
+    if local_json_path.exists():
+        try:
+            old_qcms = json.loads(local_json_path.read_text(encoding="utf-8"))
+        except Exception:
+            old_qcms = []
+    old_correct_map = {
+        str(q.get("Num") or q.get("number", "")): str(q.get("Correct", "")).strip()
+        for q in old_qcms
+        if str(q.get("Correct", "")).strip()
+    }
+    newly_corrected = 0
+    corrected_count = 0
+    for q in new_qcms:
+        correct_val = str(q.get("Correct", "")).strip()
+        if correct_val:
+            corrected_count += 1
+            key = str(q.get("Num") or q.get("number", ""))
+            if correct_val != old_correct_map.get(key, ""):
+                newly_corrected += 1
+
+    # 6. Overwrite corrected_qcms.json locally
+    local_dir.mkdir(parents=True, exist_ok=True)
+    local_json_path.write_text(json.dumps(new_qcms, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    # 7. Upload JSON + xlsx to Supabase Storage (overwrite)
+    storage_prefix = f"{user_id}/{name}/{folder}"
+    try:
+        write_bytes_file(f"{storage_prefix}/corrected_qcms.json", local_json_path.read_bytes())
+    except Exception as e:
+        print(f"[SYNC6] JSON storage upload failed: {e}")
+
+    # 8. Regenerate a fresh timestamped xlsx so the file list stays consistent
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    xlsx_path = local_dir / f"corrected_qcms_{timestamp}.xlsx"
+    try:
+        export_qcms_to_xlsx(new_qcms, xlsx_path)
+        try:
+            write_bytes_file(f"{storage_prefix}/{xlsx_path.name}", xlsx_path.read_bytes())
+        except Exception as e:
+            print(f"[SYNC6] xlsx storage upload failed: {e}")
+    except Exception as e:
+        print(f"[SYNC6] xlsx rebuild failed: {e}")
+
+    print(f"[SYNC6] Synced {newly_corrected} new corrections (total corrected: {corrected_count}/{len(new_qcms)}).")
+
+    return {
+        "total": len(new_qcms),
+        "corrected_count": corrected_count,
+        "newly_corrected": newly_corrected,
+        "file": "corrected_qcms.json",
+        "xlsx_file": xlsx_path.name,
+    }
 
 @app.post("/projects/{name}/step8/export-existing")
 async def export_matches_only(name: str, body: dict, user: dict = Depends(get_current_user)):
