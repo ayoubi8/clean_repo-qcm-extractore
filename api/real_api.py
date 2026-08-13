@@ -2700,9 +2700,9 @@ def open_in_google_sheets(name: str, step_id: str, body: dict, user: dict = Depe
         sheet_id = uploaded.get("id")
         print(f"[SHEETS] Success! URL={sheets_url}")
 
-        # Persist sheet ID ONLY for Step 6 — sync-from-sheets reads it.
+        # Persist sheet ID for steps that support sync-from-sheets.
         # Other steps don't use sync, so don't pollute their folders.
-        if step_id == "6":
+        if step_id in ("6", "2"):
             _sheets_meta_path = Path(f"/app/output/{user['id']}/{name}/{folder}/_sheets_meta.json")
             try:
                 _sheets_meta_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2726,36 +2726,62 @@ def open_in_google_sheets(name: str, step_id: str, body: dict, user: dict = Depe
         raise HTTPException(status_code=500, detail=f"Google Sheets upload failed: {str(e)}")
 
 
-@app.post("/projects/{name}/steps/6/sync-from-sheets")
-def sync_step6_from_sheets(name: str, user: dict = Depends(get_current_user)):
-    """Pull the edited Google Sheet for Step 6 back into corrected_qcms.json
-    (local + Supabase Storage) so Step 7 reads the user's manual edits.
+# Config for sync-from-sheets per step.
+# meta_folder:  where /open-sheets wrote _sheets_meta.json (matches _SFMAP)
+# json_folder:   where the canonical JSON lives (relative to project output dir)
+# json_name:     the canonical JSON filename downstream steps read
+# xlsx_prefix:   prefix for the regenerated timestamped xlsx
+_SYNC_STEP_CONFIG = {
+    "6": {
+        "meta_folder": "step6_corrections",
+        "json_folder": "step6_corrections",
+        "json_name": "corrected_qcms.json",
+        "xlsx_prefix": "corrected_qcms",
+    },
+    "2": {
+        "meta_folder": "step2_qcm",
+        "json_folder": "step2_qcm/accepted",
+        "json_name": "all_qcms.json",
+        "xlsx_prefix": "merged_qcms",
+    },
+}
 
-    Triggered automatically by the frontend when the user returns to our tab
-    after editing in Google Sheets (see visibilitychange in OutputViewer.tsx),
-    or manually via the 'Sync from Sheets' fallback button.
+
+@app.post("/projects/{name}/steps/{step_id}/sync-from-sheets")
+def sync_from_sheets(name: str, step_id: str, user: dict = Depends(get_current_user)):
+    """Pull the edited Google Sheet back into the canonical JSON for this step
+    (local + Supabase Storage) so downstream steps read the user's manual edits.
+
+    Works for Step 6 (corrected_qcms.json → Step 7) and Step 2
+    (all_qcms.json → Step 3). Triggered automatically by the frontend when the
+    user returns to our tab after editing in Google Sheets, or manually via
+    the 'Sync from Sheets' fallback button.
     """
-    import io
     from modules.utils.xlsx_exporter import export_qcms_to_xlsx
 
-    folder = "step6_corrections"
+    cfg = _SYNC_STEP_CONFIG.get(step_id)
+    if not cfg:
+        raise HTTPException(status_code=404, detail=f"Sync not supported for step {step_id}.")
+
     user_id = user["id"]
-    local_dir = Path(f"/app/output/{user_id}/{name}/{folder}")
+    meta_folder = cfg["meta_folder"]
+    json_folder = cfg["json_folder"]
+    json_name = cfg["json_name"]
+    xlsx_prefix = cfg["xlsx_prefix"]
 
     # 1. Look up the Google Sheet ID from _sheets_meta.json
-    meta_path = local_dir / "_sheets_meta.json"
+    meta_local_path = Path(f"/app/output/{user_id}/{name}/{meta_folder}/_sheets_meta.json")
     meta = None
-    if meta_path.exists():
+    if meta_local_path.exists():
         try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta = json.loads(meta_local_path.read_text(encoding="utf-8"))
         except Exception as e:
-            print(f"[SYNC6] meta file unreadable: {e}")
+            print(f"[SYNC{step_id}] meta file unreadable: {e}")
     if not meta:
         try:
-            meta_text = read_file(f"{user_id}/{name}/{folder}/_sheets_meta.json")
-            meta = json.loads(meta_text)
+            meta = json.loads(read_file(f"{user_id}/{name}/{meta_folder}/_sheets_meta.json"))
         except Exception as _e:
-            print(f"[SYNC6] meta not in Storage either: {_e}")
+            print(f"[SYNC{step_id}] meta not in Storage either: {_e}")
     if not meta or not meta.get("sheet_id"):
         raise HTTPException(status_code=409, detail="No Google Sheet associated with this step yet. Open the file in Google Sheets first.")
 
@@ -2777,7 +2803,7 @@ def sync_step6_from_sheets(name: str, user: dict = Depends(get_current_user)):
     except Exception as e:
         import traceback
         traceback.print_exc()
-        print(f"[SYNC6] Sheets API failed: {e}")
+        print(f"[SYNC{step_id}] Sheets API failed: {e}")
         raise HTTPException(status_code=502, detail=f"Google Sheets read failed: {str(e)}")
 
     if not rows:
@@ -2791,7 +2817,7 @@ def sync_step6_from_sheets(name: str, user: dict = Depends(get_current_user)):
     new_qcms = []
     for row in rows[1:]:
         if all((v is None or str(v).strip() == "") for v in row):
-            continue  # skip entirely empty rows
+            continue
         qcm = {}
         for idx, col_name in enumerate(header):
             if not col_name:
@@ -2803,59 +2829,82 @@ def sync_step6_from_sheets(name: str, user: dict = Depends(get_current_user)):
     if not new_qcms:
         raise HTTPException(status_code=422, detail="No data rows found in sheet.")
 
-    # 5. Diff vs existing corrected_qcms.json to count newly-corrected entries
-    local_json_path = local_dir / "corrected_qcms.json"
+    # 5. Diff vs existing canonical JSON
+    local_json_dir = Path(f"/app/output/{user_id}/{name}/{json_folder}")
+    local_json_path = local_json_dir / json_name
     old_qcms = []
     if local_json_path.exists():
         try:
             old_qcms = json.loads(local_json_path.read_text(encoding="utf-8"))
         except Exception:
             old_qcms = []
-    old_correct_map = {
-        str(q.get("Num") or q.get("number", "")): str(q.get("Correct", "")).strip()
-        for q in old_qcms
-        if str(q.get("Correct", "")).strip()
-    }
-    newly_corrected = 0
-    corrected_count = 0
-    for q in new_qcms:
-        correct_val = str(q.get("Correct", "")).strip()
-        if correct_val:
-            corrected_count += 1
-            key = str(q.get("Num") or q.get("number", ""))
-            if correct_val != old_correct_map.get(key, ""):
-                newly_corrected += 1
 
-    # 6. Overwrite corrected_qcms.json locally
-    local_dir.mkdir(parents=True, exist_ok=True)
+    def _qcm_key(q):
+        return str(q.get("uid") or q.get("Num") or q.get("number") or "")
+
+    if step_id == "6":
+        # Step 6: count rows where the Correct field changed
+        old_correct_map = {
+            _qcm_key(q): str(q.get("Correct", "")).strip()
+            for q in old_qcms
+            if str(q.get("Correct", "")).strip()
+        }
+        newly_corrected = 0
+        corrected_count = 0
+        for q in new_qcms:
+            correct_val = str(q.get("Correct", "")).strip()
+            if correct_val:
+                corrected_count += 1
+                if correct_val != old_correct_map.get(_qcm_key(q), ""):
+                    newly_corrected += 1
+    else:
+        # Generic: count rows where ANY field differs from the old version
+        old_map = {_qcm_key(q): q for q in old_qcms}
+        newly_corrected = 0
+        corrected_count = 0
+        for q in new_qcms:
+            key = _qcm_key(q)
+            old_q = old_map.get(key)
+            if not old_q:
+                newly_corrected += 1
+                continue
+            for k, v in q.items():
+                old_v = old_q.get(k)
+                if str(old_v) != str(v):
+                    newly_corrected += 1
+                    break
+
+    # 6. Overwrite canonical JSON locally
+    local_json_dir.mkdir(parents=True, exist_ok=True)
     local_json_path.write_text(json.dumps(new_qcms, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    # 7. Upload JSON + xlsx to Supabase Storage (overwrite)
-    storage_prefix = f"{user_id}/{name}/{folder}"
+    # 7. Upload JSON to Supabase Storage (overwrite)
+    json_storage_path = f"{user_id}/{name}/{json_folder}/{json_name}"
     try:
-        write_bytes_file(f"{storage_prefix}/corrected_qcms.json", local_json_path.read_bytes())
+        write_bytes_file(json_storage_path, local_json_path.read_bytes())
     except Exception as e:
-        print(f"[SYNC6] JSON storage upload failed: {e}")
+        print(f"[SYNC{step_id}] JSON storage upload failed: {e}")
 
     # 8. Regenerate a fresh timestamped xlsx so the file list stays consistent
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-    xlsx_path = local_dir / f"corrected_qcms_{timestamp}.xlsx"
+    xlsx_path = local_json_dir / f"{xlsx_prefix}_{timestamp}.xlsx"
     try:
         export_qcms_to_xlsx(new_qcms, xlsx_path)
         try:
-            write_bytes_file(f"{storage_prefix}/{xlsx_path.name}", xlsx_path.read_bytes())
+            xlsx_storage_path = f"{user_id}/{name}/{json_folder}/{xlsx_path.name}"
+            write_bytes_file(xlsx_storage_path, xlsx_path.read_bytes())
         except Exception as e:
-            print(f"[SYNC6] xlsx storage upload failed: {e}")
+            print(f"[SYNC{step_id}] xlsx storage upload failed: {e}")
     except Exception as e:
-        print(f"[SYNC6] xlsx rebuild failed: {e}")
+        print(f"[SYNC{step_id}] xlsx rebuild failed: {e}")
 
-    print(f"[SYNC6] Synced {newly_corrected} new corrections (total corrected: {corrected_count}/{len(new_qcms)}).")
+    print(f"[SYNC{step_id}] Synced {newly_corrected} changed row(s) out of {len(new_qcms)} total.")
 
     return {
         "total": len(new_qcms),
         "corrected_count": corrected_count,
         "newly_corrected": newly_corrected,
-        "file": "corrected_qcms.json",
+        "file": json_name,
         "xlsx_file": xlsx_path.name,
     }
 
