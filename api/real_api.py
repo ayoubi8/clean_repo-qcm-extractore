@@ -2383,6 +2383,9 @@ def get_step_output_files(name: str, step_id: str, user: dict = Depends(get_curr
         files = []
         for f in sorted(step_dir.rglob("*")):
             if f.is_file():
+                # Hide internal meta files (e.g. _sheets_meta.json used by Step 6 sync)
+                if f.name.startswith("_"):
+                    continue
                 files.append({
                     "name": str(f.relative_to(step_dir)).replace("\\", "/"),
                     "size_bytes": f.stat().st_size,
@@ -2412,7 +2415,7 @@ def get_step_output_files(name: str, step_id: str, user: dict = Depends(get_curr
                 "created_at": created_at,
             }
             for e in sql_row["file_manifest"]
-            if e.get("path")
+            if e.get("path") and not e.get("path", "").split("/")[-1].startswith("_")
         ]
         if files:
             return {"files": files}
@@ -2426,6 +2429,7 @@ def get_step_output_files(name: str, step_id: str, user: dict = Depends(get_curr
             {"name": it["name"], "size_bytes": it.get("metadata", {}).get("size", 0),
              "path": f"{storage_prefix}/{it['name']}", "created_at": ""}
             for it in items
+            if not it.get("name", "").split("/")[-1].startswith("_")
         ]
         return {"files": files}
     except Exception:
@@ -2696,20 +2700,23 @@ def open_in_google_sheets(name: str, step_id: str, body: dict, user: dict = Depe
         sheet_id = uploaded.get("id")
         print(f"[SHEETS] Success! URL={sheets_url}")
 
-        _sheets_meta_path = Path(f"/app/output/{user['id']}/{name}/{folder}/_sheets_meta.json")
-        try:
-            _sheets_meta_path.parent.mkdir(parents=True, exist_ok=True)
-            _sheets_meta_path.write_text(json.dumps({
-                "sheet_id": sheet_id,
-                "filename": filename,
-                "opened_at": datetime.now().isoformat(),
-            }), encoding="utf-8")
+        # Persist sheet ID ONLY for Step 6 — sync-from-sheets reads it.
+        # Other steps don't use sync, so don't pollute their folders.
+        if step_id == "6":
+            _sheets_meta_path = Path(f"/app/output/{user['id']}/{name}/{folder}/_sheets_meta.json")
             try:
-                write_file(f"{user['id']}/{name}/{folder}/_sheets_meta.json", _sheets_meta_path.read_text())
+                _sheets_meta_path.parent.mkdir(parents=True, exist_ok=True)
+                _sheets_meta_path.write_text(json.dumps({
+                    "sheet_id": sheet_id,
+                    "filename": filename,
+                    "opened_at": datetime.now().isoformat(),
+                }), encoding="utf-8")
+                try:
+                    write_file(f"{user['id']}/{name}/{folder}/_sheets_meta.json", _sheets_meta_path.read_text())
+                except Exception as _e:
+                    print(f"[SHEETS] meta upload skipped: {_e}")
             except Exception as _e:
-                print(f"[SHEETS] meta upload skipped: {_e}")
-        except Exception as _e:
-            print(f"[SHEETS] could not persist sheet meta: {_e}")
+                print(f"[SHEETS] could not persist sheet meta: {_e}")
 
         return {"url": sheets_url, "id": sheet_id}
     except Exception as e:
