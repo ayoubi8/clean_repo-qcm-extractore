@@ -2737,12 +2737,14 @@ _SYNC_STEP_CONFIG = {
         "json_folder": "step6_corrections",
         "json_name": "corrected_qcms.json",
         "xlsx_prefix": "corrected_qcms",
+        "sibling": "2",
     },
     "2": {
         "meta_folder": "step2_qcm",
         "json_folder": "step2_qcm/accepted",
         "json_name": "all_qcms.json",
         "xlsx_prefix": "merged_qcms",
+        "sibling": "6",
     },
 }
 
@@ -2898,12 +2900,64 @@ def sync_from_sheets(name: str, step_id: str, user: dict = Depends(get_current_u
     except Exception as e:
         print(f"[SYNC{step_id}] xlsx rebuild failed: {e}")
 
-    print(f"[SYNC{step_id}] Synced {newly_corrected} changed row(s) out of {len(new_qcms)} total.")
+    # 9. Cross-step propagation: apply the edited fields to the sibling step's JSON.
+    # The same QCMs exist at Step 2 (all_qcms.json) and Step 6 (corrected_qcms.json),
+    # identified by uid/Num. When the user edits one, propagate to the other so both
+    # stay in sync. Field-level merge: only update fields present in the sheet, preserve
+    # the sibling's extra fields (e.g. Correct, categoryName) that the sheet may lack.
+    propagated = 0
+    sibling_id = cfg.get("sibling")
+    if sibling_id and _SYNC_STEP_CONFIG.get(sibling_id):
+        sib_cfg = _SYNC_STEP_CONFIG[sibling_id]
+        sib_json_folder = sib_cfg["json_folder"]
+        sib_json_name = sib_cfg["json_name"]
+        sib_json_dir = Path(f"/app/output/{user_id}/{name}/{sib_json_folder}")
+        sib_json_path = sib_json_dir / sib_json_name
+
+        sib_qcms = []
+        if sib_json_path.exists():
+            try:
+                sib_qcms = json.loads(sib_json_path.read_text(encoding="utf-8"))
+            except Exception as e:
+                print(f"[SYNC{step_id}] sibling JSON unreadable: {e}")
+
+        if sib_qcms:
+            # Build map of sibling QCMs by uid/Num
+            sib_map = {_qcm_key(q): q for q in sib_qcms}
+            # Build map of edited sheet rows by uid/Num
+            edited_map = {_qcm_key(q): q for q in new_qcms if _qcm_key(q)}
+
+            changed_in_sibling = 0
+            for key, edited_q in edited_map.items():
+                sib_q = sib_map.get(key)
+                if not sib_q:
+                    continue  # QCM not present in sibling — skip (don't append, could be a different stage)
+                for field, val in edited_q.items():
+                    old_val = sib_q.get(field)
+                    if str(old_val) != str(val):
+                        sib_q[field] = val
+                        changed_in_sibling += 1
+
+            if changed_in_sibling > 0:
+                try:
+                    sib_json_path.write_text(json.dumps(sib_qcms, indent=2, ensure_ascii=False), encoding="utf-8")
+                    try:
+                        write_bytes_file(f"{user_id}/{name}/{sib_json_folder}/{sib_json_name}", sib_json_path.read_bytes())
+                    except Exception as e:
+                        print(f"[SYNC{step_id}] sibling JSON storage upload failed: {e}")
+                    propagated = changed_in_sibling
+                    print(f"[SYNC{step_id}] Propagated {propagated} field change(s) to sibling step {sibling_id} ({sib_json_name}).")
+                except Exception as e:
+                    print(f"[SYNC{step_id}] sibling JSON write failed: {e}")
+
+    print(f"[SYNC{step_id}] Synced {newly_corrected} changed row(s) out of {len(new_qcms)} total"
+          + (f", propagated {propagated} field(s) to step {sibling_id}." if propagated else "."))
 
     return {
         "total": len(new_qcms),
         "corrected_count": corrected_count,
         "newly_corrected": newly_corrected,
+        "propagated": propagated,
         "file": json_name,
         "xlsx_file": xlsx_path.name,
     }
