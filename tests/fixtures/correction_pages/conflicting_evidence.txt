@@ -1,0 +1,6 @@
+CORRECTION SHEET
+
+QCM 20: A[X] B[X] C[ ] D[ ] E[ ] R: AC T: BD SCORE: 0.50
+
+The grid and R field conflict with T. T is the strong answer-key signal, but
+the conflict must be retained for review instead of silently discarded.

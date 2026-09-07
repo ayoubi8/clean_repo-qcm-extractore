@@ -1,0 +1,9 @@
+QUESTION 6. Quel est le diagnostic le plus probable ?
+A. Option clinique
+B. Autre option
+C. Option differente
+
+CORRIGE TYPE
+QCM 7: A[X] B[ ] C[ ] D[ ] E[X] R: AE T: AE SCORE: 1.00
+
+QUESTION 8. La page may continue with ordinary QCM content.

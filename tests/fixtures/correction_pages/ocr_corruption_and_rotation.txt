@@ -1,0 +1,7 @@
+CORRIGE TYPE (rotated low-resolution scan)
+
+QCM 8: A[X] B[ ] C[X] D[ ] E[ ] R8: AC T8: AC SCORE: 0,50
+QCM 18: A[ ] B[ ] C[ ] D[X] E[X] R: DE t: DE SCORE: 1,00
+
+OCR may read T: as T8, t:, or a nearby label. The block boundary remains the
+question number.

@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "description": "Phase 1 correction-page OCR fixtures. Text represents OCR output, not final parsed answers.",
+  "cases": [
+    {
+      "name": "conventional_x_table",
+      "file": "conventional_x_table.txt",
+      "format": "conventional_table",
+      "expected_map": {
+        "1": "ACE",
+        "2": "BD"
+      }
+    },
+    {
+      "name": "visual_multi_column",
+      "file": "visual_multi_column.txt",
+      "format": "visual_blocks",
+      "expected_map": {
+        "1": "BCD",
+        "26": "ACD",
+        "51": "BD"
+      }
+    },
+    {
+      "name": "mixed_normal_and_correction",
+      "file": "mixed_normal_and_correction.txt",
+      "format": "mixed",
+      "expected_map": {
+        "7": "AE"
+      }
+    },
+    {
+      "name": "page_break_correction",
+      "files": [
+        "page_break_part_1.txt",
+        "page_break_part_2.txt"
+      ],
+      "format": "split_blocks",
+      "expected_map": {
+        "12": "ABE",
+        "13": "C"
+      }
+    },
+    {
+      "name": "ocr_corruption_and_rotation",
+      "file": "ocr_corruption_and_rotation.txt",
+      "format": "degraded_visual_blocks",
+      "expected_map": {
+        "8": "AC",
+        "18": "DE"
+      }
+    },
+    {
+      "name": "conflicting_evidence",
+      "file": "conflicting_evidence.txt",
+      "format": "conflict",
+      "expected_map": {
+        "20": "BD"
+      },
+      "expected_conflicts": ["20"]
+    }
+  ]
+}

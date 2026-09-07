@@ -1,0 +1,7 @@
+CORRECTION SHEET
+
+QCM 1: A[ ] B[X] C[X] D[X] E[ ] R: ABCD T: BCD SCORE: 0.75
+QCM 26: A[X] B[ ] C[X] D[X] E[ ] R: ACD T: ACD SCORE: 1.00
+QCM 51: A[ ] B[X] C[ ] D[X] E[ ] R: BD T: BD SCORE: 0.50
+
+The three blocks may appear side by side on one physical horizontal line.

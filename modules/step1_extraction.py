@@ -11,6 +11,7 @@ from modules.utils.cost_tracker import CostTracker
 from modules.utils.prompt_helper import PromptHelper
 from modules.utils.file_manager import FileManager
 from modules.utils.ocr_cache import OCRCache
+from modules.model_policy import get_model_pair
 
 class Step1Extraction:
     """Text extraction with dual mode: pypdfium2 or Vision OCR"""
@@ -123,15 +124,8 @@ class Step1Extraction:
             
         # 2. Process pending pages in parallel
         def process_page(idx, img):
-            prompt = f"""Transcribe ALL content from this page exactly as it appears. Follow these rules:
-1. Preserve natural reading order (top to bottom, left to right).
-2. TABLES ARE CRITICAL: Convert every table — including answer-key grids, correction tables with X marks, and any grid with columns — into markdown table format using | pipe separators. Never skip a table.
-3. For answer-key / correction tables (e.g., | Q | A | B | C | D | E | with X marks): reproduce each row exactly with its X marks preserved.
-4. Do NOT summarise, skip, or paraphrase any content. Every line, every cell, every mark must appear in the output.
-5. Do NOT add any commentary or explanation — output ONLY the page content.
-{guidance}"""
-            primary_model = os.getenv("STEP1_MODEL") or os.getenv("OCR_MODEL", "qwen/qwen3-vl-30b-a3b-instruct")
-            fallback_model = os.getenv("STEP1_FALLBACK_MODEL", "qwen/qwen-2.5-vl-7b-instruct:free")
+            prompt = self._build_vision_prompt(guidance)
+            primary_model, fallback_model = get_model_pair("step1_ocr")
             max_tokens = int(os.getenv("STEP1_MAX_TOKENS", "15000"))
 
             try:
@@ -194,3 +188,18 @@ class Step1Extraction:
             "cost": total_cost,
             "page_count": len(pages)
         }
+
+    @staticmethod
+    def _build_vision_prompt(guidance: str = "") -> str:
+        """Build the OCR prompt while preserving correction-page layout."""
+        return f"""Transcribe ALL content from this page exactly as it appears. Follow these rules:
+1. Preserve natural reading order (top to bottom, left to right).
+2. TABLES ARE CRITICAL: Convert ordinary tables and conventional answer-key tables into markdown table format. Preserve every row, cell, and mark.
+3. A correction page may contain multiple independent QCM blocks (correction blocks) on one physical horizontal line. One OCR line does NOT equal one question.
+4. For every correction block, keep the question number associated with its A-E marks, R:, T:, and SCORE fields. A new question number starts a new block.
+5. Preserve R: and T: literally and separately. T: is page content and must never be dropped. Preserve scores as page content.
+6. Do not flatten side-by-side correction blocks into one logical table when that would destroy their associations. A structure such as QCM number, A-E marks, R:, T:, SCORE: is preferred.
+7. On normal QCM pages, preserve the existing reading order and table behavior.
+8. Do NOT solve or interpret corrections. Transcribe the page only; do not decide the final answer letters.
+9. Do NOT summarise, skip, or paraphrase any content. Do NOT add commentary — output ONLY the page content.
+{guidance}"""

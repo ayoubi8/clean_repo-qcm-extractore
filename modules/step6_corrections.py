@@ -11,6 +11,7 @@ from modules.document_processor import DocumentProcessor
 from modules.utils.cost_tracker import CostTracker
 from modules.utils.prompt_helper import PromptHelper
 from modules.utils.xlsx_exporter import export_qcms_to_xlsx
+from modules.model_policy import get_model_pair
 
 class Step6Corrections:
     """Add corrections from 4 sources: Knowledge, Page, Data, or Vision"""
@@ -456,6 +457,13 @@ QUESTIONS TO SOLVE:
             page_map.update(md_table_map)
             print(f"     ✅ MD-table: {len(md_table_map)} corrections on page {page_num}. Total: {len(page_map)}")
 
+        # 2d. Visual correction blocks. These must be parsed before generic
+        # number/letter regexes so side-by-side blocks retain their ownership.
+        visual_map = self._parse_visual_correction_blocks(text)
+        if visual_map:
+            page_map.update(visual_map)
+            print(f"     ✅ Visual blocks: {len(visual_map)} corrections on page {page_num}. Total: {len(page_map)}")
+
         # 2c. Regex — answers listed inline (1: ABE, 1. ABE, 1 ABE, | 1 ABE |)
         # Fix B: include `|` in the separator class so the pattern can cross
         # a markdown cell boundary between the number and the answer.
@@ -473,26 +481,12 @@ QUESTIONS TO SOLVE:
             print(f"     ✅ Regex: {len(regex_map)} corrections on page {page_num}. Total: {len(page_map)}")
 
         # 3. AI fallback — only if nothing found yet (and not suppressed)
-        if not page_map and not deterministic_only:
+        if (not page_map or self._correction_result_is_suspicious(text, page_map)) and not deterministic_only:
             print(f"     🤖 No pattern match on page {page_num}, trying AI...")
             # We do a lightweight inline AI call here for just this page.
-            primary_model = os.getenv("STEP6_TEXT_MODEL", "nvidia/nemotron-3-nano-30b-a3b:free")
-            fallback_model = os.getenv("STEP6_TEXT_FALLBACK_MODEL", "google/gemini-2.0-flash-lite-001")
+            primary_model, fallback_model = get_model_pair("step6_text")
             max_tokens = int(os.getenv("STEP6_TEXT_MAX_TOKENS", "4000"))
-            prompt = f"""Extract ALL question corrections (answer keys) from this page of a French medical QCM document.
-Return ONLY valid JSON mapping question number strings to their correct answer letters (uppercase).
-Example: {{"1": "AB", "2": "CDE", "10": "B"}}
-If no corrections found, return {{}}
-
-PAGE {page_num} TEXT:
-{text}
-"""
-            # Fix C: estimate how many answer rows the page actually contains
-            # (markdown-table rows like `| 1 | ... |`). If the AI returns far
-            # fewer than this, treat it as a partial result and retry with the
-            # fallback model instead of silently accepting 3/50 as "success".
-            expected_rows = len(re.findall(r'\|\s*\d{1,3}\s*\|', text))
-
+            prompt = self._build_correction_prompt(text, page_num)
             # Alternate primary -> fallback across attempts so a parse failure
             # on the primary model is retried with the fallback model.
             for attempt in range(2):
@@ -507,23 +501,131 @@ PAGE {page_num} TEXT:
                     raw = self._parse_first_json_object(content)
                     if not raw:
                         raise json.JSONDecodeError("No JSON object found", content, 0)
-                    for k, v in raw.items():
-                        clean_v = ''.join(c for c in str(v).upper() if c in 'ABCDE')
-                        if clean_v:
-                            page_map[str(k)] = clean_v
+                    page_map.update(self._normalise_correction_map(raw))
                     print(f"     ✅ AI ({model_used}) found {len(page_map)} corrections on page {page_num}")
                     # Fix C: completeness gate. If the page clearly contains
                     # more answer rows than the AI returned, and we still have
                     # a fallback attempt left, retry instead of accepting a
                     # partial result.
-                    if expected_rows and len(page_map) < expected_rows * 0.5 and attempt == 0:
-                        print(f"     ⚠️  AI returned {len(page_map)}/{expected_rows} — below 50%, retrying with fallback ({fallback_model})...")
+                    if self._correction_result_is_suspicious(text, page_map) and attempt == 0:
+                        print(f"     ⚠️  AI returned a partial correction map — retrying with fallback ({fallback_model})...")
                         continue  # do not break — let next attempt use fallback
                     break
                 except Exception as e:
                     print(f"     ⚠️  AI attempt {attempt+1} failed for page {page_num} ({model_used}): {e}")
 
         return page_map
+
+    def _parse_visual_correction_blocks(self, text: str) -> Dict[str, str]:
+        """Extract answer evidence from numbered visual correction blocks.
+
+        The parser deliberately keeps block boundaries tied to question numbers
+        instead of treating an OCR line as a single question. T is preferred,
+        then R, then explicit marked grid cells.
+        """
+        block_pattern = re.compile(
+            r"(?im)(?:^|\n).*?\b(?:QCM|QUESTION|Q)\s*(\d{1,3})\s*:\s*"
+        )
+        starts = list(block_pattern.finditer(text))
+        if not starts:
+            return {}
+
+        result: Dict[str, str] = {}
+        for index, match in enumerate(starts):
+            block_start = match.start()
+            block_end = starts[index + 1].start() if index + 1 < len(starts) else len(text)
+            block = text[block_start:block_end]
+            question = str(int(match.group(1)))
+
+            # OCR commonly turns T: / R: into T8: / R8:.
+            t_match = re.search(r"\bT\s*8?\s*:\s*([A-E](?:\s*[A-E]){0,4})\b", block, re.I)
+            r_match = re.search(r"\bR\s*8?\s*:\s*([A-E](?:\s*[A-E]){0,4})\b", block, re.I)
+
+            answer = self._normalise_answer_letters(t_match.group(1)) if t_match else ""
+            if not answer and r_match:
+                answer = self._normalise_answer_letters(r_match.group(1))
+            if not answer:
+                answer = self._parse_marked_grid(block)
+            if answer:
+                result[question] = answer
+
+        return result
+
+    @staticmethod
+    def _build_correction_prompt(text: str, page_num: int = 0) -> str:
+        """Build the shared AI prompt for OCR-derived correction text."""
+        return f"""Extract ALL answer-key corrections from page {page_num} of a French medical QCM document.
+
+The page may use either format:
+1. A conventional correction table with A-E columns and X/check marks.
+2. Visual QCM correction blocks containing a question number, A-E grid, R:, T:, and SCORE:.
+
+CRITICAL DOCUMENT GRAMMAR:
+- Multiple QCM blocks may exist on one physical OCR line.
+- One physical OCR line is NOT one question.
+- Question number, A-E marks, R:, T:, and SCORE: belong to the same visual block.
+- T: is strong answer-key evidence and must not be ignored.
+- R: is separate supporting correction evidence and must not be merged with T:.
+- Common OCR variants such as T8: and R8: may represent T: and R:.
+- Do not invent an answer when the block association is ambiguous.
+
+Return ONLY valid JSON mapping numeric question-number strings to uppercase answer letters.
+Example: {{"1": "AB", "26": "ACD", "51": "BD"}}
+If no correction is present, return {{}}.
+Do not return explanations, markdown, a corrections wrapper, or malformed values.
+
+PAGE {page_num} OCR TEXT:
+{text}
+"""
+
+    @staticmethod
+    def _normalise_correction_map(raw: Any) -> Dict[str, str]:
+        """Accept only a real question-to-answer map; never salvage prose."""
+        if not isinstance(raw, dict):
+            return {}
+
+        result: Dict[str, str] = {}
+        for key, value in raw.items():
+            question = str(key).strip()
+            answer = str(value).strip().upper()
+            if not question.isdigit() or not re.fullmatch(r"[A-E]{1,5}", answer):
+                continue
+            result[str(int(question))] = "".join(dict.fromkeys(answer))
+        return result
+
+    @staticmethod
+    def _correction_signal_count(text: str) -> int:
+        """Estimate how many correction blocks a page visibly contains."""
+        block_count = len(re.findall(r"(?im)\b(?:QCM|QUESTION|Q)\s*\d{1,3}\s*:", text))
+        table_rows = len(re.findall(r"\|\s*\d{1,3}\s*\|", text))
+        t_fields = len(re.findall(r"\bT\s*8?\s*:", text, re.I))
+        r_fields = len(re.findall(r"\bR\s*8?\s*:", text, re.I))
+        return max(block_count, table_rows, t_fields, r_fields)
+
+    @classmethod
+    def _correction_result_is_suspicious(cls, text: str, correction_map: Dict[str, str]) -> bool:
+        """Reject syntactically valid but visibly incomplete extraction."""
+        expected = cls._correction_signal_count(text)
+        return expected > 0 and len(correction_map) < expected
+
+    @staticmethod
+    def _normalise_answer_letters(value: str) -> str:
+        """Validate and canonicalize an answer-letter sequence."""
+        letters = "".join(re.findall(r"[A-E]", value.upper()))
+        return "".join(dict.fromkeys(letters))[:5]
+
+    @classmethod
+    def _parse_marked_grid(cls, block: str) -> str:
+        """Read simple A[X] / B[ ] style visual grid cells."""
+        marked = []
+        cell_pattern = re.compile(
+            r"\b([A-E])\s*(?:\[\s*([XxVvOo*1✓✔])\s*\]|"
+            r"\(\s*([XxVvOo*1✓✔])\s*\))"
+        )
+        for match in cell_pattern.finditer(block):
+            if match.group(2) or match.group(3):
+                marked.append(match.group(1).upper())
+        return cls._normalise_answer_letters("".join(marked))
 
     def _extract_from_page_text(self, qcms: List[Dict], auto_mode: bool = False,
                                 page_ref: str = None, guidance: str = None) -> List[Dict]:
@@ -634,8 +736,7 @@ PAGE {page_num} TEXT:
         threshold = int(scan_cfg.get("candidate_threshold", 15))
         include_neighbors = scan_cfg.get("include_neighbors", True)
         
-        primary_model = os.getenv("STEP6_ALL_PAGES_MODEL", "google/gemini-2.5-flash-lite-preview-09-2025")
-        fallback_model = os.getenv("STEP6_ALL_PAGES_FALLBACK_MODEL", "google/gemini-2.0-flash-001")
+        primary_model, fallback_model = get_model_pair("step6_all_pages")
         max_tokens = int(os.getenv("STEP6_ALL_PAGES_MAX_TOKENS", "4000"))
         
         guidance = config.get("page_text", {}).get("extraction_guidance", "")
@@ -745,6 +846,10 @@ Your task:
     • A section titled Corrigé / Correction / Réponses
 - If a page mixes new QCMs with corrections for PREVIOUS questions, extract ONLY the corrections, not the new questions.
 - The answers may use uppercase OR lowercase letters — normalise all to uppercase.
+- Multiple QCM correction blocks can share one physical OCR line. Keep each
+  question number associated with its own A-E grid, R:, T:, and SCORE: fields.
+- T: is strong answer-key evidence and must not be ignored. R: is separate
+  supporting evidence. OCR variants such as T8: and R8: are possible.
 {guidance_line}
 
 QCM numbers that need corrections (from the extracted question bank):
@@ -801,13 +906,16 @@ DOCUMENT TEXT:
                 if not raw_map:
                     raise ValueError("No JSON object found in model response.")
 
-                # Normalise: keys → str, values → uppercase A-E only
-                for k, v in raw_map.items():
-                    clean_v = ''.join(c for c in str(v).upper() if c in 'ABCDE')
-                    if clean_v:
-                        correction_map[str(k)] = clean_v
+                # Validate the map instead of turning arbitrary model prose
+                # into apparently valid answer letters.
+                candidate_map = self._normalise_correction_map(raw_map)
 
-                print(f"   ✅ Attempt {attempt}: parsed {len(correction_map)} corrections from JSON.")
+                print(f"   ✅ Attempt {attempt}: parsed {len(candidate_map)} corrections from JSON.")
+                if self._correction_result_is_suspicious(full_blob, candidate_map):
+                    correction_map = candidate_map
+                    print(f"   ⚠️  Attempt {attempt}: correction map is incomplete; retrying.")
+                    continue
+                correction_map = candidate_map
                 break  # success
 
             except json.JSONDecodeError as e:
@@ -822,6 +930,9 @@ DOCUMENT TEXT:
         if not correction_map:
             print("⚠️  No corrections extracted — returning QCMs unchanged.")
             return qcms
+
+        if self._correction_result_is_suspicious(full_blob, correction_map):
+            print("⚠️  Correction extraction remains incomplete after retries; applying only validated entries.")
 
         # ── 7. Apply corrections to QCMs ──────────────────────────────
         applied = 0
@@ -872,8 +983,7 @@ DOCUMENT TEXT:
         threshold = int(scan_cfg.get("candidate_threshold", 15))
         include_neighbors = scan_cfg.get("include_neighbors", True)
 
-        primary_model = os.getenv("STEP6_ALL_PAGES_MODEL", "deepseek/deepseek-v4-flash")
-        fallback_model = os.getenv("STEP6_ALL_PAGES_FALLBACK_MODEL", "google/gemini-2.0-flash-001")
+        primary_model, fallback_model = get_model_pair("step6_auto_detect")
         max_tokens = int(os.getenv("STEP6_ALL_PAGES_MAX_TOKENS", "4000"))
         guidance = (config.get("page_text", {}) or {}).get("extraction_guidance", "")
 
@@ -988,6 +1098,13 @@ TASK
 Identify every correction present on the current page. A correction is one of:
   - CHECK MARKS: a table with X / ✓ / ✓ in a column flagged A, B, C, D, E (the marked letters are the answer).
   - MERGED LETTERS: a single answer cell that lists the correct letters together (e.g. "ABE", "BCD", "E").
+  - VISUAL BLOCKS: a question number followed by an A-E grid, R:, T:, and SCORE:.
+
+CRITICAL DOCUMENT GRAMMAR
+- Multiple QCM blocks may share one physical OCR line; one line is not one question.
+- Keep each question number associated with its own grid, R:, T:, and SCORE:.
+- T: is strong answer-key evidence and must not be ignored.
+- R: is separate supporting evidence. OCR may render them as T8: or R8:.
 
 CRITICAL — SPLIT QUESTIONS
 A QCM may be split across a page break: the current page may show only part of a question
@@ -1035,18 +1152,13 @@ PAGE {pn} TEXT:
                     raw = self._parse_first_json_object(content)
                     if not raw:
                         raise json.JSONDecodeError("No JSON object found", content, 0)
-                    got = {}
-                    for k, v in raw.items():
-                        clean_v = "".join(c for c in str(v).upper() if c in "ABCDE")
-                        if clean_v and str(k).isdigit():
-                            got[str(int(k))] = clean_v
+                    got = self._normalise_correction_map(raw)
                     print(f"     🤖 AI ({model_used}) attempt {attempt+1}: "
                           f"{len(got)} corrections on page {pn}.")
                     # If the AI returned very little but the deterministic pass
                     # had partial results, retry on the fallback model.
-                    expected_here_hint = len(re.findall(r'\|\s*\d{1,3}\s*\|', text))
-                    if expected_here_hint and got and len(got) < expected_here_hint * 0.5 and attempt == 0:
-                        print(f"     ⚠️  AI returned {len(got)}/{expected_here_hint} row hints — retrying with fallback.")
+                    if self._correction_result_is_suspicious(text, {**page_map, **got}) and attempt == 0:
+                        print("     ⚠️  AI returned a partial correction map — retrying with fallback.")
                         continue
                     break
                 except Exception as e:
@@ -1362,8 +1474,7 @@ TEXT:
 """
         # FIX 1: No [:5000] truncation — send full text to the model
 
-        primary_model = os.getenv("STEP6_TEXT_MODEL", "nvidia/nemotron-3-nano-30b-a3b:free")
-        fallback_model = os.getenv("STEP6_TEXT_FALLBACK_MODEL", "google/gemini-2.0-flash-lite-001")
+        primary_model, fallback_model = get_model_pair("step6_text")
         max_tokens = int(os.getenv("STEP6_TEXT_MAX_TOKENS", "4000"))
         
         max_retries = 3
