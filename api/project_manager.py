@@ -1,5 +1,8 @@
 import json
 import os
+import time
+import copy
+import threading
 from pathlib import Path
 from datetime import datetime
 
@@ -34,6 +37,8 @@ sys.path.insert(0, "/app")
 from modules.utils.project_context import ProjectContext
 from modules.utils.cost_tracker import CostTracker
 from auth import get_db_user_id
+import supabase_client
+import storage_client
 
 # In-memory registry: project_name → {"context": ..., "tracker": ...}
 _registry = {}
@@ -128,8 +133,16 @@ def get_or_create(project_name: str, email: str) -> dict:
     return _registry[registry_key]
 
 def _build_project_from_storage(email: str, pname: str, meta: dict) -> dict:
-    local_pdir = Path(f"/app/output/{email}/{pname}")
-    proj = {
+    """Build a project entry from Storage list metadata ONLY.
+
+    No file downloads, no recursive step probes — the old version did a
+    read_file for project.json, another for total_costs.json and up to 10
+    recursive Storage walks (step_output_exists) per project, which made
+    list_projects crawl. Projects discovered here are registered in the DB
+    by the self-heal upsert; the startup backfills then fill in
+    total_tokens/pdf_path from Storage once (tokens_synced marks them done).
+    """
+    return {
         "name": pname,
         "last_step": 0,
         "last_modified": meta.get("created_at") or meta.get("lastUpdated") or meta.get("updated_at") or "",
@@ -137,115 +150,103 @@ def _build_project_from_storage(email: str, pname: str, meta: dict) -> dict:
         "pdf_path": ""
     }
 
-    # Try to list files in f"{email}/{pname}/" to find project.json and get its metadata created_at timestamp
-    try:
-        from storage_client import list_files
-        p_files = list_files(f"{email}/{pname}/")
-        pjson_item = next((x for x in p_files if x.get("name") == "project.json"), None)
-        if pjson_item:
-            proj["last_modified"] = pjson_item.get("created_at") or pjson_item.get("updated_at") or ""
-    except Exception as e:
-        print(f"[_build_project_from_storage] failed to get project.json metadata for {pname}: {e}")
 
-    # Restore project.json locally so pipeline works
-    try:
-        from storage_client import read_file
-        pjson_text = read_file(f"{email}/{pname}/project.json")
-        local_pdir.mkdir(parents=True, exist_ok=True)
-        (local_pdir / "project.json").write_text(pjson_text)
-        pdata = json.loads(pjson_text)
-        proj["pdf_path"] = pdata.get("pdf_path", "")
-    except Exception:
-        pass
-        
-    # Restore costs locally
-    try:
-        from storage_client import read_file
-        costs_text = read_file(f"{email}/{pname}/total_costs.json")
-        local_pdir.mkdir(parents=True, exist_ok=True)
-        (local_pdir / "total_costs.json").write_text(costs_text)
-        costs = json.loads(costs_text)
-        summary = costs.get("summary", costs)
-        proj["total_tokens"] = summary.get("total_tokens", 0)
-    except Exception:
-        pass
+# --- GET /projects TTL cache -----------------------------------------------
+# The frontend hits /projects on every dashboard load and step transition;
+# a 30s TTL cache turns those into dict hits. invalidate_projects_cache()
+# is called by the API on create/delete/step-completion/costs-save.
+_PROJECTS_CACHE: dict = {}      # email -> {"expires": ts, "projects": list}
+_PROJECTS_CACHE_TTL = 30.0
+_PROJECTS_CACHE_LOCK = threading.Lock()
 
-    # Check last step
-    # Steps 4 & 5 are intentionally skipped — they are an invisible backend
-    # auto-build that fires after Step 3 succeeds (see modules/post_step3_build.py).
-    # Reporting last_step as 4 or 5 here would confuse the UI (which hides those
-    # steps) — the user-visible progression must jump 3 -> 6 directly.
-    STEP_CHECK_ORDER = [
-        (8, "8"), (7, "7"), (6, "6"),
-        (3, "3"), (2, "2"), (1.6, "1.6"),
-        (1.5, "1.5"), (1, "1"),
-    ]
-    for snum, sid in STEP_CHECK_ORDER:
-        if step_output_exists(pname, sid, email):
-            proj["last_step"] = snum
-            break
-            
-    return proj
+
+def invalidate_projects_cache(email: str = None) -> None:
+    """Drop cached /projects results (call after mutations)."""
+    with _PROJECTS_CACHE_LOCK:
+        if email is None:
+            _PROJECTS_CACHE.clear()
+        else:
+            _PROJECTS_CACHE.pop(email, None)
+
+
+def _select_project_rows(sb, db_uid: str, cols: list) -> list:
+    """SELECT projects rows, progressively dropping optional columns
+    (total_tokens, last_activity_at) when migration.sql hasn't been run yet
+    so the list keeps working in degraded mode."""
+    while cols:
+        try:
+            sel = ",".join(cols)
+            q = sb.table("projects").select(sel).eq("user_id", db_uid)
+            if "last_activity_at" in cols:
+                q = q.order("last_activity_at", desc=True)
+            q = q.order("created_at", desc=True)
+            return getattr(q.execute(), "data", None) or []
+        except Exception as e:
+            dropped = False
+            for c in ("total_tokens", "last_activity_at"):
+                if c in cols and _is_missing_column_error(e, c):
+                    cols.remove(c)
+                    print(f"[list_projects] column projects.{c} missing — retrying without it (run api/migration.sql)")
+                    dropped = True
+                    break
+            if not dropped:
+                print(f"[list_projects] DB query failed: {e}")
+                return []
+    return []
 
 
 def list_projects(email: str) -> list:
+    """List projects for a user.
+
+    Fast path: one SQL query for id/name/timestamps/pdf_path/total_tokens
+    plus one batched step_results query for last_step. No Storage
+    round-trips, no per-project downloads. A 30s TTL cache fronts the
+    computation for repeat dashboard loads.
+    """
+    now = time.time()
+    with _PROJECTS_CACHE_LOCK:
+        cached = _PROJECTS_CACHE.get(email)
+        if cached and cached["expires"] > now:
+            return copy.deepcopy(cached["projects"])
+        if cached:
+            _PROJECTS_CACHE.pop(email, None)
+
+    projects = _compute_projects(email)
+
+    with _PROJECTS_CACHE_LOCK:
+        _PROJECTS_CACHE[email] = {
+            "expires": time.time() + _PROJECTS_CACHE_TTL,
+            "projects": copy.deepcopy(projects),
+        }
+    return projects
+
+
+def _compute_projects(email: str) -> list:
     projects = []
     seen = set()
-    
-    # 1. DB query with retry (RC-1).
-    # Resilient to a missing `last_activity_at` column: retry a slim SELECT
-    # that selects/orders by `created_at` only so list_projects keeps working
-    # until the operator runs migration.sql (which adds the column).
-    db_projects = []
-    for attempt in range(2):
-        try:
-            from supabase_client import get_supabase
-            sb = get_supabase()
-            db_uid = get_db_user_id({"id": email})
-            res = (sb.table("projects")
-                      .select("id,name,created_at,last_activity_at,pdf_storage_path")
-                      .eq("user_id", db_uid)
-                      .order("last_activity_at", desc=True)
-                      .order("created_at", desc=True)
-                      .execute())
-            db_projects = res.data or []
-            break
-        except Exception as e:
-            print(f"[list_projects] DB query attempt {attempt+1} failed: {e}")
-            # If the column is genuinely missing in the live DB schema,
-            # retry without last_activity_at so the app stays usable.
-            if _is_missing_column_error(e, "last_activity_at"):
-                try:
-                    from supabase_client import get_supabase
-                    sb = get_supabase()
-                    db_uid = get_db_user_id({"id": email})
-                    res = (sb.table("projects")
-                              .select("id,name,created_at,pdf_storage_path")
-                              .eq("user_id", db_uid)
-                              .order("created_at", desc=True)
-                              .execute())
-                    db_projects = res.data or []
-                    print("[list_projects] falling back to created_at (last_activity_at missing)")
-                    break
-                except Exception as fe:
-                    print(f"[list_projects] created_at fallback failed: {fe}")
-                    db_projects = []
-            elif attempt == 1:
-                db_projects = []
 
-    # PERSISTENCE_FIX_PLAN PR-2: batch SQL query for `last_step`.
-    # Single round-trip computes the highest user-visible step per project,
-    # so we skip the (8 steps × N projects) recursive Storage walks that
-    # make list_projects crawl for tens of seconds on a freshly restarted
-    # container. Steps 4 & 5 are intentionally excluded (UI-hidden — the
-    # user-visible progression jumps 3 → 6 directly).
+    # 1. DB query (source of truth, resilient to an unmigrated schema).
+    db_projects = []
+    try:
+        sb = supabase_client.get_supabase()
+        db_uid = get_db_user_id({"id": email})
+        db_projects = _select_project_rows(
+            sb, db_uid,
+            ["id", "name", "created_at", "last_activity_at", "pdf_storage_path", "total_tokens"],
+        )
+    except Exception as e:
+        print(f"[list_projects] DB query failed: {e}")
+        db_projects = []
+
+    # PR-2: batch SQL query for `last_step` — a single round-trip computes
+    # the highest user-visible step per project. Steps 4 & 5 are
+    # intentionally excluded (UI-hidden — the user-visible progression
+    # jumps 3 → 6 directly).
     last_step_by_pid: dict = {}
     try:
         pid_list = [r.get("id") for r in db_projects if r.get("id")]
         if pid_list:
-            from supabase_client import get_supabase
-            sb = get_supabase()
-            sql_last: dict = {}
+            sb = supabase_client.get_supabase()
             CHUNK = 200
             for i in range(0, len(pid_list), CHUNK):
                 chunk = pid_list[i:i + CHUNK]
@@ -258,114 +259,82 @@ def list_projects(email: str) -> list:
                     pid = row.get("project_id")
                     sid = str(row.get("step_number"))
                     if pid and sid:
-                        sql_last.setdefault(pid, set()).add(sid)
-            # Priority: highest user-visible step first, skip 4 & 5.
-            PRIORITY = [(8, "8"), (7, "7"), (6, "6"), (3, "3"), (2, "2"),
-                        (1.6, "1.6"), (1.5, "1.5"), (1, "1")]
-            for pid, sids in sql_last.items():
-                for snum, sid in PRIORITY:
-                    if sid in sids:
-                        last_step_by_pid[pid] = snum
-                        break
-                else:
-                    last_step_by_pid[pid] = 0
+                        last_step_by_pid.setdefault(pid, set()).add(sid)
     except Exception as e:
-        print(f"[list_projects] step_results batch query failed (will fall back to FS/Storage): {e}")
+        print(f"[list_projects] step_results batch query failed: {e}")
 
-    # Process DB projects
-    if db_projects:
-        for row in db_projects:
-            pname = row["name"]
-            seen.add(pname)
-            pdf_path = row.get("pdf_storage_path", "")
-            last_modified = row.get("last_activity_at") or row.get("created_at", "")
-            pid = row.get("id")
+    PRIORITY = [(8, "8"), (7, "7"), (6, "6"), (3, "3"), (2, "2"),
+                (1.6, "1.6"), (1.5, "1.5"), (1, "1")]
 
-            # PERSISTENCE_FIX_PLAN PR-2: prefer the batch SQL result for
-            # `last_step`. Skip the FS walk + Storage recursive fallback
-            # entirely when SQL already has a hit — that's the fast path
-            # that makes list_projects instant after a container restart.
-            last_step = last_step_by_pid.get(pid, 0)
+    # Process DB projects — pure SQL + local FS, zero Storage calls.
+    for row in db_projects:
+        pname = row.get("name")
+        if not pname:
+            continue
+        seen.add(pname)
+        pdf_path = row.get("pdf_storage_path") or ""
+        last_modified = row.get("last_activity_at") or row.get("created_at", "")
+        pid = row.get("id")
 
+        last_step = 0
+        sids = last_step_by_pid.get(pid)
+        if sids:
+            for snum, sid in PRIORITY:
+                if sid in sids:
+                    last_step = snum
+                    break
+
+        # Local-FS-only step detection (free, container-local). NO Storage
+        # probing — a project with no step_results row simply reports
+        # last_step=0; the startup backfill keeps step_results authoritative.
+        if last_step == 0:
             local_pdir = Path(f"/app/output/{email}/{pname}")
-            total_tokens = 0
-
-            # Slow path: SQL had no row for this project (pre-fix project,
-            # or the step_results table isn't created yet) — fall back to
-            # the FS walk + recursive Storage probe (existing behaviour).
-            if last_step == 0:
+            if local_pdir.exists():
                 STEP_ORDER = [
                     (8, "step8_matcher"), (7, "step7_categories"), (6, "step6_corrections"),
                     (5, "step5_json"), (4, "step4_format"), (3, "step3_metadata"), (2, "step2_qcm"),
                     (1.6, "step1_extraction"), (1.5, "step1_extraction"), (1, "step1_extraction"),
                 ]
+                for step_num, folder_name in STEP_ORDER:
+                    folder_path = local_pdir / folder_name
+                    if folder_path.exists() and any(folder_path.iterdir()):
+                        last_step = step_num
+                        break
 
-                if local_pdir.exists():
-                    for step_num, folder_name in STEP_ORDER:
-                        folder_path = local_pdir / folder_name
-                        if folder_path.exists() and any(folder_path.iterdir()):
-                            last_step = step_num
-                            break
-
-                # If not found locally, probe Storage
-                if last_step == 0:
-                    STEP_CHECK_ORDER = [
-                        (8, "8"), (7, "7"), (6, "6"), (5, "5"),
-                        (4, "4"), (3, "3"), (2, "2"), (1.6, "1.6"),
-                        (1.5, "1.5"), (1, "1"),
-                    ]
-                    for snum, sid in STEP_CHECK_ORDER:
-                        if step_output_exists(pname, sid, email):
-                            last_step = snum
-                            break
-
-            # Restore project.json locally so pipeline works
-            if not local_pdir.exists() or not (local_pdir / "project.json").exists():
-                try:
-                    from storage_client import read_file
-                    pjson_text = read_file(f"{email}/{pname}/project.json")
-                    local_pdir.mkdir(parents=True, exist_ok=True)
-                    (local_pdir / "project.json").write_text(pjson_text)
-                    if not pdf_path:
-                        pdata = json.loads(pjson_text)
-                        pdf_path = pdata.get("pdf_path", "")
-                except Exception:
-                    pass
-
-            # Find tokens
-            cost_file = local_pdir / "total_costs.json"
+        # total_tokens straight from the DB column (backfilled once at
+        # startup, then kept fresh after every step run). If the column
+        # isn't migrated yet, degrade to the local cost file — never Storage.
+        total_tokens = 0
+        db_tokens = row.get("total_tokens")
+        if db_tokens is not None:
+            try:
+                total_tokens = int(db_tokens)
+            except (TypeError, ValueError):
+                total_tokens = 0
+        else:
+            cost_file = Path(f"/app/output/{email}/{pname}/total_costs.json")
             if cost_file.exists():
                 try:
                     data = json.loads(cost_file.read_text())
                     summary = data.get("summary", data)
                     total_tokens = summary.get("total_tokens", 0)
-                except:
-                    pass
-            else:
-                # Restore costs locally
-                try:
-                    from storage_client import read_file
-                    costs_text = read_file(f"{email}/{pname}/total_costs.json")
-                    local_pdir.mkdir(parents=True, exist_ok=True)
-                    (local_pdir / "total_costs.json").write_text(costs_text)
-                    costs = json.loads(costs_text)
-                    summary = costs.get("summary", costs)
-                    total_tokens = summary.get("total_tokens", 0)
                 except Exception:
                     pass
 
-            projects.append({
-                "name": pname,
-                "last_step": last_step,
-                "last_modified": last_modified,
-                "total_tokens": total_tokens,
-                "pdf_path": pdf_path
-            })
+        projects.append({
+            "name": pname,
+            "last_step": last_step,
+            "last_modified": last_modified,
+            "total_tokens": total_tokens,
+            "pdf_path": pdf_path
+        })
 
-    # 2. Merge: discover any project in Storage missing from DB and self-heal
+    # 2. Self-heal merge: discover any project in Storage missing from the
+    # DB and register it. After the startup backfills this is a no-op; it
+    # exists as a safety net (e.g. DB blip at project-creation time).
+    # Metadata only — no recursive walks, no downloads.
     try:
-        from storage_client import list_files
-        items = list_files(f"{email}/")
+        items = storage_client.list_files(f"{email}/")
         storage_names = set()
         for it in items:
             name = it.get("name", "")
@@ -380,22 +349,21 @@ def list_projects(email: str) -> list:
             seen.add(pname)
             # Self-heal: upsert missing row so future calls hit DB first.
             # Resilient to a missing `last_activity_at` column: drop it from
-            # the upsert payload and retry once so the self-heal still registers
-            # the project (using created_at as a stand-in timestamp).
+            # the upsert payload and retry once so the self-heal still
+            # registers the project (using created_at as a stand-in).
             try:
-                sb = get_supabase()
-                row = {
+                sb = supabase_client.get_supabase()
+                sb.table("projects").upsert({
                     "user_id": get_db_user_id({"id": email}),
                     "name": pname,
                     "pdf_storage_path": proj.get("pdf_path", ""),
                     "created_at": proj.get("last_modified") or datetime.utcnow().isoformat(),
                     "last_activity_at": proj.get("last_modified") or datetime.utcnow().isoformat(),
-                }
-                sb.table("projects").upsert(row, on_conflict="user_id,name").execute()
+                }, on_conflict="user_id,name").execute()
             except Exception as ue:
                 if _is_missing_column_error(ue, "last_activity_at"):
                     try:
-                        sb = get_supabase()
+                        sb = supabase_client.get_supabase()
                         sb.table("projects").upsert({
                             "user_id": get_db_user_id({"id": email}),
                             "name": pname,
@@ -410,15 +378,15 @@ def list_projects(email: str) -> list:
     except Exception as e:
         print(f"[list_projects] Storage merge error: {e}")
 
-    # 3. Third-tier fallback: Local filesystem scan if STILL no projects
-    # (e.g. offline container with local data)
+    # 3. Third-tier fallback: local filesystem scan if STILL no projects
+    # (e.g. offline container with local data).
     if not projects:
         output_dir = Path(f"/app/output/{email}")
         if output_dir.exists():
             for d in sorted(output_dir.iterdir()):
                 if not d.is_dir() or d.name.startswith(("_", ".", "global")):
                     continue
-                
+
                 pname = d.name
                 last_step = 0
                 STEP_ORDER = [

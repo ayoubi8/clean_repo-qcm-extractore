@@ -341,6 +341,7 @@ def _test_list_projects_uses_batch_sql_for_last_step():
     pm.step_output_exists = MagicMock(side_effect=step_exists)
 
     try:
+        pm.invalidate_projects_cache()  # fresh compute (both tests use this email)
         projects = pm.list_projects(email)
     finally:
         supabase_client.get_supabase = orig_get_sb
@@ -359,7 +360,7 @@ def _test_list_projects_uses_batch_sql_for_last_step():
 
 
 def _test_list_projects_falls_back_when_sql_empty():
-    print("\n--- Test 14: list_projects falls back to FS/Storage when SQL empty ---")
+    print("\n--- Test 14: list_projects SQL miss → last_step=0, NO Storage probing ---")
     real_api = _import_real_api()
     pm = _import_project_manager()
     pid_a = str(uuid.uuid4())
@@ -392,12 +393,10 @@ def _test_list_projects_falls_back_when_sql_empty():
     storage_client.read_file = MagicMock(side_effect=Exception("no storage in test"))
     storage_client.list_files_recursive = MagicMock(return_value=[])
 
-    # Storage recursive probe returns True only for step "1" of projA
-    def step_exists(pname, sid, email):
-        return pname == "projA" and sid == "1"
-    pm.step_output_exists = MagicMock(side_effect=step_exists)
+    pm.step_output_exists = MagicMock(return_value=False)
 
     try:
+        pm.invalidate_projects_cache()  # fresh compute (both tests use this email)
         projects = pm.list_projects(email)
     finally:
         supabase_client.get_supabase = orig_get_sb
@@ -406,9 +405,11 @@ def _test_list_projects_falls_back_when_sql_empty():
         if orig_list_rec is not None: storage_client.list_files_recursive = orig_list_rec
 
     a = next(p for p in projects if p["name"] == "projA")
-    assert a["last_step"] == 1, a  # fell back to Storage probe
-    assert pm.step_output_exists.call_count > 0, "Storage fallback should have run"
-    print(f"✅ SQL miss → Storage fallback: projA last_step={a['last_step']}")
+    # Performance fix: a project with no step_results row reports last_step=0
+    # instead of paying up to 10 recursive Storage probes per list call.
+    assert a["last_step"] == 0, a
+    assert pm.step_output_exists.call_count == 0, "Storage probing must be skipped (perf fix)"
+    print(f"✅ SQL miss → last_step=0, Storage probes=0, Storage reads=0")
 
 
 def _run_all():

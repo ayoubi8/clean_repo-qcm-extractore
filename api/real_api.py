@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse, RedirectResponse
 import shutil
 import mimetypes
 import pickle
+import threading
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleAuthRequest
@@ -29,7 +30,9 @@ sys.path.insert(0, "/app")
 
 from job_manager import job_manager
 from log_capture import LogCapture
-from project_manager import get_or_create, list_projects, step_output_exists, get_weekly_costs
+from project_manager import (get_or_create, list_projects, step_output_exists,
+                              get_weekly_costs, invalidate_projects_cache,
+                              _is_missing_column_error)
 from env_manager import read_env, mask, write_env_keys, EDITABLE_KEYS
 from auth import (get_current_user, require_admin, load_users,
                      find_user_by_email, hash_password, verify_password, rehash_if_legacy,
@@ -267,21 +270,36 @@ def _backfill_projects_to_db():
 
 @app.on_event("startup")
 async def startup_event():
-    _migrate_legacy_projects()
-    _backfill_projects_to_db()
-    # PERSISTENCE_FIX_PLAN PR-4: prefetch the projects table into an
-    # in-memory registry so the first /projects call after a restart is a
-    # dict hit. One SELECT, no per-project round-trips.
-    _eager_rebuild_registry()
-    # PERSISTENCE_FIX_PLAN PR-4: backfill synthetic step_results rows for
-    # pre-fix projects whose outputs already live in Storage but who never
-    # re-ran since PR-1 was deployed. Idempotent — re-runs no-op.
-    try:
-        inserted = _backfill_step_results_from_storage()
-        if inserted:
-            print(f"[STARTUP] ✅ backfilled {inserted} synthetic step_results row(s) from Storage")
-    except Exception as e:
-        print(f"[STARTUP] ⚠️ step_results backfill failed: {e}")
+    # All heavy Storage/DB backfill scans run in a daemon thread so the
+    # server binds and serves requests IMMEDIATELY. Previously these ran
+    # inline before the first request — with many projects that meant
+    # hundreds of sequential Storage round-trips blocking the port for
+    # minutes after every container wake.
+    def _background_init():
+        _migrate_legacy_projects()
+        _backfill_projects_to_db()
+        # PERSISTENCE_FIX_PLAN PR-4: prefetch the projects table into an
+        # in-memory registry so the first /projects call after a restart is a
+        # dict hit. One SELECT, no per-project round-trips.
+        _eager_rebuild_registry()
+        # PERSISTENCE_FIX_PLAN PR-4: backfill synthetic step_results rows for
+        # pre-fix projects whose outputs already live in Storage but who never
+        # re-ran since PR-1 was deployed. Idempotent — re-runs no-op.
+        try:
+            inserted = _backfill_step_results_from_storage()
+            if inserted:
+                print(f"[STARTUP] ✅ backfilled {inserted} synthetic step_results row(s) from Storage")
+        except Exception as e:
+            print(f"[STARTUP] ⚠️ step_results backfill failed: {e}")
+        # Data migration: copy total_tokens (total_costs.json) and pdf_path
+        # (project.json) from Storage into the projects DB columns so
+        # GET /projects is a single SQL query. Idempotent (tokens_synced).
+        try:
+            _backfill_project_tokens_from_storage()
+        except Exception as e:
+            print(f"[STARTUP] ⚠️ tokens/pdf backfill failed: {e}")
+
+    threading.Thread(target=_background_init, daemon=True, name="startup-backfill").start()
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -591,13 +609,33 @@ def create_project(body: dict, user: dict = Depends(get_current_user)):
                 "name": name,
                 "pdf_storage_path": pdf_path,
                 "last_activity_at": datetime.utcnow().isoformat(),
+                "total_tokens": 0,
+                "tokens_synced": True,
             }, on_conflict="user_id,name").execute()
             registered = True
             break
         except Exception as e:
-            print(f"[DB] projects upsert attempt {attempt+1} failed: {e}")
+            # Resilient to unmigrated schema: register without the new columns.
+            if _is_missing_column_error(e, "total_tokens") or _is_missing_column_error(e, "tokens_synced"):
+                try:
+                    sb = get_supabase()
+                    db_uid = get_db_user_id(user)
+                    sb.table("projects").upsert({
+                        "user_id": db_uid,
+                        "name": name,
+                        "pdf_storage_path": pdf_path,
+                        "last_activity_at": datetime.utcnow().isoformat(),
+                    }, on_conflict="user_id,name").execute()
+                    registered = True
+                    print("[DB] project registered without total_tokens columns — run api/migration.sql")
+                    break
+                except Exception as e2:
+                    print(f"[DB] projects upsert fallback failed: {e2}")
+            else:
+                print(f"[DB] projects upsert attempt {attempt+1} failed: {e}")
     if not registered:
         print(f"[DB] WARNING: project '{name}' created in Storage but NOT in DB — S-1 self-heal will recover on next list")
+    invalidate_projects_cache(user["id"])
 
     return {
         "name": name,
@@ -811,6 +849,16 @@ async def upload_project_pdf(name: str, file: UploadFile = File(...), user: dict
         json.dumps({"name": name, "pdf_path": internal_path})
     )
 
+    # Keep the projects.pdf_storage_path DB column fresh so GET /projects
+    # returns the pdf_path from SQL (no project.json Storage read).
+    try:
+        sb = get_supabase()
+        sb.table("projects").update({"pdf_storage_path": internal_path}) \
+            .eq("user_id", get_db_user_id(user)).eq("name", name).execute()
+    except Exception as e:
+        print(f"[DB] pdf_storage_path update failed: {e}")
+    invalidate_projects_cache(user["id"])
+
     return {"pdf_path": internal_path, "size_bytes": len(content)}
 
 
@@ -1009,6 +1057,7 @@ def delete_project(name: str, user: dict = Depends(get_current_user)):
     except Exception as e:
         print(f"[DB] projects delete failed: {e}")
 
+    invalidate_projects_cache(user["id"])
     return {"deleted": name}
 
 # --- Step Run History & Badges ---
@@ -1419,6 +1468,117 @@ def _backfill_step_results_from_storage() -> int:
         return inserted
 
 
+def _sync_project_tokens_to_db(user_id: str, project: str, cost_path: str) -> None:
+    """Push total_tokens from the local total_costs.json into the projects
+    DB row (total_tokens + tokens_synced) after every step run / costs-save,
+    so GET /projects never needs a per-project Storage download."""
+    tokens = None
+    try:
+        data = json.loads(Path(cost_path).read_text())
+        summary = data.get("summary", data)
+        tokens = int(summary.get("total_tokens", 0) or 0)
+    except Exception as e:
+        print(f"[TOKENS-SYNC] could not read {cost_path}: {e}")
+        return
+    try:
+        sb = get_supabase()
+        sb.table("projects").update({
+            "total_tokens": tokens,
+            "tokens_synced": True,
+            "last_activity_at": datetime.utcnow().isoformat(),
+        }).eq("user_id", get_db_user_id({"id": user_id})).eq("name", project).execute()
+    except Exception as e:
+        # Columns not migrated yet — degrade to a last_activity_at-only bump.
+        if _is_missing_column_error(e, "tokens_synced") or _is_missing_column_error(e, "total_tokens"):
+            try:
+                sb = get_supabase()
+                sb.table("projects").update({
+                    "last_activity_at": datetime.utcnow().isoformat(),
+                }).eq("user_id", get_db_user_id({"id": user_id})).eq("name", project).execute()
+                print("[TOKENS-SYNC] total_tokens/tokens_synced columns missing — run api/migration.sql")
+            except Exception as e2:
+                print(f"[TOKENS-SYNC] fallback update failed: {e2}")
+        else:
+            print(f"[TOKENS-SYNC] DB update failed: {e}")
+    invalidate_projects_cache(user_id)
+
+
+def _backfill_project_tokens_from_storage() -> int:
+    """One-time data migration: copy total_tokens (from total_costs.json in
+    Storage) and pdf_path (from project.json) into the projects DB columns.
+
+    Idempotent — rows are marked tokens_synced=TRUE once processed (even
+    when no cost file exists, which legitimately means 0 tokens), so the
+    Storage blobs are read at most once per project ever again.
+    """
+    from storage_client import read_file
+    sb = get_supabase()
+
+    # Probe the columns — skip with a clear message if the operator hasn't
+    # run api/migration.sql yet (same pattern as the step_results probe).
+    try:
+        sb.table("projects").select("total_tokens,tokens_synced").limit(1).execute()
+    except Exception as e:
+        print(f"[BACKFILL-TOKENS] total_tokens/tokens_synced columns missing — run api/migration.sql in the Supabase SQL editor: {e}")
+        return 0
+
+    # Resolve the admin DB UUID so Storage prefixes map correctly
+    # (admin rows store under the "admin/" prefix, not the UUID).
+    try:
+        admin_uuid = get_db_user_id({"id": "admin"})
+    except Exception:
+        admin_uuid = None
+
+    res = (sb.table("projects")
+             .select("id,user_id,name,pdf_storage_path")
+             .eq("tokens_synced", False)
+             .execute())
+    rows = getattr(res, "data", None) or []
+    if not rows:
+        print("[BACKFILL-TOKENS] all project rows already synced — nothing to do")
+        return 0
+
+    print(f"[BACKFILL-TOKENS] migrating {len(rows)} project row(s) from Storage")
+    updated = 0
+    for row in rows:
+        pid = row.get("id")
+        db_uid = row.get("user_id")
+        pname = row.get("name")
+        if not (pid and db_uid and pname):
+            continue
+        prefix = "admin" if (admin_uuid and db_uid == admin_uuid) else str(db_uid)
+
+        # total_tokens from total_costs.json (absent file → 0 tokens).
+        tokens = 0
+        try:
+            costs_text = read_file(f"{prefix}/{pname}/total_costs.json")
+            data = json.loads(costs_text)
+            summary = data.get("summary", data)
+            tokens = int(summary.get("total_tokens", 0) or 0)
+        except Exception:
+            pass
+
+        update_row = {"total_tokens": tokens, "tokens_synced": True}
+
+        # pdf_path migration for rows that never got one stored.
+        if not (row.get("pdf_storage_path") or ""):
+            try:
+                pjson = json.loads(read_file(f"{prefix}/{pname}/project.json"))
+                pdf_path = pjson.get("pdf_path", "")
+                if pdf_path:
+                    update_row["pdf_storage_path"] = pdf_path
+            except Exception:
+                pass
+
+        try:
+            sb.table("projects").update(update_row).eq("id", pid).execute()
+            updated += 1
+        except Exception as e:
+            print(f"[BACKFILL-TOKENS] update failed for {pname}: {e}")
+    print(f"[BACKFILL-TOKENS] done — {updated}/{len(rows)} row(s) synced")
+    return updated
+
+
 def _stream_file_from_storage(storage_path: str, local_dest: Path) -> bytes | None:
     """Pull `storage_path` from Supabase Storage and cache it at `local_dest`.
 
@@ -1789,6 +1949,10 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
                 except Exception as e:
                     print(f"[STORAGE] cost upload failed: {e}")
                     failed_uploads.append(f"cost file: {e}")
+
+                # Keep the projects.total_tokens DB column fresh so
+                # GET /projects stays a single SQL query.
+                _sync_project_tokens_to_db(user_id, project, cost_path)
 
                 # Upload step output folder to Supabase
                 step_storage_prefix = f"{user_id}/{project}/{folder_name}"
@@ -2251,6 +2415,8 @@ def save_project_costs(name: str, user: dict = Depends(get_current_user)):
         write_file(f"{user['id']}/{name}/total_costs.json", Path(local_path).read_text())
     except Exception as e:
         print(f"[STORAGE] costs/save upload failed: {e}")
+    # Keep the projects.total_tokens DB column fresh
+    _sync_project_tokens_to_db(user["id"], name, local_path)
     return {"saved_to": local_path}
 
 @app.get("/costs/weekly")

@@ -97,6 +97,34 @@ def rehash_if_legacy(plain_password: str, stored_hash: str) -> Optional[str]:
 # User CRUD helpers (Supabase)
 # ---------------------------------------------------------------------------
 
+# --- In-memory user cache (TTL) -------------------------------------------
+# get_current_user + get_db_user_id resolve the users table on every request;
+# caching removes two sequential DB round-trips per API call. Invalidated by
+# every user mutation below (add/update/delete) and on TTL expiry.
+_USER_CACHE: dict = {}  # ("email"|"id", value) → {"expires": float, "user": dict}
+_USER_CACHE_TTL = 60.0
+_USER_CACHE_LOCK = threading.Lock()
+
+def _user_cache_get(key):
+    with _USER_CACHE_LOCK:
+        entry = _USER_CACHE.get(key)
+        if entry and entry["expires"] > time.time():
+            return dict(entry["user"])
+        if entry:
+            _USER_CACHE.pop(key, None)
+    return None
+
+def _user_cache_put(key, user) -> None:
+    if not user:
+        return
+    with _USER_CACHE_LOCK:
+        _USER_CACHE[key] = {"expires": time.time() + _USER_CACHE_TTL, "user": dict(user)}
+
+def invalidate_user_cache() -> None:
+    with _USER_CACHE_LOCK:
+        _USER_CACHE.clear()
+
+
 def load_users() -> List[dict]:
     """Fetch all users from Supabase."""
     sb = get_supabase()
@@ -105,21 +133,34 @@ def load_users() -> List[dict]:
 
 
 def find_user_by_email(email: str) -> Optional[dict]:
-    """Find a user by email in Supabase."""
+    """Find a user by email (TTL in-memory cache, invalidated on mutation)."""
+    key = ("email", email)
+    cached = _user_cache_get(key)
+    if cached is not None:
+        return cached
     sb = get_supabase()
     res = sb.table("users").select("*").eq("email", email).limit(1).execute()
-    return res.data[0] if res.data else None
+    user = res.data[0] if res.data else None
+    _user_cache_put(key, user)
+    return user
 
 
 def find_user_by_id(user_id: str) -> Optional[dict]:
-    """Find a user by ID in Supabase."""
+    """Find a user by ID (TTL in-memory cache, invalidated on mutation)."""
+    key = ("id", user_id)
+    cached = _user_cache_get(key)
+    if cached is not None:
+        return cached
     sb = get_supabase()
     res = sb.table("users").select("*").eq("id", user_id).limit(1).execute()
-    return res.data[0] if res.data else None
+    user = res.data[0] if res.data else None
+    _user_cache_put(key, user)
+    return user
 
 
 def add_user(user_dict: dict):
     """Insert a new user row into Supabase."""
+    invalidate_user_cache()
     sb = get_supabase()
     res = sb.table("users").insert(user_dict).execute()
     return res.data[0]
@@ -127,12 +168,14 @@ def add_user(user_dict: dict):
 
 def update_user_field(uid: str, field: str, value):
     """Update a specific field for a user in Supabase."""
+    invalidate_user_cache()
     sb = get_supabase()
     sb.table("users").update({field: value}).eq("id", uid).execute()
 
 
 def delete_user(uid: str):
     """Delete a user from Supabase."""
+    invalidate_user_cache()
     sb = get_supabase()
     sb.table("users").delete().eq("id", uid).execute()
 

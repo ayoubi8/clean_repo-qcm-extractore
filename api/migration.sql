@@ -29,6 +29,14 @@ ALTER TABLE projects ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMPTZ DEFAU
 CREATE INDEX IF NOT EXISTS projects_user_activity_idx
   ON projects (user_id, last_activity_at DESC);
 
+-- PROJECTS LIST SPEEDUP: total_tokens now lives in the projects table so
+-- GET /projects is a single SQL query (no per-project Storage downloads of
+-- total_costs.json). tokens_synced marks rows already migrated from the
+-- Storage total_costs.json blobs — the backend backfills unsynced rows once
+-- at startup, so no old data is lost.
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS total_tokens BIGINT DEFAULT 0;
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS tokens_synced BOOLEAN DEFAULT FALSE;
+
 
 -- STEP_HISTORY table
 CREATE TABLE IF NOT EXISTS step_history (
