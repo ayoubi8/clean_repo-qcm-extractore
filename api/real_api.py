@@ -4,6 +4,7 @@ import json
 import sys
 import os
 import time
+import re
 from datetime import datetime
 import yaml
 from pathlib import Path
@@ -1772,6 +1773,19 @@ async def run_step(name: str, step_id: str, body: dict, user: dict = Depends(get
     _job_user_ids[job_manager.key(name, step_id)] = user["id"]
     return {"job_id": f"{name}-{step_id}-001"}
 
+
+@app.post("/projects/{name}/steps/{step_id}/stop")
+async def stop_step(name: str, step_id: str, body: dict = None, user: dict = Depends(get_current_user)):
+    """Gracefully stop a running step while preserving partial outputs."""
+    body = body or {}
+    mode = "cancelled" if body.get("mode") == "cancel" else "stopped"
+    owner = _job_user_ids.get(job_manager.key(name, step_id))
+    if owner and owner != user["id"]:
+        raise HTTPException(status_code=403, detail="Not authorized to stop this step")
+    if not job_manager.request_stop(name, step_id, mode):
+        raise HTTPException(status_code=409, detail="Step is not running")
+    return {"status": "stopping", "mode": mode}
+
 async def _run_step_task(project: str, user_id: str, step_id: str, config: dict):
     ctx_data = get_or_create(project, user_id)
     context = ctx_data["context"]
@@ -1782,7 +1796,13 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
 
     def _run_with_capture():
         with LogCapture(log_callback):
-            _call_step(step_id, tracker, context, config)
+            _call_step(
+                step_id,
+                tracker,
+                context,
+                config,
+                cancel_check=lambda: job_manager.should_stop(project, step_id),
+            )
 
     try:
         _STEP_FOLDER_MAP = {
@@ -1865,11 +1885,23 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
         # --- FIX-04: Track step success separately so _do_post_step can never
         # overwrite a successful step status with a false "error" badge. ---
         step_succeeded = False
+        step_outcome = "error"
 
         try:
             await loop.run_in_executor(None, _run_with_capture)
 
+            if job_manager.should_stop(project, step_id):
+                step_outcome = job_manager.get_stop_mode(project, step_id)
+                job_manager.set_stopped(project, step_id, step_outcome)
+                log_callback({
+                    "ts": datetime.now().strftime("%H:%M:%S"),
+                    "type": "warn",
+                    "text": f"⏸ Step {step_id} {step_outcome}. Partial outputs were preserved; resume to continue.",
+                })
+                return
+
             step_succeeded = True
+            step_outcome = "success"
             # Defer set_done for Step 2 until AFTER the cascade (Step 3 + build)
             # completes. The WebSocket log stream (ws_log) closes as soon as it
             # sees status=="done" — if we set_done here, the WS would close
@@ -1929,6 +1961,7 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
             import traceback
             traceback.print_exc()
             job_manager.set_error(project, step_id)
+            step_outcome = "error"
             log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "error", "text": f"❌ Step {step_id} failed: {str(e)}"})
 
         finally:
@@ -2000,7 +2033,7 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
                     badge, stats = _compute_step_badge(project, user_id, step_id)
                     _record_step_history(project, user_id, step_id, start_ts, badge, stats)
                 else:
-                    badge, stats = "error", {}
+                    badge, stats = step_outcome, {}
                     _record_step_history(project, user_id, step_id, start_ts, badge, stats)
                 # PERSISTENCE_FIX_PLAN PR-1: also record into the SQL
                 # step_results / step_history / costs tables so the run
@@ -2025,13 +2058,14 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
         import traceback
         traceback.print_exc()
         job_manager.set_error(project, step_id)
+        step_outcome = "error"
         log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "error", "text": f"❌ Step {step_id} setup failed: {str(outer_e)}"})
         try:
             _record_step_history(project, user_id, step_id, _step_start_time.get(f"{project}-{step_id}", time.time()), "error", {})
         except Exception as be:
             print(f"[POST-STEP] Badge recording failed for step {step_id}: {be}")
 
-def _call_step(step_id: str, tracker, context, config: dict):
+def _call_step(step_id: str, tracker, context, config: dict, cancel_check=None):
     """Synchronous step dispatcher. Runs in a thread via run_in_executor."""
     
     def _auto_input(prompt=""):
@@ -2224,6 +2258,7 @@ def _call_step(step_id: str, tracker, context, config: dict):
                     auto_ocr=(config.get("method", "") == "vision_ocr"),
                     ocr_guidance=config.get("ocr_guidance", ""),
                     force_overwrite=bool(config.get("force_overwrite", False)),
+                    cancel_check=cancel_check,
                ),
         "1.5": lambda: Step1_5BatchTextFixer(tracker, context).run(),
         "1.6": lambda: Step1_6IntelligentTextFixer(tracker, context).run(),
@@ -2284,7 +2319,7 @@ def get_step_status(name: str, step_id: str, user: dict = Depends(get_current_us
 
     # If the job is actively tracked in memory (running or finished this session),
     # trust the in-memory state — it's the most up-to-date.
-    if mem_status in ("running", "done", "error"):
+    if mem_status in ("running", "stopping", "done", "error", "stopped", "cancelled"):
         return {"status": mem_status, "output_exists": mem_output}
 
     # PERSISTENCE_FIX_PLAN PR-2: SQL-first check. After a container restart
@@ -2296,8 +2331,8 @@ def get_step_status(name: str, step_id: str, user: dict = Depends(get_current_us
         badge = sql_row.get("badge")
         if badge == "success":
             return {"status": "done", "output_exists": True}
-        if badge == "error":
-            return {"status": "error", "output_exists": bool(sql_row.get("file_manifest"))}
+        if badge in ("error", "stopped", "cancelled"):
+            return {"status": badge, "output_exists": bool(sql_row.get("file_manifest"))}
 
     # mem_status == "idle" and no SQL row: fall back to Supabase Storage
     # (handles pre-fix projects that have outputs in Storage but no SQL row yet).
@@ -2337,7 +2372,7 @@ async def ws_log(websocket: WebSocket, project: str, step_id: str, token: str = 
             
             # Exit loop if job is finished and all lines pushed
             status = job_manager.get_status(project, step_id)
-            if status in ("done", "error") and sent_count >= len(all_logs):
+            if status in ("done", "error", "stopped", "cancelled") and sent_count >= len(all_logs):
                 break
             
             await asyncio.sleep(0.3)
@@ -2534,6 +2569,18 @@ def get_template_list(user: dict = Depends(get_current_user)):
     from modules.utils.template_library import TemplateLibrary
     return TemplateLibrary().list_templates()
 
+def _sort_output_file_items(files: list) -> list:
+    """Keep page outputs numeric and deterministic despite parallel LLM work."""
+    def sort_key(item):
+        name = str(item.get("name", ""))
+        match = re.search(r"(?:^|/)page_(\d+)(?:\.[^/]*)?$", name, re.I)
+        if match:
+            return (0, int(match.group(1)), name.lower())
+        return (1, name.lower())
+
+    return sorted(files, key=sort_key)
+
+
 @app.get("/projects/{name}/steps/{step_id}/output")
 def get_step_output_files(name: str, step_id: str, user: dict = Depends(get_current_user)):
     _SFMAP = {
@@ -2547,7 +2594,7 @@ def get_step_output_files(name: str, step_id: str, user: dict = Depends(get_curr
     # Local filesystem (during active container session)
     if step_dir.exists():
         files = []
-        for f in sorted(step_dir.rglob("*")):
+        for f in sorted(step_dir.rglob("*"), key=lambda path: str(path).lower()):
             if f.is_file():
                 # Hide internal meta files (e.g. _sheets_meta.json used by Step 6 sync)
                 if f.name.startswith("_"):
@@ -2559,7 +2606,7 @@ def get_step_output_files(name: str, step_id: str, user: dict = Depends(get_curr
                     "created_at": datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
                 })
         if files:
-            return {"files": files}
+            return {"files": _sort_output_file_items(files)}
 
     # PERSISTENCE_FIX_PLAN PR-2: SQL-first manifest. After a container restart
     # the local FS is empty. If a step_results row exists, its file_manifest
@@ -2584,7 +2631,7 @@ def get_step_output_files(name: str, step_id: str, user: dict = Depends(get_curr
             if e.get("path") and not e.get("path", "").split("/")[-1].startswith("_")
         ]
         if files:
-            return {"files": files}
+            return {"files": _sort_output_file_items(files)}
 
     # Fallback: list from Supabase Storage (recursive — step outputs live in
     # sub-folders like step1_extraction/accepted/page_*.txt)
@@ -2597,7 +2644,7 @@ def get_step_output_files(name: str, step_id: str, user: dict = Depends(get_curr
             for it in items
             if not it.get("name", "").split("/")[-1].startswith("_")
         ]
-        return {"files": files}
+        return {"files": _sort_output_file_items(files)}
     except Exception:
         return {"files": []}
 

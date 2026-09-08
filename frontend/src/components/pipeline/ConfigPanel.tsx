@@ -6,7 +6,7 @@ import { Step2_3Config } from './configs/Step2_3Config'
 import { Step6Config } from './configs/Step6Config'
 import { Step8Config } from './configs/Step8Config'
 import { StepRunOnly } from './configs/StepRunOnly'
-import { runStep, connectLogStream, getStepStatus } from '../../lib/api'
+import { runStep, stopStep, connectLogStream, getStepStatus } from '../../lib/api'
 import { useAppStore } from '../../store/appStore'
 import { OutputViewer } from './OutputViewer'
 import { useStepHistory } from '../../hooks/useStepHistory'
@@ -118,7 +118,7 @@ export function ConfigPanel() {
       if (activeStep.id === 1) config = {
         ...store.step1Config,
         pdf_path: activeProject?.pdf_path ?? '',
-        force_overwrite: overwriteConfirmed,
+         force_overwrite: overwriteConfirmed && activeStep.status === 'done',
       }
       if (activeStep.id === 2) {
         const s = store.step2Config
@@ -173,8 +173,25 @@ export function ConfigPanel() {
     }
   }
 
+  const handleStop = async (mode: 'stop' | 'cancel') => {
+    if (!activeProject) return
+    setStepStatus(activeStep.id, 'stopping')
+    appendLog({
+      ts: new Date().toLocaleTimeString(),
+      type: 'warn',
+      text: mode === 'stop' ? `⏸ Stopping ${activeStep.label} and preserving partial outputs...` : `✕ Cancelling ${activeStep.label}...`,
+    })
+    try {
+      await stopStep(activeProject.name, activeStep.id, mode)
+    } catch (err: any) {
+      setStepStatus(activeStep.id, 'running')
+      appendLog({ ts: new Date().toLocaleTimeString(), type: 'error', text: `Stop failed: ${err.message}` })
+    }
+  }
+
   const ConfigComponent = CONFIG_MAP[activeStep.id.toString()]
-  const isRunDisabled = loading || (activeStep.outputExists && !overwriteConfirmed)
+  const isRunning = activeStep.status === 'running' || activeStep.status === 'stopping'
+  const isRunDisabled = loading || isRunning || (activeStep.outputExists && !overwriteConfirmed && activeStep.status !== 'stopped' && activeStep.status !== 'cancelled')
 
   return (
     <section className="flex-1 overflow-y-auto bg-surface custom-scrollbar">
@@ -196,24 +213,39 @@ export function ConfigPanel() {
 
         {activeStep.id !== 1.5 && (  // legacy guard — 1.5 no longer in CONFIG_MAP, but keep for safety
           <div className="mt-12 pt-8 border-t border-outline-variant/10">
-            <button
-              id="btn-run-step-config"
-              onClick={handleRun}
-              disabled={isRunDisabled}
-              className="w-full py-4 bg-primary text-on-primary rounded-xl font-black uppercase tracking-widest flex items-center justify-center gap-3 hover:bg-primary/90 disabled:opacity-40 disabled:cursor-not-allowed transition-all shadow-[0_4px_20px_rgba(76,215,246,0.3)]"
-            >
-              {activeStep.status === 'running' ? (
-                <>
-                  <span className="material-symbols-outlined animate-spin">refresh</span>
-                  Running...
-                </>
-              ) : (
-                <>
-                  <span className="material-symbols-outlined">play_arrow</span>
-                  {activeStep.status === 'done' ? 'Re-run Step' : 'Run Step'}
-                </>
-              )}
-            </button>
+            {isRunning ? (
+              <div className="flex gap-3">
+                <button
+                  id="btn-stop-step-config"
+                  onClick={() => handleStop('stop')}
+                  disabled={activeStep.status === 'stopping'}
+                  className="flex-1 py-4 bg-amber-500 text-black rounded-xl font-black uppercase tracking-widest flex items-center justify-center gap-3 hover:bg-amber-400 disabled:opacity-40 transition-all"
+                >
+                  <span className="material-symbols-outlined">{activeStep.status === 'stopping' ? 'hourglass_top' : 'pause'}</span>
+                  {activeStep.status === 'stopping' ? 'Stopping...' : 'Stop'}
+                </button>
+                <button
+                  id="btn-cancel-step-config"
+                  onClick={() => handleStop('cancel')}
+                  disabled={activeStep.status === 'stopping'}
+                  className="px-6 py-4 border border-error/40 text-error rounded-xl font-black uppercase tracking-widest hover:bg-error/10 disabled:opacity-40 transition-all"
+                >
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <button
+                id="btn-run-step-config"
+                onClick={handleRun}
+                disabled={isRunDisabled}
+                className="w-full py-4 bg-primary text-on-primary rounded-xl font-black uppercase tracking-widest flex items-center justify-center gap-3 hover:bg-primary/90 disabled:opacity-40 disabled:cursor-not-allowed transition-all shadow-[0_4px_20px_rgba(76,215,246,0.3)]"
+              >
+                <span className="material-symbols-outlined">play_arrow</span>
+                {activeStep.status === 'stopped' || activeStep.status === 'cancelled'
+                  ? 'Resume Step'
+                  : activeStep.status === 'done' ? 'Re-run Step' : 'Run Step'}
+              </button>
+            )}
           </div>
         )}
 

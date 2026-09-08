@@ -189,6 +189,20 @@ export async function runStep(projectName: string, stepId: number, config: objec
   return res.json()
 }
 
+// POST /projects/{name}/steps/{stepId}/stop
+export async function stopStep(projectName: string, stepId: number, mode: 'stop' | 'cancel' = 'stop') {
+  const res = await fetchWithRefresh(`${BASE}/projects/${encodeURIComponent(projectName)}/steps/${stepId}/stop`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+    body: JSON.stringify({ mode }),
+  })
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+    throw new Error(data.detail || 'Failed to stop step')
+  }
+  return res.json()
+}
+
 // GET /projects/{name}/steps/{stepId}/status
 export async function getStepStatus(projectName: string, stepId: number): Promise<{ status: any, output_exists: boolean }> {
   const res = await fetchWithRefresh(`${BASE}/projects/${encodeURIComponent(projectName)}/steps/${stepId}/status`, {
@@ -559,4 +573,26 @@ export async function deleteRefDb(id: string): Promise<void> {
     headers: { ...getAuthHeaders() }
   })
   if (!res.ok) throw new Error('Failed to delete reference database')
+}
+
+// POST /projects/{name}/steps/{stepId}/sync-from-sheets
+// Pull the edited Google Sheet back into the canonical JSON (local + Supabase Storage).
+// Works for Step 6 (corrected_qcms.json) and Step 2 (all_qcms.json).
+export async function syncFromSheets(projectName: string, stepId: string): Promise<{
+  total: number
+  corrected_count: number
+  newly_corrected: number
+  propagated: number
+  file: string
+  xlsx_file: string
+}> {
+  const res = await fetchWithRefresh(`${BASE}/projects/${encodeURIComponent(projectName)}/steps/${encodeURIComponent(stepId)}/sync-from-sheets`, {
+    method: 'POST',
+    headers: { ...getAuthHeaders() }
+  })
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}))
+    throw new Error(errData.detail || 'Sync from Sheets failed')
+  }
+  return res.json()
 }

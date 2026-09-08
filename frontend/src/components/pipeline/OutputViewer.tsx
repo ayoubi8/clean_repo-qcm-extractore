@@ -1,7 +1,20 @@
-import { useState, useEffect } from 'react';
-import { fetchStepOutput, fetchAuthenticatedBlobUrl, downloadAuthenticatedFile } from '../../lib/api';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { fetchStepOutput, fetchAuthenticatedBlobUrl, downloadAuthenticatedFile, syncFromSheets } from '../../lib/api';
+import { usePipelineStore } from '../../store/pipelineStore';
+import type { StepStatus } from '../../types';
 
 const BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
+
+function sortOutputFiles(items: any[]): any[] {
+  return [...items].sort((a, b) => {
+    const pageA = String(a.name).match(/(?:^|\/)page_(\d+)(?:\.[^/]*)?$/i)
+    const pageB = String(b.name).match(/(?:^|\/)page_(\d+)(?:\.[^/]*)?$/i)
+    if (pageA && pageB) return Number(pageA[1]) - Number(pageB[1])
+    if (pageA) return -1
+    if (pageB) return 1
+    return String(a.name).localeCompare(String(b.name), undefined, { numeric: true })
+  })
+}
 
 function getAuthHeaders(): Record<string, string> {
   const token = localStorage.getItem('qcm_token')
@@ -27,13 +40,79 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
   const [selectedRun, setSelectedRun] = useState<string | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
 
+  // Step 6 auto-sync state
+  const [syncing, setSyncing] = useState(false);
+  const [syncToast, setSyncToast] = useState<string | null>(null);
+  const hasOpenedSheetRef = useRef(false);
+  const syncingRef = useRef(false);  // guard against overlapping sync calls
+
+  // Auto-sync from Google Sheets when the user returns to our tab (Steps 2 & 6)
+  useEffect(() => {
+    if (!["2", "6"].includes(stepId)) return;
+
+    const onVisibility = async () => {
+      if (document.visibilityState !== "visible") return;
+      if (!hasOpenedSheetRef.current) return;     // only sync if user actually opened Sheets
+      if (syncingRef.current) return;             // prevent overlapping syncs
+      syncingRef.current = true;
+      setSyncing(true);
+      try {
+        const result = await syncFromSheets(projectName, stepId);
+        if (result.newly_corrected > 0) {
+          // Refresh file list so the new timestamped xlsx appears
+          try {
+            const data = await fetchStepOutput(projectName, stepId);
+            setFiles(sortOutputFiles(data.files));
+          } catch {}
+          const propMsg = result.propagated > 0 ? ` (${result.propagated} propagated to ${stepId === '6' ? 'Step 2' : 'Step 6'})` : '';
+          setSyncToast(`Synced ${result.newly_corrected} change${result.newly_corrected === 1 ? '' : 's'} from Google Sheets${propMsg}`);
+          setTimeout(() => setSyncToast(null), 5000);
+        }
+      } catch (e: any) {
+        // 409 = no sheet opened yet, 401 = need re-auth — silent in auto-mode
+        console.error("Auto-sync from Sheets failed:", e?.message || e);
+      } finally {
+        syncingRef.current = false;
+        setSyncing(false);
+      }
+    };
+
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, [stepId, projectName]);
+
+  const handleManualSync = async () => {
+    if (syncingRef.current) return;
+    syncingRef.current = true;
+    setSyncing(true);
+    try {
+      const result = await syncFromSheets(projectName, stepId);
+      if (result.newly_corrected > 0) {
+        try {
+          const data = await fetchStepOutput(projectName, stepId);
+          setFiles(sortOutputFiles(data.files));
+        } catch {}
+        const propMsg = result.propagated > 0 ? ` (${result.propagated} propagated to ${stepId === '6' ? 'Step 2' : 'Step 6'})` : '';
+        setSyncToast(`Synced ${result.newly_corrected} change${result.newly_corrected === 1 ? '' : 's'} from Google Sheets${propMsg}`);
+      } else {
+        setSyncToast(`Sheet is up to date (${result.total} rows)`);
+      }
+      setTimeout(() => setSyncToast(null), 5000);
+    } catch (e: any) {
+      alert(e?.message || 'Sync from Sheets failed');
+    } finally {
+      syncingRef.current = false;
+      setSyncing(false);
+    }
+  };
+
   useEffect(() => {
     async function loadAll() {
       // 1. Load current step files
       setLoadingFiles(true);
       try {
         const data = await fetchStepOutput(projectName, stepId);
-        setFiles(data.files);
+        setFiles(sortOutputFiles(data.files));
       } catch (err) {
         console.error(err);
       } finally {
@@ -47,7 +126,7 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
         });
         const hdata = await res.json();
         const runs = hdata.runs || [];
-        setHistoryRuns(runs);
+        setHistoryRuns(runs.map((run: any) => ({ ...run, files: sortOutputFiles(run.files || []) })));
         if (runs.length > 0) setSelectedRun(runs[0].run_id);
       } catch (err) {
         console.error('History load error:', err);
@@ -61,6 +140,33 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
     loadAll();
   }, [projectName, stepId]);
 
+  // Auto-refresh output when this step finishes running (status → 'done' or 'error').
+  // Without this, the user had to click away and back to see fresh files after a run.
+  const stepStatus = usePipelineStore(s => s.steps.find(st => st.id.toString() === stepId)?.status);
+  const prevStatusRef = useRef<StepStatus | undefined>(undefined);
+  useEffect(() => {
+    const prev = prevStatusRef.current;
+    prevStatusRef.current = stepStatus as StepStatus | undefined;
+    // Only refetch on the running → done/error transition (not on idle page-load).
+    if (prev === 'running' && (stepStatus === 'done' || stepStatus === 'error')) {
+      (async () => {
+        try {
+          const data = await fetchStepOutput(projectName, stepId);
+          setFiles(sortOutputFiles(data.files));
+        } catch (err) {
+          console.error('Auto-refresh after run failed:', err);
+        }
+        try {
+          const res = await fetch(`${BASE}/projects/${encodeURIComponent(projectName)}/steps/${stepId}/history`, {
+            headers: getAuthHeaders()
+          });
+          const hdata = await res.json();
+            setHistoryRuns((hdata.runs || []).map((run: any) => ({ ...run, files: sortOutputFiles(run.files || []) })));
+        } catch {}
+      })();
+    }
+  }, [stepStatus, projectName, stepId]);
+
   const loadHistory = async () => {
     // Called on manual refresh via the button toggle
     setHistoryLoading(true);
@@ -70,7 +176,7 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
       });
       const data = await res.json();
       const runs = data.runs || [];
-      setHistoryRuns(runs);
+      setHistoryRuns(runs.map((run: any) => ({ ...run, files: sortOutputFiles(run.files || []) })));
       if (runs.length > 0 && !selectedRun) setSelectedRun(runs[0].run_id);
     } catch (err) {
       console.error(err);
@@ -123,6 +229,7 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
 
   const openInSheets = async (file: any) => {
     setSheetsLoading(file.name);
+    if (["2", "6"].includes(stepId)) hasOpenedSheetRef.current = true;
     // Pre-open window immediately to bypass popup blocker
     const newTab = window.open('about:blank', '_blank');
     try {
@@ -249,7 +356,15 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
       )}
 
       <div className="space-y-2 max-h-80 overflow-y-auto custom-scrollbar pr-2">
-        {(showHistory ? (historyRuns.find(r => r.run_id === selectedRun)?.files || []) : files).map((file) => (
+        {syncToast && (
+          <div className="fixed bottom-6 right-6 z-50 animate-in slide-in-from-bottom-2 fade-in duration-300">
+            <div className="bg-primary/10 border border-primary/30 text-primary text-xs font-bold px-4 py-3 rounded-xl shadow-lg backdrop-blur flex items-center gap-2">
+              <span className="material-symbols-outlined text-[16px]">cloud_done</span>
+              {syncToast}
+            </div>
+          </div>
+        )}
+        {sortOutputFiles(showHistory ? (historyRuns.find(r => r.run_id === selectedRun)?.files || []) : files).map((file) => (
           <div key={file.name} className="space-y-2">
             <div className={`flex items-center justify-between p-3 rounded-xl border transition-all ${
               previewFile === file.name
@@ -336,6 +451,20 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
                     : <span className="material-symbols-outlined text-[16px]">open_in_new</span>
                   }
                 </button>
+
+                {["2", "6"].includes(stepId) && file.name.endsWith('.xlsx') && !showHistory && (
+                  <button
+                    onClick={handleManualSync}
+                    title="Pull the latest edits back from Google Sheets"
+                    disabled={syncing}
+                    className="w-7 h-7 rounded-lg flex items-center justify-center text-outline hover:text-primary hover:bg-primary/10 transition-colors disabled:opacity-50"
+                  >
+                    {syncing
+                      ? <span className="material-symbols-outlined text-[14px] animate-spin">sync</span>
+                      : <span className="material-symbols-outlined text-[16px]">cloud_sync</span>
+                    }
+                  </button>
+                )}
               </div>
             </div>
 

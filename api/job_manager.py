@@ -1,11 +1,14 @@
 import asyncio
+import threading
 from typing import Dict, Optional
 
 class JobManager:
     def __init__(self):
         self._jobs: Dict[str, asyncio.Task] = {}    # key: "{project}-{step}"
-        self._status: Dict[str, str] = {}           # "running" | "done" | "error"
+        self._status: Dict[str, str] = {}           # running | done | error | stopping | stopped | cancelled
         self._logs: Dict[str, list] = {}            # buffered log lines per job
+        self._stop_events: Dict[str, threading.Event] = {}
+        self._stop_modes: Dict[str, str] = {}
 
     def key(self, project: str, step: str) -> str:
         return f"{project}-{step}"
@@ -19,6 +22,27 @@ class JobManager:
         self._jobs[k] = task
         self._status[k] = "running"
         self._logs[k] = []
+        self._stop_events[k] = threading.Event()
+        self._stop_modes.pop(k, None)
+
+    def request_stop(self, project: str, step: str, mode: str = "stopped") -> bool:
+        """Request cooperative stop while preserving outputs already written."""
+        k = self.key(project, step)
+        task = self._jobs.get(k)
+        if not task or task.done():
+            return False
+        if mode not in ("stopped", "cancelled"):
+            raise ValueError(f"Unsupported stop mode: {mode}")
+        self._stop_modes[k] = mode
+        self._stop_events.setdefault(k, threading.Event()).set()
+        self._status[k] = "stopping"
+        return True
+
+    def should_stop(self, project: str, step: str) -> bool:
+        return self._stop_events.get(self.key(project, step), threading.Event()).is_set()
+
+    def get_stop_mode(self, project: str, step: str) -> str:
+        return self._stop_modes.get(self.key(project, step), "stopped")
 
     def append_log(self, project: str, step: str, line: dict):
         k = self.key(project, step)
@@ -34,6 +58,11 @@ class JobManager:
 
     def set_error(self, project: str, step: str):
         self._status[self.key(project, step)] = "error"
+
+    def set_stopped(self, project: str, step: str, mode: str = "stopped"):
+        if mode not in ("stopped", "cancelled"):
+            raise ValueError(f"Unsupported stop mode: {mode}")
+        self._status[self.key(project, step)] = mode
 
     def get_status(self, project: str, step: str) -> str:
         return self._status.get(self.key(project, step), "idle")

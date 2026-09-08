@@ -23,7 +23,7 @@ class Step1Extraction:
         self.context = project_context
         self.cache = OCRCache()
     
-    def run(self, pdf_path: str, auto_ocr: bool = False, ocr_guidance: str = "", force_overwrite: bool = False) -> Dict:
+    def run(self, pdf_path: str, auto_ocr: bool = False, ocr_guidance: str = "", force_overwrite: bool = False, cancel_check=None) -> Dict:
         """
         Main execution
         Returns: {"output_dir": "output/project/step1_extraction", "method": "vision_ocr", "cost": 0.0073}
@@ -49,7 +49,7 @@ class Step1Extraction:
         # Choose method
         if auto_ocr:
             print(f"\n[AUTO] Using Vision OCR (as configured)")
-            return self._extract_with_vision(pdf_path, pages, ocr_guidance)
+            return self._extract_with_vision(pdf_path, pages, ocr_guidance, cancel_check)
         
         print("\nSelect extraction method:")
         print("  1. pypdfium2 (Fast, free, text-based PDFs)")
@@ -59,7 +59,7 @@ class Step1Extraction:
         if choice == "1":
             return self._extract_with_pypdfium2(pdf_path, len(pages))
         else:
-            return self._extract_with_vision(pdf_path, pages)
+            return self._extract_with_vision(pdf_path, pages, cancel_check=cancel_check)
     
     def _extract_with_pypdfium2(self, pdf_path: str, page_count: int) -> Dict:
         """Free extraction using pypdfium2"""
@@ -93,7 +93,7 @@ class Step1Extraction:
             "page_count": page_count
         }
     
-    def _extract_with_vision(self, pdf_path: str, pages: List[Image.Image], guidance: str = "") -> Dict:
+    def _extract_with_vision(self, pdf_path: str, pages: List[Image.Image], guidance: str = "", cancel_check=None) -> Dict:
         """OCR extraction using Vision AI (with caching and parallel processing)"""
         if not guidance:
             guidance = self.prompt_helper.get_user_guidance(
@@ -112,6 +112,8 @@ class Step1Extraction:
         
         print("\n🔍 Checking cache...")
         for i in range(len(pages)):
+            if cancel_check and cancel_check():
+                break
             cached_text = self.cache.get(pdf_path, i+1)
             if cached_text:
                 results[i] = {"text": cached_text, "cost": 0.0, "source": "cache"}
@@ -124,6 +126,8 @@ class Step1Extraction:
             
         # 2. Process pending pages in parallel
         def process_page(idx, img):
+            if cancel_check and cancel_check():
+                return idx, None, 0.0, {}, "stopped"
             prompt = self._build_vision_prompt(guidance)
             primary_model, fallback_model = get_model_pair("step1_ocr")
             max_tokens = int(os.getenv("STEP1_MAX_TOKENS", "15000"))
@@ -151,21 +155,28 @@ class Step1Extraction:
                 return idx, f"ERROR: {str(e)}", 0.0, {}, "error"
 
         # Use max 5 threads to avoid overwhelming rate limits (Gemini is fine, others vary)
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            future_to_idx = {executor.submit(process_page, idx, img): idx for idx, img in pending_pages}
-            
+        executor = ThreadPoolExecutor(max_workers=5)
+        future_to_idx = {executor.submit(process_page, idx, img): idx for idx, img in pending_pages}
+        try:
             for future in as_completed(future_to_idx):
                 idx, content, cost, usage, used_model = future.result()
-                results[idx] = {"text": content, "cost": cost, "source": "api"}
-                total_cost += cost
-                
-                if usage and used_model != "error":
+                if content is not None:
+                    results[idx] = {"text": content, "cost": cost, "source": "api"}
+                    total_cost += cost
+                if usage and used_model not in ("error", "stopped"):
                     self.cost_tracker.log_api_call(
                         "step1", used_model,
                         {"prompt": usage.get("prompt_tokens", 0), "completion": usage.get("completion_tokens", 0)},
                         cost
                     )
-                print(f"  Page {idx+1} completed ✓ (${cost:.4f})")
+                if content is not None:
+                    print(f"  Page {idx+1} completed ✓ (${cost:.4f})")
+                if cancel_check and cancel_check():
+                    for pending in future_to_idx:
+                        pending.cancel()
+                    break
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
         # 3. Save all results
         for i, res in enumerate(results, 1):

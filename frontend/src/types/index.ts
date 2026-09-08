@@ -15,7 +15,7 @@ export interface Project {
 // - Steps 4 & 5 are an invisible backend operation after Step 3
 //   (see modules/post_step3_build.py).
 export type StepId = 1 | 1.5 | 1.6 | 2 | 3 | 6 | 7 | 8
-export type StepStatus = 'idle' | 'running' | 'done' | 'error'
+export type StepStatus = 'idle' | 'running' | 'stopping' | 'done' | 'error' | 'stopped' | 'cancelled'
 
 export interface StepState {
   id: StepId

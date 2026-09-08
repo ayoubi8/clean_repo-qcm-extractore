@@ -1,6 +1,6 @@
 import { usePipelineStore } from '../../store/pipelineStore'
 import { StepState } from '../../types'
-import { runStep, connectLogStream, getStepStatus, fetchAuthenticatedBlobUrl } from '../../lib/api'
+import { runStep, stopStep, connectLogStream, getStepStatus, fetchAuthenticatedBlobUrl } from '../../lib/api'
 import { useAppStore } from '../../store/appStore'
 import { useState } from 'react'
 
@@ -62,7 +62,11 @@ export function StepRow({ step, isActive, onClick }: StepRowProps) {
     try {
       // Map step ID to config object
       let config = {}
-      if (step.id === 1) config = { ...store.step1Config, force_overwrite: step.outputExists }
+      if (step.id === 1) {
+        // A stopped/cancelled Step 1 resumes from its OCR cache. A completed
+        // rerun may explicitly rebuild the cache from scratch.
+        config = { ...store.step1Config, force_overwrite: step.status === 'done' && step.outputExists }
+      }
       if (step.id === 2) {
         // Merged Step 2: forward both extraction + metadata config.
         // Step 3 config rides along as `step3` sub-key for run_post_step2_metadata.
@@ -93,8 +97,35 @@ export function StepRow({ step, isActive, onClick }: StepRowProps) {
       })
     }
   }
+  if (status === 'stopped' || status === 'cancelled' || status === 'stopping') {
+    return (
+      <div className="w-5 h-5 rounded-full bg-amber-500/20 flex items-center justify-center">
+        <span className="material-symbols-outlined text-[14px] text-amber-500 font-bold">
+          {status === 'stopping' ? 'hourglass_top' : 'pause'}
+        </span>
+      </div>
+    )
+  }
 
-  const showRunButton = isActive && step.status !== 'running'
+  const handleStop = async (e: React.MouseEvent, mode: 'stop' | 'cancel') => {
+    e.stopPropagation()
+    if (!activeProject) return
+    setStepStatus(step.id, 'stopping')
+    appendLog({
+      ts: new Date().toLocaleTimeString(),
+      type: 'warn',
+      text: mode === 'stop' ? `⏸ Stopping ${step.label} and preserving partial outputs...` : `✕ Cancelling ${step.label}...`,
+    })
+    try {
+      await stopStep(activeProject.name, step.id, mode)
+    } catch (err: any) {
+      appendLog({ ts: new Date().toLocaleTimeString(), type: 'error', text: `Stop failed: ${err.message}` })
+      setStepStatus(step.id, 'running')
+    }
+  }
+
+  const isStopping = step.status === 'running' || step.status === 'stopping'
+  const showRunButton = isActive && !isStopping
 
   return (
     <div 
@@ -115,13 +146,34 @@ export function StepRow({ step, isActive, onClick }: StepRowProps) {
         </p>
       </div>
 
+      {isActive && isStopping && (
+        <div className="flex items-center gap-1">
+          <button
+            id={`btn-stop-step-${step.id}`}
+            onClick={(e) => handleStop(e, 'stop')}
+            disabled={step.status === 'stopping'}
+            className="px-2.5 py-1 text-[10px] font-black uppercase tracking-widest bg-amber-500 text-black rounded hover:bg-amber-400 transition-colors shadow-sm disabled:opacity-50"
+          >
+            {step.status === 'stopping' ? 'Stopping...' : 'Stop'}
+          </button>
+          <button
+            id={`btn-cancel-step-${step.id}`}
+            onClick={(e) => handleStop(e, 'cancel')}
+            disabled={step.status === 'stopping'}
+            className="px-2.5 py-1 text-[10px] font-black uppercase tracking-widest border border-error/40 text-error rounded hover:bg-error/10 transition-colors disabled:opacity-50"
+          >
+            Cancel
+          </button>
+        </div>
+      )}
+
       {showRunButton && (
         <button
           id={`btn-run-step-${step.id}`}
           onClick={handleRun}
           className="px-2.5 py-1 text-[10px] font-black uppercase tracking-widest bg-primary text-on-primary rounded hover:bg-primary/80 transition-colors shadow-sm"
         >
-          {step.status === 'idle' || step.status === 'error' ? 'Run' : 'Re-run'}
+          {step.status === 'stopped' || step.status === 'cancelled' ? 'Resume' : step.status === 'idle' || step.status === 'error' ? 'Run' : 'Re-run'}
         </button>
       )}
     </div>
