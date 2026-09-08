@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { fetchStepOutput, fetchAuthenticatedBlobUrl, downloadAuthenticatedFile, syncFromSheets } from '../../lib/api';
+import { fetchStepOutput, fetchAuthenticatedBlobUrl, downloadAuthenticatedFile, syncFromSheets, deleteStepOutput } from '../../lib/api';
 import { usePipelineStore } from '../../store/pipelineStore';
 import type { StepStatus } from '../../types';
 
@@ -43,6 +43,7 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
   // Step 6 auto-sync state
   const [syncing, setSyncing] = useState(false);
   const [syncToast, setSyncToast] = useState<string | null>(null);
+  const [deletingFile, setDeletingFile] = useState<string | null>(null);
   const hasOpenedSheetRef = useRef(false);
   const syncingRef = useRef(false);  // guard against overlapping sync calls
 
@@ -103,6 +104,23 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
     } finally {
       syncingRef.current = false;
       setSyncing(false);
+    }
+  };
+
+  const handleDeleteFile = async (filename: string) => {
+    if (!window.confirm(`Delete ${filename}?`)) return;
+    setDeletingFile(filename);
+    try {
+      await deleteStepOutput(projectName, stepId, filename);
+      setFiles(prev => prev.filter(file => file.name !== filename));
+      if (previewFile === filename) {
+        setPreviewFile(null);
+        setPreviewContent('');
+      }
+    } catch (e: any) {
+      alert(e?.message || 'Delete failed');
+    } finally {
+      setDeletingFile(null);
     }
   };
 
@@ -451,6 +469,19 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
                     : <span className="material-symbols-outlined text-[16px]">open_in_new</span>
                   }
                 </button>
+
+                {!showHistory && (
+                  <button
+                    onClick={() => handleDeleteFile(file.name)}
+                    title="Delete result"
+                    disabled={deletingFile === file.name}
+                    className="w-7 h-7 rounded-lg flex items-center justify-center text-outline hover:text-error hover:bg-error/10 transition-colors disabled:opacity-50"
+                  >
+                    <span className="material-symbols-outlined text-[16px]">
+                      {deletingFile === file.name ? 'hourglass_top' : 'delete'}
+                    </span>
+                  </button>
+                )}
 
                 {["2", "6"].includes(stepId) && file.name.endsWith('.xlsx') && !showHistory && (
                   <button

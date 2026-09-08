@@ -1,4 +1,5 @@
 import os
+import json
 from pathlib import Path
 from typing import List, Dict
 from PIL import Image
@@ -105,6 +106,8 @@ class Step1Extraction:
         client = OpenRouterClient()
         total_cost = 0.0
         output_dir = ""
+        pdf_hash = self.cache.get_pdf_hash(pdf_path)
+        expected_pages = len(pages)
         
         # 1. Check for cached pages
         results = [None] * len(pages)
@@ -114,7 +117,7 @@ class Step1Extraction:
         for i in range(len(pages)):
             if cancel_check and cancel_check():
                 break
-            cached_text = self.cache.get(pdf_path, i+1)
+            cached_text = self.cache.get(pdf_path, i+1, pdf_hash)
             if cached_text:
                 results[i] = {"text": cached_text, "cost": 0.0, "source": "cache"}
             else:
@@ -147,22 +150,27 @@ class Step1Extraction:
                 cost = response.get('cost', 0.0) or client.estimate_cost(used_model, usage)
                 
                 # Save to cache immediately
-                self.cache.save(pdf_path, idx + 1, content)
+                self.cache.save(pdf_path, idx + 1, content, pdf_hash)
                 
                 return idx, content, cost, usage, used_model
             except Exception as e:
                 print(f"❌ Error on page {idx+1}: {e}")
-                return idx, f"ERROR: {str(e)}", 0.0, {}, "error"
+                return idx, None, 0.0, {}, "error"
 
         # Use max 5 threads to avoid overwhelming rate limits (Gemini is fine, others vary)
-        executor = ThreadPoolExecutor(max_workers=5)
+        max_workers = max(1, int(os.getenv("STEP1_MAX_WORKERS", "5")))
+        print(f"[STEP1] Processing {len(pending_pages)} uncached page(s) with {max_workers} concurrent request(s).")
+        executor = ThreadPoolExecutor(max_workers=max_workers)
         future_to_idx = {executor.submit(process_page, idx, img): idx for idx, img in pending_pages}
+        failed_indices = []
         try:
             for future in as_completed(future_to_idx):
                 idx, content, cost, usage, used_model = future.result()
                 if content is not None:
                     results[idx] = {"text": content, "cost": cost, "source": "api"}
                     total_cost += cost
+                elif used_model == "error":
+                    failed_indices.append(idx)
                 if usage and used_model not in ("error", "stopped"):
                     self.cost_tracker.log_api_call(
                         "step1", used_model,
@@ -178,9 +186,35 @@ class Step1Extraction:
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
+        # A failed page gets one bounded second pass. This catches transient
+        # provider/rate-limit failures without multiplying every page's cost.
+        retry_limit = max(0, int(os.getenv("STEP1_FAILED_PAGE_RETRIES", "1")))
+        for retry_number in range(retry_limit):
+            if not failed_indices or (cancel_check and cancel_check()):
+                break
+            retrying = failed_indices
+            failed_indices = []
+            print(f"[STEP1] Retrying {len(retrying)} failed page(s), pass {retry_number + 1}/{retry_limit}.")
+            for idx in retrying:
+                if cancel_check and cancel_check():
+                    break
+                idx, content, cost, usage, used_model = process_page(idx, pages[idx])
+                if content is not None:
+                    results[idx] = {"text": content, "cost": cost, "source": "retry"}
+                    total_cost += cost
+                    if usage:
+                        self.cost_tracker.log_api_call(
+                            "step1", used_model,
+                            {"prompt": usage.get("prompt_tokens", 0), "completion": usage.get("completion_tokens", 0)},
+                            cost,
+                        )
+                else:
+                    failed_indices.append(idx)
+
         # 3. Save all results
         for i, res in enumerate(results, 1):
-            if not res: continue
+            if not res:
+                continue
             
             # Save using project context
             if self.context:
@@ -192,12 +226,36 @@ class Step1Extraction:
             output_dir = str(save_path.parent)
             with open(save_path, "w", encoding="utf-8") as f:
                 f.write(res["text"])
+
+        missing_pages = [i for i, res in enumerate(results, 1) if not res]
+        if missing_pages:
+            error_dir = (self.context.get_path("step1_extraction", "errors")
+                         if self.context else Path("output/step1_extraction/errors"))
+            error_dir.mkdir(parents=True, exist_ok=True)
+            for page_num in missing_pages:
+                (error_dir / f"page_{page_num}.txt").write_text(
+                    "OCR_FAILED: page was not completed after the configured retries.\n",
+                    encoding="utf-8",
+                )
+
+        if self.context:
+            manifest_path = self.context.get_path("step1_extraction") / "_page_manifest.json"
+        else:
+            manifest_path = Path("output/step1_extraction/_page_manifest.json")
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(json.dumps({
+            "expected_pages": expected_pages,
+            "completed_pages": expected_pages - len(missing_pages),
+            "missing_pages": missing_pages,
+        }, indent=2), encoding="utf-8")
                 
         return {
             "output_dir": output_dir,
             "method": "vision_ocr",
             "cost": total_cost,
-            "page_count": len(pages)
+            "page_count": expected_pages,
+            "completed_pages": expected_pages - len(missing_pages),
+            "missing_pages": missing_pages,
         }
 
     @staticmethod

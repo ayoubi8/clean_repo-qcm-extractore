@@ -44,6 +44,9 @@ class Step2QCMExtractBatch:
         print("\n" + "="*60)
         print("STEP 2: BATCH QCM EXTRACTION (v7.0 - All Pages)")
         print("="*60)
+        # Model selection is scoped to one Step 2 run. Once the primary fails,
+        # all later chunks use the fallback instead of repeating known failures.
+        self._step2_promoted_to_fallback = False
         
         # Determine input directory
         if self.context:
@@ -256,6 +259,7 @@ Return ONLY the JSON array, no markdown, no explanation.
         
         primary_model = os.getenv("STEP2_MODEL", "google/gemini-2.5-flash-lite-preview-09-2025")
         fallback_model = os.getenv("STEP2_FALLBACK_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
+        active_model = fallback_model if getattr(self, "_step2_promoted_to_fallback", False) else primary_model
         base_max_tokens = int(os.getenv("STEP2_MAX_TOKENS", "20000"))
         max_retries = int(os.getenv("STEP2_MAX_RETRIES", "3"))
         retries = max(1, max_retries)  # at least 1 attempt
@@ -270,24 +274,29 @@ Return ONLY the JSON array, no markdown, no explanation.
             max_tokens = min(max_tokens, int(os.getenv("STEP2_MAX_TOKENS_CEILING", "64000")))
             attempt_note = f"  (attempt {attempt}/{retries})" if retries > 1 else ""
 
-            print(f"[API] Trying primary model: {primary_model}...{attempt_note}")
+            print(f"[API] Trying {active_model}...{attempt_note}")
             try:
                 try:
                     response = self.client.generate_completion(
                         prompt,
-                        model=primary_model,
+                        model=active_model,
                         max_tokens=max_tokens
                     )
-                    model_used = primary_model
+                    model_used = active_model
                 except Exception as e:
-                    print(f"[WARN] Primary model failed: {e}")
-                    print(f"[INFO] Retrying with fallback: {fallback_model}")
+                    if active_model == primary_model:
+                        self._step2_promoted_to_fallback = True
+                        active_model = fallback_model
+                        print(f"[WARN] Primary model failed: {e}")
+                        print(f"[INFO] Promoting fallback for the rest of Step 2: {fallback_model}")
+                    else:
+                        print(f"[WARN] Fallback model failed: {e}")
                     response = self.client.generate_completion(
                         prompt,
-                        model=fallback_model,
+                        model=active_model,
                         max_tokens=max_tokens
                     )
-                    model_used = fallback_model
+                    model_used = active_model
 
             except Exception as e2:
                 print(f"❌ Both primary and fallback models failed. Final error: {e2}")
@@ -327,6 +336,10 @@ Return ONLY the JSON array, no markdown, no explanation.
                     print(f"  ... and {len(qcms)-3} more")
                 break
             else:
+                if active_model == primary_model:
+                    self._step2_promoted_to_fallback = True
+                    active_model = fallback_model
+                    print(f"[INFO] Primary response was unusable; promoting fallback for the rest of Step 2: {fallback_model}")
                 if attempt < retries:
                     print(f"⚠️  No QCMs parsed on attempt {attempt}/{retries} "
                           f"(chunk pages {start_page}–{end_page}). Retrying "

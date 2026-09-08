@@ -11,14 +11,18 @@ class OCRCache:
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         
-    def _get_cache_key(self, pdf_path: str, page_num: int) -> str:
+    def get_pdf_hash(self, pdf_path: str) -> str:
+        """Compute the PDF hash once and reuse it across all page lookups."""
+        return hashlib.md5(open(pdf_path, 'rb').read()).hexdigest()
+
+    def _get_cache_key(self, pdf_path: str, page_num: int, file_hash: str = None) -> str:
         """Generate a unique hash for a PDF file content + page number."""
-        file_hash = hashlib.md5(open(pdf_path, 'rb').read()).hexdigest()
+        file_hash = file_hash or self.get_pdf_hash(pdf_path)
         return f"{file_hash}_p{page_num}"
-        
-    def get(self, pdf_path: str, page_num: int) -> Optional[str]:
+
+    def get(self, pdf_path: str, page_num: int, file_hash: str = None) -> Optional[str]:
         """Retrieve cached text if it exists."""
-        key = self._get_cache_key(pdf_path, page_num)
+        key = self._get_cache_key(pdf_path, page_num, file_hash)
         cache_file = self.cache_dir / f"{key}.json"
         
         if cache_file.exists():
@@ -30,9 +34,9 @@ class OCRCache:
                 pass
         return None
         
-    def save(self, pdf_path: str, page_num: int, text: str):
+    def save(self, pdf_path: str, page_num: int, text: str, file_hash: str = None):
         """Save OCR result to cache."""
-        key = self._get_cache_key(pdf_path, page_num)
+        key = self._get_cache_key(pdf_path, page_num, file_hash)
         cache_file = self.cache_dir / f"{key}.json"
         
         with open(cache_file, 'w', encoding='utf-8') as f:

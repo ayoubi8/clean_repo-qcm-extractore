@@ -840,14 +840,14 @@ async def upload_project_pdf(name: str, file: UploadFile = File(...), user: dict
         # ✅ Store the LOCAL absolute path so restored project.json is correct
         write_file(
             f"{user['id']}/{name}/project.json",
-            json.dumps({"name": name, "pdf_path": internal_path})
+            json.dumps({"name": name, "pdf_path": internal_path, "pdf_filename": file.filename})
         )
     except Exception as e:
         print(f"[STORAGE] PDF upload to Supabase failed: {e}")
 
     # Write the same project.json locally
     (project_dir / "project.json").write_text(
-        json.dumps({"name": name, "pdf_path": internal_path})
+        json.dumps({"name": name, "pdf_path": internal_path, "pdf_filename": file.filename})
     )
 
     # Keep the projects.pdf_storage_path DB column fresh so GET /projects
@@ -2648,6 +2648,67 @@ def get_step_output_files(name: str, step_id: str, user: dict = Depends(get_curr
     except Exception:
         return {"files": []}
 
+
+@app.delete("/projects/{name}/steps/{step_id}/output/{filename:path}")
+def delete_step_output_file(name: str, step_id: str, filename: str, user: dict = Depends(get_current_user)):
+    """Delete one current-step result from local disk and Supabase Storage."""
+    folder_map = {
+        "1": "step1_extraction", "1.5": "step1_extraction", "1.6": "step1_extraction",
+        "2": "step2_qcm", "3": "step3_metadata", "4": "step4_format",
+        "5": "step5_json", "6": "step6_corrections", "7": "step7_categories", "8": "step8_matches",
+    }
+    folder_name = folder_map.get(step_id, f"step{step_id}")
+    relative = Path(filename)
+    if relative.is_absolute() or ".." in relative.parts or not filename.strip():
+        raise HTTPException(status_code=400, detail="Invalid output filename")
+
+    step_dir = Path(f"/app/output/{user['id']}/{name}/{folder_name}")
+    file_path = step_dir / relative
+    try:
+        file_path.resolve().relative_to(step_dir.resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid output filename")
+
+    deleted_local = False
+    if file_path.exists():
+        if not file_path.is_file():
+            raise HTTPException(status_code=400, detail="Only files can be deleted")
+        file_path.unlink()
+        deleted_local = True
+
+    storage_path = f"{user['id']}/{name}/{folder_name}/{relative.as_posix()}"
+    if not deleted_local:
+        try:
+            if not file_exists(storage_path):
+                raise HTTPException(status_code=404, detail="File not found")
+        except HTTPException:
+            raise
+        except Exception:
+            # Storage availability errors should not make an existing local
+            # delete look successful; there was no local file in this branch.
+            raise HTTPException(status_code=404, detail="File not found")
+    try:
+        delete_prefix(storage_path)
+    except Exception as e:
+        if not deleted_local:
+            raise HTTPException(status_code=404, detail="File not found")
+        print(f"[DELETE] Storage delete failed for {storage_path}: {e}")
+
+    try:
+        row = _latest_step_result_row(user["id"], name, step_id)
+        if row and row.get("file_manifest") and row.get("id"):
+            manifest = [
+                entry for entry in row["file_manifest"]
+                if entry.get("path") != relative.as_posix()
+            ]
+            get_supabase().table("step_results").update({"file_manifest": manifest}).eq(
+                "id", row["id"]
+            ).execute()
+    except Exception as e:
+        print(f"[DELETE] Manifest update failed: {e}")
+
+    return {"status": "deleted", "filename": relative.as_posix()}
+
 @app.get("/projects/{name}/steps/{step_id}/output/{filename:path}")
 def get_step_file_content(name: str, step_id: str, filename: str, user: dict = Depends(get_current_user)):
     _SFMAP = {
@@ -2943,20 +3004,20 @@ def open_in_google_sheets(name: str, step_id: str, body: dict, user: dict = Depe
 # meta_folder:  where /open-sheets wrote _sheets_meta.json (matches _SFMAP)
 # json_folder:   where the canonical JSON lives (relative to project output dir)
 # json_name:     the canonical JSON filename downstream steps read
-# xlsx_prefix:   prefix for the regenerated timestamped xlsx
+# xlsx_kind:     stable result filename kind
 _SYNC_STEP_CONFIG = {
     "6": {
         "meta_folder": "step6_corrections",
         "json_folder": "step6_corrections",
         "json_name": "corrected_qcms.json",
-        "xlsx_prefix": "corrected_qcms",
+        "xlsx_kind": "corrections",
         "sibling": "2",
     },
     "2": {
         "meta_folder": "step2_qcm",
         "json_folder": "step2_qcm/accepted",
         "json_name": "all_qcms.json",
-        "xlsx_prefix": "merged_qcms",
+        "xlsx_kind": "qcms",
         "sibling": "6",
     },
 }
@@ -2973,6 +3034,7 @@ def sync_from_sheets(name: str, step_id: str, user: dict = Depends(get_current_u
     the 'Sync from Sheets' fallback button.
     """
     from modules.utils.xlsx_exporter import export_qcms_to_xlsx
+    from modules.utils.output_naming import result_xlsx_name
 
     cfg = _SYNC_STEP_CONFIG.get(step_id)
     if not cfg:
@@ -2982,7 +3044,7 @@ def sync_from_sheets(name: str, step_id: str, user: dict = Depends(get_current_u
     meta_folder = cfg["meta_folder"]
     json_folder = cfg["json_folder"]
     json_name = cfg["json_name"]
-    xlsx_prefix = cfg["xlsx_prefix"]
+    xlsx_kind = cfg["xlsx_kind"]
 
     # 1. Look up the Google Sheet ID from _sheets_meta.json
     meta_local_path = Path(f"/app/output/{user_id}/{name}/{meta_folder}/_sheets_meta.json")
@@ -3100,9 +3162,24 @@ def sync_from_sheets(name: str, step_id: str, user: dict = Depends(get_current_u
     except Exception as e:
         print(f"[SYNC{step_id}] JSON storage upload failed: {e}")
 
-    # 8. Regenerate a fresh timestamped xlsx so the file list stays consistent
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-    xlsx_path = local_json_dir / f"{xlsx_prefix}_{timestamp}.xlsx"
+    # 8. Regenerate the same stable workbook so Google Sheets edits update it.
+    project_meta_path = Path(f"/app/output/{user_id}/{name}/project.json")
+    pdf_stem = "source"
+    try:
+        project_meta = json.loads(project_meta_path.read_text(encoding="utf-8"))
+        original_name = project_meta.get("pdf_filename") or project_meta.get("pdf_name")
+        if original_name:
+            from pathlib import PurePath
+            import re as _re
+            pdf_stem = _re.sub(
+                r"[^A-Za-z0-9._-]+", "_", PurePath(str(original_name)).stem
+            ).strip("._") or "source"
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+    count = len(new_qcms) if xlsx_kind == "qcms" else sum(
+        1 for qcm in new_qcms if str(qcm.get("Correct", "")).strip()
+    )
+    xlsx_path = local_json_dir / result_xlsx_name(xlsx_kind, count, pdf_stem)
     try:
         export_qcms_to_xlsx(new_qcms, xlsx_path)
         try:

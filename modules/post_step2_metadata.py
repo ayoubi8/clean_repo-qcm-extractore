@@ -198,9 +198,9 @@ def run_post_step2_metadata(tracker, context, user_id: str, project: str,
                 print(f"[AUTO-ENRICH] ✅ Copied merged_qcms.json → step2_qcm/accepted/")
             xlsx_src_str = build.get("step5", {}).get("xlsx_file", "")
             if xlsx_src_str and Path(xlsx_src_str).exists():
-                xlsx_dst = Path(step2_accepted) / "merged_qcms.xlsx"
+                xlsx_dst = Path(step2_accepted) / Path(xlsx_src_str).name
                 shutil.copy2(xlsx_src_str, xlsx_dst)
-                print(f"[AUTO-ENRICH] ✅ Copied merged_qcms.xlsx → step2_qcm/accepted/")
+                print(f"[AUTO-ENRICH] ✅ Copied {xlsx_dst.name} → step2_qcm/accepted/")
         except Exception as copy_e:
             print(f"[AUTO-ENRICH] ⚠️ Failed to surface merged result into step2 output: {copy_e}")
     elif status == "no_qcms":

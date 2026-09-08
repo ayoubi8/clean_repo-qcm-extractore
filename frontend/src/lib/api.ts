@@ -413,6 +413,19 @@ export async function fetchStepOutput(projectName: string, stepId: string): Prom
   return res.json()
 }
 
+// DELETE /projects/{name}/steps/{stepId}/output/{filename}
+export async function deleteStepOutput(projectName: string, stepId: string, filename: string): Promise<void> {
+  const encodedFilename = filename.split('/').map(encodeURIComponent).join('/')
+  const res = await fetchWithRefresh(
+    `${BASE}/projects/${encodeURIComponent(projectName)}/steps/${encodeURIComponent(stepId)}/output/${encodedFilename}`,
+    { method: 'DELETE', headers: { ...getAuthHeaders() } },
+  )
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+    throw new Error(data.detail || 'Failed to delete output')
+  }
+}
+
 // GET /projects/{name}/steps/{step_id}/output/{filename}
 export async function fetchStepFileContent(projectName: string, stepId: string, filename: string): Promise<any> {
   const encodedFilename = filename.split('/').map(encodeURIComponent).join('/')

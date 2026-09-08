@@ -1,7 +1,6 @@
 import json
 import os
 import re
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Any
 
@@ -11,6 +10,7 @@ from modules.document_processor import DocumentProcessor
 from modules.utils.cost_tracker import CostTracker
 from modules.utils.prompt_helper import PromptHelper
 from modules.utils.xlsx_exporter import export_qcms_to_xlsx
+from modules.utils.output_naming import pdf_stem_for_context, result_xlsx_name
 from modules.model_policy import get_model_pair
 
 class Step6Corrections:
@@ -229,9 +229,12 @@ class Step6Corrections:
 
         print(f"\n✅ corrected_qcms.json saved with {len(corrected_qcms)} entries.")
 
-        # Also export as XLSX — timestamped so each run creates a NEW file
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-        xlsx_path = output_dir / f"corrected_qcms_{timestamp}.xlsx"
+        corrected_count = sum(
+            1 for qcm in corrected_qcms if str(qcm.get("Correct", "")).strip()
+        )
+        xlsx_path = output_dir / result_xlsx_name(
+            "corrections", corrected_count, pdf_stem_for_context(self.context)
+        )
         export_qcms_to_xlsx(corrected_qcms, xlsx_path)
 
         return {"total": len(corrected_qcms), "file": str(output_path), "xlsx_file": str(xlsx_path)}

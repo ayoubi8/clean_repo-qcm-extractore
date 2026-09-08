@@ -1,6 +1,5 @@
 import json
 import os
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Any
 
@@ -9,6 +8,7 @@ from modules.utils.xlsx_exporter import export_qcms_to_xlsx
 from modules.deepseek_client import DeepSeekClient
 from modules.utils.file_manager import FileManager
 from modules.utils.cost_tracker import CostTracker
+from modules.utils.output_naming import pdf_stem_for_context, result_xlsx_name
 
 class Step5Builder:
     """Build final JSON by mapping Step 3 data to Step 4 template"""
@@ -80,9 +80,10 @@ class Step5Builder:
             
         print(f"\n✅ Merged JSON saved to {output_path}")
         
-        # Also export as XLSX — use a timestamped name so each run creates a NEW file
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-        xlsx_path = output_dir / f"merged_qcms_{timestamp}.xlsx"
+        # Keep one stable, human-readable workbook for the current result.
+        xlsx_path = output_dir / result_xlsx_name(
+            "qcms", len(final_qcms), pdf_stem_for_context(self.context)
+        )
         export_qcms_to_xlsx(final_qcms, xlsx_path)
         
         return {"total_qcms": len(final_qcms), "output_file": str(output_path), "xlsx_file": str(xlsx_path)}
