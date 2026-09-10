@@ -1,4 +1,5 @@
 import os
+import asyncio
 import base64
 import io
 import time
@@ -158,6 +159,96 @@ class OpenRouterClient:
                 print(f"Error calling OpenRouter (Attempt {attempt + 1}/{retries}): {e}")
                 if attempt < retries - 1:
                     time.sleep(backoff * (attempt + 1))
+                else:
+                    raise RuntimeError(f"Failed to get response from OpenRouter after {retries} attempts") from e
+        return {}
+
+    def _compose_messages(self, prompt: str, images: List[Image.Image] = None) -> List[Dict]:
+        """Build the chat messages payload shared by the sync and async paths."""
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": prompt,
+                        # OpenRouter Prompt Caching (Cost Opt #2)
+                        # Ensure static parts of the prompt are at the beginning
+                        # and effectively cached if supported by the model/provider
+                        "cache_control": {"type": "ephemeral"}
+                    }
+                ]
+            }
+        ]
+
+        if images:
+            for img in images:
+                base64_img = self._encode_image(img)
+                messages[0]["content"].append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{base64_img}"
+                    }
+                })
+        return messages
+
+    async def generate_completion_async(self, prompt: str, images: List[Image.Image] = None, max_tokens: int = 4000, model: str = None, temperature: float = 0.1) -> Dict[str, Any]:
+        """
+        Async mirror of generate_completion — same payload, headers, timeout and
+        retry policy, but using httpx.AsyncClient so many calls can run
+        concurrently on one event loop (used by the parallel CC checker).
+        The sync method is left untouched.
+        """
+        target_model = model if model else self.model
+
+        if not self.api_key:
+             raise ValueError("OPENROUTER_API_KEY is not set. Please check your .env file.")
+
+        messages = self._compose_messages(prompt, images)
+
+        payload = {
+            "model": target_model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature # Low temp for precise extraction (0.0 = deterministic verification)
+        }
+
+        retries = 3
+        backoff = 2
+
+        for attempt in range(retries):
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    response = await client.post(
+                        "https://openrouter.ai/api/v1/chat/completions",
+                        headers=self.headers,
+                        json=payload
+                    )
+
+                    if response.status_code != 200:
+                        error_msg = f"HTTP {response.status_code}: {response.text}"
+                        print(f"API Error (Attempt {attempt + 1}): {error_msg}")
+                        raise httpx.HTTPStatusError(error_msg, request=response.request, response=response)
+
+                    result = response.json()
+
+                    if 'error' in result:
+                         raise ValueError(f"OpenRouter API Error: {result['error']}")
+
+                    if 'choices' not in result or not result['choices']:
+                         raise ValueError("Empty response from API")
+
+                    usage = result.get('usage', {})
+                    return {
+                        "content": result['choices'][0]['message']['content'],
+                        "usage": usage,
+                        "cost": usage.get('cost', 0.0)  # Real cost from OpenRouter API
+                    }
+
+            except Exception as e:
+                print(f"Error calling OpenRouter (Attempt {attempt + 1}/{retries}): {e}")
+                if attempt < retries - 1:
+                    await asyncio.sleep(backoff * (attempt + 1))
                 else:
                     raise RuntimeError(f"Failed to get response from OpenRouter after {retries} attempts") from e
         return {}

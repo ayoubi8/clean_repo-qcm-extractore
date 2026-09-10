@@ -16,6 +16,8 @@ re-runs so the new QCMs get enriched. To force full re-enrichment, delete the
 `step3_metadata/accepted/` folder before re-running Step 2.
 """
 import json
+import time
+import traceback
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -24,6 +26,25 @@ from modules.post_step3_build import run_post_step3_build
 from modules.clinical_case_checker import run_clinical_case_checker
 from modules.hint_detector import run_hint_detection
 from modules.cas_text_split import run_cas_text_split
+
+
+def _trace(stage: str, event: str, elapsed_ms: int = None, detail: str = ""):
+    """Single-line greppable cascade marker. Print-only, no DB, no side effects.
+
+    Stages: guard | hint | cas_split | step3 | checker | build | copyback | cascade
+    Events: START | END | ERROR | SKIP
+    A "stuck after Step 2" repro = find the last START with no matching END.
+    """
+    parts = f"[CASCADE-TRACE] stage={stage} event={event}"
+    if elapsed_ms is not None:
+        parts += f" elapsed_ms={elapsed_ms}"
+    if detail:
+        parts += f" detail={detail}"
+    print(parts, flush=True)
+
+
+def _now_ms() -> int:
+    return int(time.monotonic() * 1000)
 
 
 # Default Step 3 config used when the /steps/2/run caller does not send one.
@@ -147,11 +168,18 @@ def run_post_step2_metadata(tracker, context, user_id: str, project: str,
     print("\n" + "=" * 60)
     print("POST-STEP-2 AUTO-ENRICH  (Step 3 metadata + Step 4-5 build)")
     print("=" * 60)
+    cascade_t0 = _now_ms()
+    _trace("cascade", "START")
 
     # 1. Guard: nothing to do if Step 2 produced no accepted QCMs.
+    _trace("guard", "START")
+    guard_t0 = _now_ms()
     if not _accepted_qcms_exist(context):
+        _trace("guard", "END", _now_ms() - guard_t0, "no_accepted_qcms")
+        _trace("cascade", "END", _now_ms() - cascade_t0, "no_qcms")
         print("[AUTO-ENRICH] No accepted QCMs found after Step 2 — skipping cascade.")
         return {"status": "no_qcms", "step3": "skipped"}
+    _trace("guard", "END", _now_ms() - guard_t0, "accepted_qcms_present")
 
     # 1.5 Phase 3 — Hint detection (always-on, no toggle, no strategy gate):
     #     parse trailing A(1+2)-style hint blocks out of Step 2 propositions
@@ -160,12 +188,17 @@ def run_post_step2_metadata(tracker, context, user_id: str, project: str,
     #     sees clean propositions. Pure Python (no LLM). Soft-fail: a hint
     #     error never blocks the cascade.
     hint_result: Dict = {"status": "not_run"}
+    _trace("hint", "START")
+    hint_t0 = _now_ms()
     try:
         hint_result = run_hint_detection(context)
+        _trace("hint", "END", _now_ms() - hint_t0,
+               f"status={hint_result.get('status')}")
     except Exception as e:
-        import traceback
         traceback.print_exc()
         hint_result = {"status": "error", "detail": str(e)}
+        _trace("hint", "ERROR", _now_ms() - hint_t0,
+               f"{type(e).__name__}: {e}")
         print(f"[HINT] ⚠️ ERROR: Hint detection failed: {e} — continuing without hints.")
 
     # 1.6 Phase 4 — Cas column split: remove the clinical-case narrative from
@@ -173,19 +206,26 @@ def run_post_step2_metadata(tracker, context, user_id: str, project: str,
     #     Unconditional (keyed on data presence: QCMs without `cas` are
     #     skipped), idempotent, soft-fail: never blocks the cascade.
     cas_split_result: Dict = {"status": "not_run"}
+    _trace("cas_split", "START")
+    cas_t0 = _now_ms()
     try:
         cas_split_result = run_cas_text_split(context)
+        _trace("cas_split", "END", _now_ms() - cas_t0,
+               f"status={cas_split_result.get('status')}")
     except Exception as e:
-        import traceback
         traceback.print_exc()
         cas_split_result = {"status": "error", "detail": str(e)}
+        _trace("cas_split", "ERROR", _now_ms() - cas_t0,
+               f"{type(e).__name__}: {e}")
         print(f"[CAS-SPLIT] ⚠️ ERROR: Cas split failed: {e} — continuing with unscrubbed text.")
 
     # 2. Step 3 (metadata) — skip only if Step 3 already enriched the SAME
     #    uid-set as the current all_qcms.json (Q8 fast-path). If Step 2 grew
     #    (e.g. re-run added new QCMs), Step 3 re-runs so the new QCMs get
     #    enriched — otherwise they'd silently bypass metadata and the merge.
+    step3_t0 = _now_ms()
     if _step3_covers_current_step2(context):
+        _trace("step3", "SKIP", _now_ms() - step3_t0, "q8_fast_path_uid_sets_equal")
         print("[AUTO-ENRICH] Step 3 accepted metadata already covers the current "
               "Step 2 QCM set — skipping Step 3 (Q8 fast-path). To force "
               "re-enrichment, delete step3_metadata/accepted/ before re-running "
@@ -201,6 +241,7 @@ def run_post_step2_metadata(tracker, context, user_id: str, project: str,
                     if p.strip().isdigit()]
         print(f"[AUTO-ENRICH] Running Step 3 (metadata) — "
               f"fields={list(fields.keys())}, global_pages={gp_list}")
+        _trace("step3", "START", detail=f"llm_run fields={list(fields.keys())} global_pages={gp_list}")
         try:
             Step3Metadata(tracker, context).run(
                 auto_mode=True,
@@ -208,9 +249,12 @@ def run_post_step2_metadata(tracker, context, user_id: str, project: str,
                 global_pages=gp_list,
             )
             step3_status = "done"
+            _trace("step3", "END", _now_ms() - step3_t0, "status=done")
         except Exception as e:
-            import traceback
             traceback.print_exc()
+            _trace("step3", "ERROR", _now_ms() - step3_t0,
+                   f"{type(e).__name__}: {e}")
+            _trace("cascade", "END", _now_ms() - cascade_t0, "stage=step3_error")
             print(f"[AUTO-ENRICH] ⚠️ Step 3 failed: {e}")
             return {"status": "error", "stage": "step3", "detail": str(e),
                     "hint": hint_result, "cas_split": cas_split_result}
@@ -225,25 +269,38 @@ def run_post_step2_metadata(tracker, context, user_id: str, project: str,
     cc_check: Dict = {"status": "not_enabled"}
     if _clinical_case_enabled(step3_config):
         print("[AUTO-ENRICH] Clinical Case Checker (per_group) — verification pass...")
+        _trace("checker", "START")
+        cc_t0 = _now_ms()
         try:
             cc_check = run_clinical_case_checker(tracker, context)
+            _trace("checker", "END", _now_ms() - cc_t0,
+                   f"status={cc_check.get('status')}")
         except Exception as e:
-            import traceback
             traceback.print_exc()
             cc_check = {"status": "error", "detail": str(e)}
+            _trace("checker", "ERROR", _now_ms() - cc_t0,
+                   f"{type(e).__name__}: {e}")
             print(f"[CC-CHECK] ⚠️ ERROR: Clinical Case Checker failed: {e} — case links "
                   "were NOT verified. The build continues with unverified data. Fix the "
                   "CC Checker model (Settings) and re-run Step 2.")
+    else:
+        _trace("checker", "SKIP", 0, "clinical_case_strategy_not_per_group")
 
     # 3. Chain the already-shipped Step 4+5 auto-build. run_post_step3_build
     # internally checks for accepted Step3 QCMs and returns {"status":"no_qcms"}
     # when absent — we propagate that.
     print("[AUTO-ENRICH] Chaining Step 4+5 auto-build (run_post_step3_build)...")
+    _trace("build", "START")
+    build_t0 = _now_ms()
     try:
         build = run_post_step3_build(tracker, context, user_id, project)
+        _trace("build", "END", _now_ms() - build_t0,
+               f"status={build.get('status')}")
     except Exception as e:
-        import traceback
         traceback.print_exc()
+        _trace("build", "ERROR", _now_ms() - build_t0,
+               f"{type(e).__name__}: {e}")
+        _trace("cascade", "END", _now_ms() - cascade_t0, "stage=build_error")
         print(f"[AUTO-ENRICH] ⚠️ Step 4+5 build failed: {e}")
         return {"status": "error", "stage": "build", "detail": str(e),
                 "step3": step3_status}
@@ -259,6 +316,8 @@ def run_post_step2_metadata(tracker, context, user_id: str, project: str,
         # user sees extraction results but not the metadata-enriched final
         # output (merged_qcms.xlsx) because the OutputViewer endpoint maps
         # step "2" → step2_qcm/ only.
+        _trace("copyback", "START")
+        copy_t0 = _now_ms()
         try:
             import shutil
             step2_accepted = context.get_path("step2_qcm", "accepted")
@@ -274,11 +333,18 @@ def run_post_step2_metadata(tracker, context, user_id: str, project: str,
                 shutil.copy2(xlsx_src_str, xlsx_dst)
                 print(f"[AUTO-ENRICH] ✅ Copied {xlsx_dst.name} → step2_qcm/accepted/")
         except Exception as copy_e:
+            _trace("copyback", "ERROR", _now_ms() - copy_t0,
+                   f"{type(copy_e).__name__}: {copy_e}")
             print(f"[AUTO-ENRICH] ⚠️ Failed to surface merged result into step2 output: {copy_e}")
+        else:
+            _trace("copyback", "END", _now_ms() - copy_t0, "surfaced")
     elif status == "no_qcms":
+        _trace("copyback", "SKIP", 0, "build_no_qcms")
         print("[AUTO-ENRICH] Step 4+5 build skipped (no accepted metadata).")
     else:
+        _trace("copyback", "SKIP", 0, f"build_status={status}")
         print(f"[AUTO-ENRICH] Step 4+5 build reported status={status}")
 
+    _trace("cascade", "END", _now_ms() - cascade_t0, f"status={status}")
     return {"status": status, "step3": step3_status, "hint": hint_result,
             "cas_split": cas_split_result, "cc_check": cc_check, "build": build}

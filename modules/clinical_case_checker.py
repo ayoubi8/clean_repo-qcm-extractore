@@ -7,22 +7,36 @@ consecutive QCMs (deterministic propagation in step3_metadata.py
 _propagate_cas_clinique). This module adds the Phase 1 verification pass:
 
     a cheap/fast model double-checks every QCM in every cascaded chain —
-    one simple verification question per QCM, chain by chain, starting from
-    the first QCM that has an attached clinical case text.
+    one simple verification question per QCM, chains in PARALLEL
+    (asyncio, max CC_CHECKER_MAX_PARALLEL concurrent, default 5),
+    QCMs strictly sequential WITHIN each chain.
 
-Decision policy (Phase 1):
+Decision policy (spec clinical_case_checker.md §6-§7):
     - Verified (applies=true)  -> the QCM keeps its cascaded `cas` text.
-    - Rejected (applies=false) -> the `cas` field is removed from that QCM
-      ONLY (unlinked); the rest of the chain is untouched.
+    - Single NO (applies=false) -> PROVISIONAL: the link is kept until the
+      next verdict confirms (second NO) or refutes (YES + §7 re-check) it.
+    - Two consecutive NOs      -> the case CLOSES at the QCM before the
+      first NO (CC_CHECKER_EARLY_STOP=1, default on); every QCM from the
+      first NO onward is unlinked with ZERO further LLM calls for that
+      chain, and that chain's task ends.
+    - §7 re-check              -> a lone NO followed by YES marks the NO
+      suspicious; it is re-verified once (case context + the YES question).
+      A confirmed NO unlinks that QCM only; a re-check YES keeps the link;
+      a re-check failure keeps the link (never a rejection).
     - LLM failure              -> the decision stays "unresolved"; the linkage
       is KEPT (a technical failure is never silently converted into a
-      rejection). If every verification call fails, the run is flagged
-      "error" (data left unverified) but never modifies the QCM data.
+      rejection). Unresolved verdicts neither confirm nor reset the
+      consecutive-NO counter. If every verification call fails, the run is
+      flagged "error" (data left unverified) but never modifies the QCM data.
 
 Model configuration is external to the business logic (spec §30):
     CC_CHECKER_MODEL           primary model  (cheap/fast, e.g. mercury)
     CC_CHECKER_FALLBACK_MODEL  fallback model
     CC_CHECKER_MAX_TOKENS      tiny JSON response budget (default 500)
+    CC_CHECKER_MAX_PARALLEL    max chains verified concurrently (default 5)
+    CC_CHECKER_EARLY_STOP      1 (default) = two-consecutive-NO boundary rule;
+                               0 = legacy per-QCM unlink, still parallel
+                               across chains
 
 Audit / idempotency: results are written to
     step3_metadata/clinical_case_verification.json
@@ -30,9 +44,12 @@ Audit / idempotency: results are written to
 of the cascade skips verification when the previous audit covers the exact
 same uid set (mirrors the Q8 fast-path in post_step2_metadata).
 """
+import asyncio
 import json
 import os
 import re
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -42,6 +59,7 @@ from modules.openrouter_client import OpenRouterClient
 VERIFICATION_FILENAME = "clinical_case_verification.json"
 DEFAULT_CC_MODEL = "inception/mercury-2.5-preview"
 DEFAULT_CC_FALLBACK = "google/gemini-2.0-flash-lite-001"
+DEFAULT_CC_MAX_PARALLEL = 5
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -183,14 +201,51 @@ def _parse_verdict(content: str) -> Optional[Dict]:
         return None
 
 
-def _verify_one(client: OpenRouterClient, tracker, qcm: Dict, cas: str,
-                primary_model: str, fallback_model: str, max_tokens: int) -> Dict:
-    """One simple verification request for one QCM. Primary then fallback.
+def _recheck_prompt(cas: str, suspicious_qcm: Dict, next_qcm: Dict) -> str:
+    """Spec §7 re-check prompt: one provisional NO followed by a YES.
+
+    Decides ONLY for QCM A (the provisional NO). QCM B (the confirmed YES
+    right after it) is shown as context evidence.
+    """
+    label, narrative = _split_cas(cas)
+    a_text = suspicious_qcm.get("text") or suspicious_qcm.get("Text") or "(no question text)"
+    b_text = next_qcm.get("text") or next_qcm.get("Text") or "(no question text)"
+    return f"""You are re-checking one judgment about a multiple-choice question (QCM) and a clinical case.
+
+QCM A below was provisionally judged NOT to belong to the clinical case, but the
+QCM immediately after it (QCM B) WAS judged to belong. One of the two judgments
+may be wrong. Decide ONLY for QCM A, using the definition exactly.
+
+DEFINITION — apply it exactly:
+A QCM belongs to the clinical case only when the information contained in that
+case is necessary or materially useful to answer the QCM correctly. If the QCM
+can be answered correctly without using the case-specific information, it does
+NOT belong — even if it deals with the same medical subject.
+
+CLINICAL CASE — {label}:
+{narrative}
+
+QCM A (provisional NO — judge this one):
+{a_text}
+
+PROPOSITIONS A:
+{_render_propositions(suspicious_qcm)}
+
+QCM B (confirmed YES — context only, do NOT judge it):
+{b_text}
+
+Reply with ONE line of JSON only — no markdown, no explanation:
+{{"applies": true, "confidence": 0.9}}"""
+
+
+async def _ask_verdict_async(client: OpenRouterClient, tracker, prompt: str,
+                             primary_model: str, fallback_model: str,
+                             max_tokens: int) -> Dict:
+    """One verdict request (any prompt shape). Primary then fallback.
     Returns {"status": "ok", ...verdict, "model"} or {"status": "unresolved"}."""
-    prompt = _verification_prompt(cas, qcm)
     for model in [primary_model, fallback_model]:
         try:
-            resp = client.generate_completion(
+            resp = await client.generate_completion_async(
                 prompt, model=model, max_tokens=max_tokens, temperature=0.0
             )
             verdict = _parse_verdict(resp.get("content", ""))
@@ -204,6 +259,15 @@ def _verify_one(client: OpenRouterClient, tracker, qcm: Dict, cas: str,
             print(f"[CC-CHECK] ⚠️ Verification call failed ({model}): {e}")
             continue
     return {"status": "unresolved"}
+
+
+async def _verify_one_async(client: OpenRouterClient, tracker, qcm: Dict, cas: str,
+                            primary_model: str, fallback_model: str,
+                            max_tokens: int) -> Dict:
+    """One simple verification request for one QCM. Primary then fallback."""
+    return await _ask_verdict_async(
+        client, tracker, _verification_prompt(cas, qcm),
+        primary_model, fallback_model, max_tokens)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -225,11 +289,242 @@ def _verification_covers(step3_dir: Path, current_uids: set) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Parallel chain verification (async)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _verify_chain_async(chain_index: int, chain: Dict,
+                              entries: List[Tuple[Path, Dict]],
+                              client: OpenRouterClient, tracker,
+                              primary_model: str, fallback_model: str,
+                              max_tokens: int, early_stop: bool) -> Dict:
+    """Verify ONE chain, QCM by QCM in document order.
+
+    Early-stop state machine (spec §6-§7, active when early_stop=True):
+      - YES                    -> keep link, reset consecutive_no. A pending
+                                  provisional NO triggers one §7 re-check.
+      - first NO               -> PROVISIONAL: link kept, counter = 1.
+      - second NO (no YES in between; unresolved verdicts neither confirm
+        nor reset)             -> CLOSE: unlink from the first NO onward with
+                                  ZERO further LLM calls, end this chain.
+      - unresolved             -> link kept, counter untouched.
+      - chain ends on a pending NO -> the decisive verdict is confirmed
+                                  (unlink that QCM only, legacy parity).
+    With early_stop=False the legacy per-QCM behavior applies (every
+    applies=false unlinks that QCM immediately, all QCMs verified).
+
+    File writes are NOT done here — corrections are applied to the in-memory
+    QCM dicts and the caller persists files after gather (single-threaded).
+    """
+    label, narrative = _split_cas(chain["cas"])
+    items = chain["items"]
+    first_q = entries[chain["first_index"]][1]
+    last_q = entries[chain["last_index"]][1]
+    preview = narrative[:70].replace("\n", " ") + ("..." if len(narrative) > 70 else "")
+    print(f"\n  [CC-CHECK] [CAS {chain_index}] {label} — {len(items)} QCM(s) "
+          f"(Q{first_q.get('number', '?')} p.{first_q.get('page', '?')} → "
+          f"Q{last_q.get('number', '?')} p.{last_q.get('page', '?')})")
+    print(f"  [CC-CHECK]   Case: \"{preview}\"")
+
+    decisions: List[Dict] = []
+    cstats = {"verified": 0, "kept": 0, "unlinked": 0, "unresolved": 0,
+              "corrections": 0, "rechecked": 0}
+    consecutive_no = 0
+    suspicious = None  # {"pos", "entry_idx", "decision"} — provisional NO
+    closed_early = False
+    early_stop_reason = None
+    closed_at_entry_idx = None
+    last_member_entry_idx = None
+    llm_calls_made = 0
+    llm_calls_saved = 0
+
+    def _base_decision(pos: int, entry_idx: int) -> Dict:
+        _f, _q = entries[entry_idx]
+        return {
+            "uid": _q.get("uid"), "page": _q.get("page"), "number": _q.get("number"),
+            "chain": chain_index, "case_label": label,
+            "entry_idx": entry_idx, "pos": pos,
+            "status": "pending", "corrected": False,
+            "provisional": False, "rechecked": False, "after_close": False,
+        }
+
+    def _unlink(decision: Dict) -> None:
+        decision["corrected"] = True
+        cstats["unlinked"] += 1
+        cstats["corrections"] += 1
+
+    for pos, entry_idx in enumerate(items):
+        _f, qcm = entries[entry_idx]
+        print(f"[CC-CHECK] Verifying chain {chain_index} — "
+              f"QCM {pos + 1}/{len(items)} (Q{qcm.get('number', '?')} "
+              f"p.{qcm.get('page', '?')}) ...")
+
+        verdict = await _verify_one_async(client, tracker, qcm, chain["cas"],
+                                          primary_model, fallback_model, max_tokens)
+        llm_calls_made += 1
+        decision = _base_decision(pos, entry_idx)
+        decision["status"] = verdict["status"]
+
+        if verdict["status"] != "ok":
+            # Technical failure is never a rejection — and it neither
+            # confirms a pending NO nor resets the consecutive counter.
+            cstats["unresolved"] += 1
+            print("     ⚠️ unresolved — link kept (technical failure, not a rejection)")
+            decisions.append(decision)
+            continue
+
+        cstats["verified"] += 1
+        decision["applies"] = verdict["applies"]
+        decision["confidence"] = verdict.get("confidence")
+        decision["model"] = verdict.get("model")
+
+        if verdict["applies"]:
+            cstats["kept"] += 1
+            conf = f" ({verdict.get('confidence'):.2f})" if verdict.get("confidence") is not None else ""
+            print(f"     ✅ belongs{conf} — keeps the clinical case")
+            consecutive_no = 0
+            if suspicious is not None and early_stop:
+                # Spec §7: lone NO followed by YES → re-check the suspicious QCM.
+                s_entry_idx = suspicious["entry_idx"]
+                _sf, s_qcm = entries[s_entry_idx]
+                s_decision = suspicious["decision"]
+                print(f"     ↩️ §7 re-check: Q{s_qcm.get('number', '?')} "
+                      f"(provisional NO followed by YES) ...")
+                recheck = await _ask_verdict_async(
+                    client, tracker,
+                    _recheck_prompt(chain["cas"], s_qcm, qcm),
+                    primary_model, fallback_model, max_tokens)
+                llm_calls_made += 1
+                cstats["rechecked"] += 1
+                s_decision["rechecked"] = True
+                if recheck["status"] == "ok" and recheck["applies"] is False:
+                    # Provisional NO confirmed — unlink that QCM only.
+                    _unlink(s_decision)
+                    print(f"     ❌ §7 re-check confirms Q{s_qcm.get('number', '?')} "
+                          f"does NOT belong — link removed (that QCM only)")
+                elif recheck["status"] == "ok":
+                    print(f"     ✅ §7 re-check: Q{s_qcm.get('number', '?')} actually "
+                          f"belongs — provisional NO was a model error, link kept")
+                else:
+                    # Re-check failed technically → keep the link and downgrade
+                    # to unresolved (a failure is never a rejection).
+                    s_decision["status"] = "unresolved"
+                    s_decision.pop("applies", None)
+                    s_decision.pop("confidence", None)
+                    s_decision.pop("model", None)
+                    cstats["verified"] -= 1
+                    cstats["unresolved"] += 1
+                    print("     ⚠️ §7 re-check failed technically — link kept (needs attention)")
+                suspicious = None
+            decisions.append(decision)
+            continue
+
+        # applies == false
+        if not early_stop:
+            # Flag off: legacy per-QCM behavior — unlink immediately.
+            _unlink(decision)
+            print("     ❌ does NOT belong — clinical case link removed (unlinked)")
+            decisions.append(decision)
+            continue
+
+        if consecutive_no >= 1 and suspicious is not None:
+            # Two consecutive NOs (no YES between) → CLOSE the case at the
+            # QCM *before* the first NO. Unlink from the first NO onward.
+            closed_early = True
+            early_stop_reason = "two_consecutive_no"
+            first_no_pos = suspicious["pos"]
+            closed_at_entry_idx = suspicious["entry_idx"]
+            last_member_entry_idx = items[first_no_pos - 1] if first_no_pos > 0 else None
+            s_decision = suspicious["decision"]
+            s_decision["provisional"] = True
+            _unlink(s_decision)
+            decision["provisional"] = True
+            _unlink(decision)
+            decisions.append(decision)
+            tail = items[pos + 1:]
+            llm_calls_saved = len(tail)
+            for t_pos, t_entry_idx in enumerate(tail, start=pos + 1):
+                t_dec = _base_decision(t_pos, t_entry_idx)
+                t_dec["status"] = "unlinked_by_boundary"
+                t_dec["after_close"] = True
+                _unlink(t_dec)
+                decisions.append(t_dec)
+            print(f"     ⛔ Two consecutive NOs — case closed before "
+                  f"Q{entries[suspicious['entry_idx']][1].get('number', '?')}; "
+                  f"{len(tail)} remaining QCM(s) unlinked without LLM calls")
+            suspicious = None
+            break
+
+        # First NO of a potential pair → PROVISIONAL (spec §6.2), link kept.
+        consecutive_no = 1
+        decision["provisional"] = True
+        suspicious = {"pos": pos, "entry_idx": entry_idx, "decision": decision}
+        print("     ❓ provisional NO — link kept pending next verdict (§6.2)")
+        decisions.append(decision)
+
+    # Chain ended on a pending provisional NO with nothing after it: the
+    # verdict was decisive, so confirm it (unlink that QCM only — legacy parity).
+    if suspicious is not None and not closed_early:
+        _unlink(suspicious["decision"])
+        _sf, _sq = entries[suspicious["entry_idx"]]
+        print(f"     ❌ End of chain: pending NO confirmed — "
+              f"Q{_sq.get('number', '?')} link removed (that QCM only)")
+
+    # Apply corrections to the in-memory QCM dicts (shared references with
+    # file_data — the caller writes the files back after gather).
+    for d in decisions:
+        if d.get("corrected"):
+            _ef, _eq = entries[d["entry_idx"]]
+            _eq.pop("cas", None)
+
+    return {
+        "chain_index": chain_index, "label": label, "items": items,
+        "decisions": decisions, "stats": cstats,
+        "closed_early": closed_early, "early_stop_reason": early_stop_reason,
+        "last_member_entry_idx": last_member_entry_idx,
+        "closed_at_entry_idx": closed_at_entry_idx,
+        "llm_calls_made": llm_calls_made, "llm_calls_saved": llm_calls_saved,
+        "elapsed_ms": None,  # filled by the gather wrapper
+    }
+
+
+async def _verify_all_chains_async(chains: List[Dict],
+                                   entries: List[Tuple[Path, Dict]],
+                                   client: OpenRouterClient, tracker,
+                                   primary_model: str, fallback_model: str,
+                                   max_tokens: int, max_parallel: int,
+                                   early_stop: bool) -> List[Dict]:
+    """Run every chain as its own task, at most max_parallel concurrently."""
+    semaphore = asyncio.Semaphore(max(1, int(max_parallel)))
+    print(f"[CC-CHECK] Parallel verification: {len(chains)} chain(s), "
+          f"max {max_parallel} concurrent, early_stop={'on' if early_stop else 'off'}")
+
+    async def _bounded(ci: int, chain: Dict) -> Dict:
+        async with semaphore:
+            t0 = time.monotonic()
+            res = await _verify_chain_async(ci, chain, entries, client, tracker,
+                                            primary_model, fallback_model,
+                                            max_tokens, early_stop)
+            res["elapsed_ms"] = int((time.monotonic() - t0) * 1000)
+            return res
+
+    return list(await asyncio.gather(
+        *(_bounded(ci, c) for ci, c in enumerate(chains, 1))))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Orchestration entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_clinical_case_checker(tracker, context) -> Dict:
     """Verify every cascaded clinical-case link with a cheap/fast model.
+
+    Chains are verified in PARALLEL (asyncio, max CC_CHECKER_MAX_PARALLEL
+    concurrent chains, default 5); QCMs stay sequential WITHIN each chain so
+    the two-consecutive-NO boundary rule (spec §6.3, CC_CHECKER_EARLY_STOP=1
+    by default) can close a chain early.
+
+    Sync entry point — safe to call from a plain thread (the cascade's
+    executor worker) or from an event-loop thread (isolated worker thread).
 
     Must run after Step 3 wrote step3_metadata/accepted/*.json and before the
     Step 4/5 build consumes them. Corrections (unlinks) are written back into
@@ -276,63 +571,59 @@ def run_clinical_case_checker(tracker, context) -> Dict:
     fallback_model = os.getenv("CC_CHECKER_FALLBACK_MODEL", DEFAULT_CC_FALLBACK)
     max_tokens     = int(os.getenv("CC_CHECKER_MAX_TOKENS") or "500")
     print(f"[CC-CHECK] Model: {primary_model} (fallback: {fallback_model})")
-    print(f"[CC-CHECK] {len(chains)} clinical case chain(s) over "
-          f"{sum(len(c['items']) for c in chains)} QCMs — verifying QCM by QCM...")
 
     client = OpenRouterClient()
+    try:
+        max_parallel = max(1, int(os.getenv("CC_CHECKER_MAX_PARALLEL")
+                                  or DEFAULT_CC_MAX_PARALLEL))
+    except (TypeError, ValueError):
+        max_parallel = DEFAULT_CC_MAX_PARALLEL
+    early_stop = (os.getenv("CC_CHECKER_EARLY_STOP", "1") != "0")
+    print(f"[CC-CHECK] {len(chains)} clinical case chain(s) over "
+          f"{sum(len(c['items']) for c in chains)} QCMs — verifying chains in "
+          f"parallel (max {max_parallel}), QCMs sequential within each chain...")
 
+    _gather_kwargs = dict(
+        chains=chains, entries=entries, client=client, tracker=tracker,
+        primary_model=primary_model, fallback_model=fallback_model,
+        max_tokens=max_tokens, max_parallel=max_parallel, early_stop=early_stop)
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # Normal path: the cascade runs in an executor thread with no loop.
+        chain_results = asyncio.run(_verify_all_chains_async(**_gather_kwargs))
+    else:
+        # Already on an event-loop thread: isolate in a private thread with
+        # its own loop so loops are never nested. The tracker is only
+        # touched from that worker thread while this thread waits.
+        _box: Dict[str, Any] = {}
+
+        def _worker() -> None:
+            _box["res"] = asyncio.run(_verify_all_chains_async(**_gather_kwargs))
+
+        _wt = threading.Thread(target=_worker, daemon=True)
+        _wt.start()
+        _wt.join()
+        chain_results = _box["res"]
+
+    # Merge (single-threaded): decisions, stats, per-chain close markers.
     decisions: List[Dict] = []
     stats = {"chains": len(chains), "verified": 0, "kept": 0,
-             "unlinked": 0, "unresolved": 0, "corrections": 0}
-
-    for ci, chain in enumerate(chains, 1):
-        label, narrative = _split_cas(chain["cas"])
-        first_q = entries[chain["first_index"]][1]
-        last_q = entries[chain["last_index"]][1]
-        preview = narrative[:70].replace("\n", " ") + ("..." if len(narrative) > 70 else "")
-        print(f"\n  [CC-CHECK] [CAS {ci}] {label} — {len(chain['items'])} QCM(s) "
-              f"(Q{first_q.get('number', '?')} p.{first_q.get('page', '?')} → "
-              f"Q{last_q.get('number', '?')} p.{last_q.get('page', '?')})")
-        print(f"  [CC-CHECK]   Case: \"{preview}\"")
-
-        for qi, entry_idx in enumerate(chain["items"], 1):
-            q_file, qcm = entries[entry_idx]
-            print(f"[CC-CHECK] Verifying chain {ci}/{len(chains)} — "
-                  f"QCM {qi}/{len(chain['items'])} (Q{qcm.get('number', '?')} "
-                  f"p.{qcm.get('page', '?')}) ...")
-
-            verdict = _verify_one(client, tracker, qcm, chain["cas"],
-                                  primary_model, fallback_model, max_tokens)
-            decision = {
-                "uid": qcm.get("uid"),
-                "page": qcm.get("page"),
-                "number": qcm.get("number"),
-                "chain": ci,
-                "case_label": label,
-                "status": verdict["status"],
-                "corrected": False,
-            }
-
-            if verdict["status"] == "ok":
-                stats["verified"] += 1
-                decision["applies"] = verdict["applies"]
-                decision["confidence"] = verdict.get("confidence")
-                decision["model"] = verdict.get("model")
-                if verdict["applies"]:
-                    stats["kept"] += 1
-                    conf = f" ({verdict.get('confidence'):.2f})" if verdict.get("confidence") is not None else ""
-                    print(f"     ✅ belongs{conf} — keeps the clinical case")
-                else:
-                    stats["unlinked"] += 1
-                    stats["corrections"] += 1
-                    decision["corrected"] = True
-                    qcm.pop("cas", None)  # unlink: this QCM only
-                    print(f"     ❌ does NOT belong — clinical case link removed (unlinked)")
-            else:
-                stats["unresolved"] += 1
-                print(f"     ⚠️ unresolved — link kept (technical failure, not a rejection)")
-
-            decisions.append(decision)
+             "unlinked": 0, "unresolved": 0, "corrections": 0,
+             "closed_early_chains": 0, "llm_calls_made": 0, "llm_calls_saved": 0,
+             "rechecked": 0}
+    for cr in chain_results:
+        decisions.extend(cr["decisions"])
+        for _k in ("verified", "kept", "unlinked", "unresolved",
+                   "corrections", "rechecked"):
+            stats[_k] += cr["stats"][_k]
+        stats["llm_calls_made"] += cr["llm_calls_made"]
+        stats["llm_calls_saved"] += cr["llm_calls_saved"]
+        if cr["closed_early"]:
+            stats["closed_early_chains"] += 1
+            print(f"[CC-CHECK] ⛔ Chain {cr['chain_index']} closed early "
+                  f"(two consecutive NOs) — {cr['llm_calls_saved']} LLM call(s) "
+                  f"saved in {cr['elapsed_ms']} ms")
 
     # Write corrected files back (only the ones where a QCM was unlinked).
     corrected_uids = {d["uid"] for d in decisions if d.get("corrected")}
@@ -352,6 +643,9 @@ def run_clinical_case_checker(tracker, context) -> Dict:
     print(f"  Kept:             {stats['kept']}")
     print(f"  Unlinked:         {stats['unlinked']}  (wrong links corrected)")
     print(f"  Unresolved:       {stats['unresolved']}  (links kept, need attention)")
+    print(f"  Closed early:     {stats['closed_early_chains']}  (two-consecutive-NO boundary)")
+    print(f"  LLM calls:        {stats['llm_calls_made']} made, {stats['llm_calls_saved']} saved by early stop")
+    print(f"  Re-checked (§7):  {stats['rechecked']}")
     print(f"  Model:            {primary_model}")
     print("═" * 60)
 
@@ -359,20 +653,28 @@ def run_clinical_case_checker(tracker, context) -> Dict:
     # glob-reads as QCM lists; the folder-wide Storage upload still persists it).
     audit = {
         "run_ts": datetime.now().isoformat(),
-        "strategy": "per_qcm_cascade",
+        "strategy": "per_qcm_cascade_parallel",
+        "mode": {"max_parallel": max_parallel, "early_stop": early_stop},
         "model": primary_model,
         "fallback_model": fallback_model,
         "uid_set": sorted(u for u in current_uids if u is not None),
         "stats": stats,
         "chains": [
             {
-                "index": i,
-                "label": _split_cas(c["cas"])[0],
-                "size": len(c["items"]),
-                "first_uid": entries[c["first_index"]][1].get("uid"),
-                "last_uid": entries[c["last_index"]][1].get("uid"),
+                "index": cr["chain_index"],
+                "label": cr["label"],
+                "size": len(cr["items"]),
+                "first_uid": entries[chains[cr["chain_index"] - 1]["first_index"]][1].get("uid"),
+                "last_uid": entries[chains[cr["chain_index"] - 1]["last_index"]][1].get("uid"),
+                "closed_early": cr["closed_early"],
+                "early_stop_reason": cr["early_stop_reason"],
+                "last_member_index": cr["last_member_entry_idx"],
+                "closed_at_index": cr["closed_at_entry_idx"],
+                "llm_calls_made": cr["llm_calls_made"],
+                "llm_calls_saved": cr["llm_calls_saved"],
+                "elapsed_ms": cr["elapsed_ms"],
             }
-            for i, c in enumerate(chains, 1)
+            for cr in chain_results
         ],
         "decisions": decisions,
     }
