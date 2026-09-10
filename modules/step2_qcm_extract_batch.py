@@ -185,7 +185,7 @@ class Step2QCMExtractBatch:
         """
         
         # Pull extraction guidance if provided in config
-        guidance = "- If metadata markers (e.g. year ->YYYY, subcategory **bold**) appear before a question, extract them into 'year' and 'subcategory' fields."
+        guidance = "- If metadata markers (e.g. year ->YYYY) appear before a question, extract them into the 'year' field."
         if config and "qcm_extraction" in config and "extraction_guidance" in config["qcm_extraction"]:
             guidance = config["qcm_extraction"]["extraction_guidance"]
 
@@ -204,6 +204,20 @@ class Step2QCMExtractBatch:
                 "Otherwise omit this field entirely."
             )
             cc_hint_format = '\n    "clinical_case_hint": "CAS CLINIQUE 1"  (only if a Cas Clinique precedes this QCM)'
+
+        # Phase 3: hint-block preservation (always on). A question may end with
+        # answer-combination lines like "A(1+2+3)" (capital letter A-E followed
+        # by numbers in parentheses, one per line, right after the last
+        # proposition). Keep them VERBATIM as the final lines of proposition
+        # "e" — do not merge them into the proposition text, do not reformat
+        # them, and do not drop them. The deterministic hint detector parses
+        # and removes them downstream.
+        hint_rule = (
+            "- If the question ends with answer-combination lines like \"A(1+2+3)\" "
+            "(a capital letter A-E followed by numbers in parentheses, one per line, "
+            "right after the last proposition), reproduce them VERBATIM as the final "
+            "lines of proposition \"e\"."
+        )
 
         # Build previous-page QCM number context (single lean line, empty if first page)
         prev_numbers_block = ""
@@ -229,10 +243,11 @@ IMPORTANT RULES:
 - If a QCM spans two pages (question on one page, propositions on the next), assign it to the page where the QUESTION TEXT begins.
 - QCMs may span across page breaks — merge split QCMs but assign to the page of the question text.
 - Preserve visible question numbers EXACTLY. If a question number is missing or cropped, use the PREVIOUS PAGE QCM NUMBERS above to assign the correct sequential number.
-- Extract all propositions (a, b, c, d, e).
+- Propositions may be labeled with LETTERS (A, B, C, D, E) or with NUMBERS (1, 2, 3, 4, 5) in the source — handle BOTH labeling styles the same way. Always output propositions keyed "a"-"e" in order, mapping a=1, b=2, c=3, d=4, e=5: label "1" and label "A" both go to the "a" field, label "2" and "B" both go to "b", and so on. Never invent a "1"-"5" key in the output.
 - Do NOT include Answer Key tables in the output.
 {guidance}
 {cc_hint_rule}
+{hint_rule}
 
 OUTPUT FORMAT (JSON array):
 [
@@ -247,12 +262,12 @@ OUTPUT FORMAT (JSON array):
       "d": "Fourth proposition",
       "e": "Fifth proposition"
     }},
-    "year": "2024",
-    "subcategory": "Example Subcategory"{cc_hint_format}
+    "year": "2024"{cc_hint_format}
   }}
 ]
 ("page" is REQUIRED for every QCM — read it from the `=== PAGE X ===` marker before the question.)
-(year, subcategory{', clinical_case_hint' if cc_hint_enabled else ''} are optional, include only if detected.)
+(propositions are ALWAYS keyed "a"-"e" in the output, regardless of whether the source labels them A-E or 1-5.)
+(year{', clinical_case_hint' if cc_hint_enabled else ''} are optional, include only if detected.)
 
 Return ONLY the JSON array, no markdown, no explanation.
 """
@@ -425,12 +440,60 @@ Return ONLY the JSON array, no markdown, no explanation.
         print(f"[ERROR] No JSON found in response. Preview ({len(cleaned)} chars): {preview}")
         return []
     
+    # Phase 5 — proposition labeling: sources may label propositions with
+    # letters (A-E) or numbers (1-5); both styles route to the same columns
+    # (a=1, b=2, c=3, d=4, e=5).
+    _PROP_KEY_MAP = {
+        "1": "a", "2": "b", "3": "c", "4": "d", "5": "e",
+        "A": "a", "B": "b", "C": "c", "D": "d", "E": "e",
+    }
+
+    @staticmethod
+    def _normalize_proposition_keys(props):
+        """Route numeric (1-5) and uppercase (A-E) proposition keys onto the
+        canonical lowercase a-e columns, in canonical order.
+
+        Values are preserved; an existing canonical lowercase key wins over
+        its equivalents; unknown keys (e.g. "f", "6") pass through untouched
+        — no data loss. Non-dict input passes through as-is.
+        """
+        if not isinstance(props, dict):
+            return props
+        collected = {}
+        # Pass 1 — canonical lowercase keys first (letters win on collision).
+        for key, val in props.items():
+            k = str(key).strip()
+            if k in ("a", "b", "c", "d", "e"):
+                collected[k] = val
+        # Pass 2 — fill free canonical slots from numeric/uppercase equivalents.
+        for key, val in props.items():
+            k = str(key).strip()
+            canon = Step2QCMExtractBatch._PROP_KEY_MAP.get(k)
+            if canon and canon not in collected:
+                collected[canon] = val
+        # Pass 3 — unknown keys pass through untouched (no data loss).
+        for key, val in props.items():
+            k = str(key).strip()
+            if k not in collected and k not in Step2QCMExtractBatch._PROP_KEY_MAP:
+                collected[key] = val
+        # Assemble in canonical a-e order, unknowns appended after.
+        result = {}
+        for letter in ("a", "b", "c", "d", "e"):
+            if letter in collected:
+                result[letter] = collected[letter]
+        for key, val in collected.items():
+            if key not in result:
+                result[key] = val
+        return result
+
     def _sanitize_qcms(self, qcms: List[Dict]) -> List[Dict]:
         """
         Ensure every QCM has integer 'page' and 'number' fields.
         Converts None / missing / non-numeric values to 0 to prevent
         TypeError during sorted() comparisons.
         Also warns when number is missing so unusual LLM output is visible.
+        Phase 5: proposition keys are normalized onto canonical a-e
+        (numeric 1-5 and uppercase A-E equivalents both route correctly).
         """
         for qcm in qcms:
             raw_num = qcm.get('number')
@@ -442,6 +505,8 @@ Return ONLY the JSON array, no markdown, no explanation.
                 qcm['number'] = safe_num
             if raw_page is None or not isinstance(raw_page, int):
                 qcm['page'] = self._safe_int(raw_page, default=0)
+            if isinstance(qcm.get('propositions'), dict):
+                qcm['propositions'] = self._normalize_proposition_keys(qcm['propositions'])
         return qcms
 
     @staticmethod

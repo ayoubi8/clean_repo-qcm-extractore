@@ -21,7 +21,7 @@ class AIMetadataDetector:
         
         Args:
             text: Text to analyze (from page 1 or specified pages)
-            fields: List of fields to detect ['Year', 'Source', 'Category', 'Subcategory']
+            fields: List of fields to detect ['Year', 'Source', 'Category']
             
         Returns:
             {
@@ -48,7 +48,6 @@ INSTRUCTIONS:
 - "category": the canonical module name from VALID MODULES BY LEVEL (exactly as written). null if unknown.
 - "year": the START year of any "YYYY/YYYY" pair (e.g. "2025/2026" -> "2025"). Plain 4-digit year stays as-is.
 - "source": derive per RULES — "Externat {{faculty}}" if category matched, else "Residanat {{faculty}}". null if faculty unknown.
-- "subcategory": specific topic if present, else null.
 - "faculty": the matched faculty from VALID FACULTIES (intermediate field, used to derive source).
 
 Return ONLY JSON:
@@ -56,7 +55,6 @@ Return ONLY JSON:
   "year": {{"value": "2024", "confidence": 0.95}},
   "source": {{"value": "Externat Oran", "confidence": 0.88}},
   "category": {{"value": "Cardiologie", "confidence": 0.92}},
-  "subcategory": {{"value": null, "confidence": 0.0}},
   "faculty": {{"value": "Oran", "confidence": 0.9}}
 }}
 
@@ -152,8 +150,7 @@ If a field is not found or ambiguous, use null with confidence 0.0.
         mapping = {
             "year": "Year",
             "source": "Source",
-            "category": "Category",
-            "subcategory": "Subcategory"
+            "category": "Category"
         }
         
         for field, data in results.items():

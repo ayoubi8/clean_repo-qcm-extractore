@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { usePipelineStore } from '../../store/pipelineStore'
+import { usePipelineStore, isCcCheckerError } from '../../store/pipelineStore'
 import { StepId } from '../../types'
 import { Step1Config } from './configs/Step1Config'
 import { Step2_3Config } from './configs/Step2_3Config'
@@ -90,6 +90,7 @@ export function ConfigPanel() {
   const setStepOutputExists = usePipelineStore(s => s.setStepOutputExists)
   const appendLog = usePipelineStore(s => s.appendLog)
   const clearLog = usePipelineStore(s => s.clearLog)
+  const raiseCcAlert = usePipelineStore(s => s.raiseCcAlert)
   const activeProject = useAppStore(s => s.activeProject)
   const setPipelineStatus = useAppStore(s => s.setPipelineStatus)
   const store = usePipelineStore()
@@ -122,6 +123,7 @@ export function ConfigPanel() {
       }
       if (activeStep.id === 2) {
         const s = store.step2Config
+        const cc = store.step3Config.clinical_case_checker ?? { model: '', model_fallback: '' }
         config = {
           // Auto-Loop mode is the only mode now (single_batch removed). The
           // page_range pattern "{n}-{n}-{n}" makes Step2QCMExtractBatch.run
@@ -135,6 +137,12 @@ export function ConfigPanel() {
           // Step 3 config is embedded in the merged Step 2 panel and
           // forwarded to run_post_step2_metadata. Includes huge_edit flag.
           step3: store.step3Config,
+          // Phase 1 — Clinical Case Checker model pair, lifted to the top
+          // level (real_api._call_step reads it for CC_CHECKER_* env overrides).
+          clinical_case_checker: {
+            model_primary: cc.model,
+            model_fallback: cc.model_fallback,
+          },
         }
       }
       if (activeStep.id === 3) config = store.step3Config  // legacy: step 3 row removed, kept for safety
@@ -149,9 +157,16 @@ export function ConfigPanel() {
       await runStep(activeProject.name, activeStep.id, config)
       
       connectLogStream(
-        activeProject.name, 
-        activeStep.id, 
-        (line) => appendLog(line),
+        activeProject.name,
+        activeStep.id,
+        (line) => {
+          appendLog(line)
+          // Phase 1 — raise the persistent CC Checker alert on the backend's
+          // single error marker line (kept until the user dismisses it).
+          if (activeStep.id === 2 && isCcCheckerError(line?.text) && activeProject?.name) {
+            raiseCcAlert(activeProject.name, line.text)
+          }
+        },
         async () => {
           const status = await getStepStatus(activeProject.name, activeStep.id)
           setStepStatus(activeStep.id, status.status)

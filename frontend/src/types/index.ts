@@ -49,6 +49,13 @@ export interface MetaFieldConfig {
   strategy: MetaStrategy
   value: string | null
 }
+// Phase 1 — Clinical Case Checker (cheap/fast verification model).
+// Double-checks every cascaded Cas Clinique link, one question per QCM,
+// right after the metadata cascade. Independent from the Step 2/3 models.
+export interface CCCheckerConfig {
+  model: string
+  model_fallback: string
+}
 export interface Step3Config {
   model: string
   model_fallback: string
@@ -57,10 +64,10 @@ export interface Step3Config {
     year: MetaFieldConfig
     source: MetaFieldConfig
     category: MetaFieldConfig
-    subcategory: MetaFieldConfig
     clinical_case: MetaFieldConfig
   }
   global_pages: string
+  clinical_case_checker: CCCheckerConfig
 }
 
 export type CorrectionSource = 'page_text' | 'auto_detect'

@@ -31,7 +31,7 @@ export function AutoRunPanel({ onClose }: AutoRunPanelProps) {
     // Serialization logic — Step 3 now travels inside Step 2's config.
     const serializeStep3 = (c: any) => {
       const CODE_MAP: any = { skip: 'S', global: 'G', per_qcm: 'P', per_group: 'CC' }
-      const FIELD_MAP: any = { year: 'Year', source: 'Source', category: 'Category', subcategory: 'Subcategory', clinical_case: 'ClinicalCase' }
+      const FIELD_MAP: any = { year: 'Year', source: 'Source', category: 'Category', clinical_case: 'ClinicalCase' }
       const metaConfig: any = {}
       const globalValues: any = {}
       for (const [k, v] of Object.entries(c.fields) as any) {
@@ -60,6 +60,16 @@ export function AutoRunPanel({ onClose }: AutoRunPanelProps) {
     // merged Step 2 cascade will pick up step3 config from the store and
     // forward it via run_config.step2.step3.
     const step2InRange = store.startStep <= 2 && store.endStep >= 2
+
+    // Phase 1 — Clinical Case Checker model pair rides inside run_config.step2
+    // (real_api._call_step reads it for CC_CHECKER_* env overrides).
+    const cc = pipelineStore.step3Config.clinical_case_checker ?? { model: '', model_fallback: '' }
+    const ccCheckerConfig = {
+      clinical_case_checker: {
+        model_primary: cc.model,
+        model_fallback: cc.model_fallback,
+      },
+    }
 
     const payload = store.useYaml
       ? {
@@ -90,7 +100,7 @@ export function AutoRunPanel({ onClose }: AutoRunPanelProps) {
           use_folder_batch: false,
           run_config: {
             ...(step2InRange
-              ? { step2: { step3: serializeStep3(pipelineStore.step3Config) } }
+              ? { step2: { step3: serializeStep3(pipelineStore.step3Config), ...ccCheckerConfig } }
               : {}),
             ...(showStep6Pre ? { step6: serializeStep6(pipelineStore.step6Config) } : {}),
           }

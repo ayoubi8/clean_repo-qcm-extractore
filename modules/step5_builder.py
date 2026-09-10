@@ -100,13 +100,15 @@ class Step5Builder:
             "Text": ["text", "Text", "question", "questionText"],
             "Correct": ["correction", "Correct", "answer"],
             "categoryName": ["module", "categoryName", "module_detected"],
-            "subcategoryName": ["subcategory", "subcategoryName"],
             "tagSuggere": ["tagSuggere", "domain", "domain_tag"],
             "Year": ["year", "Year"],
             "Source": ["source", "Source"],
             "Tag": ["tag", "Tag"],
             # Cas Clinique — maps internal 'cas' field to template key 'Cas'
             "Cas": ["cas", "Cas", "clinical_case"],
+            # Phase 3 — Hint combos: internal 'hint' array to template key 'Hint'
+            # (dedicated Hint column right after proposition E in the XLSX).
+            "Hint": ["hint", "Hint"],
         }
         
         # Perform mapping for standard fields

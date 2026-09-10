@@ -98,9 +98,6 @@ metadata:
     category:
       strategy: "ai_detect"
       value: null
-    subcategory:
-      strategy: "skip"
-      value: null
   global_pages: [1]
 
 # Step 4: Format Template

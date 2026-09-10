@@ -1,4 +1,4 @@
-import { usePipelineStore } from '../../store/pipelineStore'
+import { usePipelineStore, isCcCheckerError } from '../../store/pipelineStore'
 import { StepState } from '../../types'
 import { runStep, stopStep, connectLogStream, getStepStatus, fetchAuthenticatedBlobUrl } from '../../lib/api'
 import { useAppStore } from '../../store/appStore'
@@ -41,6 +41,7 @@ export function StepRow({ step, isActive, onClick }: StepRowProps) {
   const setStepStatus = usePipelineStore(s => s.setStepStatus)
   const setStepOutputExists = usePipelineStore(s => s.setStepOutputExists)
   const appendLog = usePipelineStore(s => s.appendLog)
+  const raiseCcAlert = usePipelineStore(s => s.raiseCcAlert)
   const activeProject = useAppStore(s => s.activeProject)
   const setPipelineStatus = useAppStore(s => s.setPipelineStatus)
   
@@ -70,16 +71,32 @@ export function StepRow({ step, isActive, onClick }: StepRowProps) {
       if (step.id === 2) {
         // Merged Step 2: forward both extraction + metadata config.
         // Step 3 config rides along as `step3` sub-key for run_post_step2_metadata.
-        config = { ...store.step2Config, step3: store.step3Config }
+        // Phase 1: CC Checker model pair rides at the top level for
+        // real_api._call_step (CC_CHECKER_* env overrides).
+        const cc = store.step3Config.clinical_case_checker ?? { model: '', model_fallback: '' }
+        config = {
+          ...store.step2Config,
+          step3: store.step3Config,
+          clinical_case_checker: {
+            model_primary: cc.model,
+            model_fallback: cc.model_fallback,
+          },
+        }
       }
       if (step.id === 6) config = store.step6Config
 
       await runStep(activeProject.name, step.id, config)
       
       connectLogStream(
-        activeProject.name, 
-        step.id, 
-        (line) => appendLog(line),
+        activeProject.name,
+        step.id,
+        (line) => {
+          appendLog(line)
+          // Phase 1 — persistent CC Checker failure alert (Step 2 only)
+          if (step.id === 2 && isCcCheckerError(line?.text) && activeProject?.name) {
+            raiseCcAlert(activeProject.name, line.text)
+          }
+        },
         async () => {
           // On close, poll status
           const status = await getStepStatus(activeProject.name, step.id)

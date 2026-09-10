@@ -702,7 +702,7 @@ class Step8Matcher:
     @staticmethod
     def _slim(qcm: Dict) -> Dict:
         """Keep only essential display fields in match records."""
-        keys = ["Num", "Text", "A", "B", "C", "D", "E",
+        keys = ["Num", "Text", "Cas", "A", "B", "C", "D", "E",
                 "Correct", "Year", "subcategoryName", "categoryName",
                 "Tag", "Source"]
         return {k: qcm.get(k, qcm.get(k.lower(), "")) for k in keys}
@@ -1105,7 +1105,8 @@ class Step8Matcher:
             return
         # Determine the union of keys across rows, preserving insertion order
         # but giving common diagnostic columns priority.
-        priority_cols = ["Num", "Text", "A", "B", "C", "D", "E",
+        # Phase 4: Cas gets its own dedicated column right after Text.
+        priority_cols = ["Num", "Text", "Cas", "A", "B", "C", "D", "E",
                          "Correct", "Year", "categoryName", "subcategoryName",
                          "Tag", "Source"]
         seen: set = set()
@@ -1251,6 +1252,7 @@ class Step8Matcher:
             ("ID",           36),
             ("Num",          8),
             ("Question",     60),
+            ("Cas",          60),
             ("A",            30),
             ("B",            30),
             ("C",            30),
@@ -1314,6 +1316,7 @@ class Step8Matcher:
                 rec.get("qcm_id", ""),
                 src.get("Num", ""),
                 src.get("Text", ""),
+                src.get("Cas", ""),
                 src.get("A", ""),
                 src.get("B", ""),
                 src.get("C", ""),
@@ -1332,7 +1335,7 @@ class Step8Matcher:
                 ref.get("Year", "") if ref else "",
             ]
 
-            wrap_cols = {3, 17}  # Question, Ref Question
+            wrap_cols = {3, 4, 18}  # Question, Cas, Ref Question
             for ci, val in enumerate(row_values, start=1):
                 cell = ws.cell(row=ri, column=ci, value=val)
                 cell.fill      = row_fill

@@ -34,9 +34,11 @@ BORDER_THIN   = Border(
 
 # ── Preferred column order ──────────────────────────────────────────────────
 # Cas is included here so it appears right after Num when present.
+# Hint sits immediately after proposition E (Phase 3).
 # Any extra fields found in the QCM data are appended dynamically at the end.
 _PREFERRED_COLUMNS = [
     "Num", "Cas", "Text", "A", "B", "C", "D", "E",
+    "Hint",
     "Correct", "Exp",
     "categoryName", "tagSuggere", "subcategoryName",
     "Year", "Tag", "Type"
@@ -46,6 +48,7 @@ _PREFERRED_COLUMNS = [
 COL_WIDTHS = {
     "Num": 6, "Cas": 60, "Text": 60,
     "A": 40, "B": 40, "C": 40, "D": 40, "E": 40,
+    "Hint": 30,
     "Correct": 10, "Exp": 40,
     "categoryName": 25, "tagSuggere": 15, "subcategoryName": 35,
     "Year": 8, "Tag": 20, "Type": 8,

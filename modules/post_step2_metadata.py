@@ -21,6 +21,9 @@ from typing import Any, Dict, Optional
 
 from modules.step3_metadata import Step3Metadata
 from modules.post_step3_build import run_post_step3_build
+from modules.clinical_case_checker import run_clinical_case_checker
+from modules.hint_detector import run_hint_detection
+from modules.cas_text_split import run_cas_text_split
 
 
 # Default Step 3 config used when the /steps/2/run caller does not send one.
@@ -32,7 +35,6 @@ DEFAULT_STEP3_CONFIG: Dict[str, Any] = {
         "year":          {"strategy": "per_qcm",  "value": None},
         "source":        {"strategy": "skip",      "value": "Externat"},
         "category":      {"strategy": "global",    "value": None},
-        "subcategory":   {"strategy": "per_qcm",  "value": None},
         "clinical_case": {"strategy": "per_group", "value": None},
     },
     "global_pages": "1",
@@ -108,6 +110,27 @@ def _step3_covers_current_step2(context) -> bool:
     return s2_uids == s3_uids
 
 
+def _clinical_case_enabled(step3_config: Optional[Dict]) -> bool:
+    """True when the clinical-case cascade ("per_group") is toggled on.
+
+    Accepts both config shapes that reach this cascade:
+      - UI shape:        {"fields": {"clinical_case": {"strategy": "per_group"}}}
+      - Autorun shape:   {"config": {"ClinicalCase": "CC"}}
+    A missing/None config falls back to the DEFAULT_STEP3_CONFIG (per_group).
+    """
+    cfg = step3_config or DEFAULT_STEP3_CONFIG
+    try:
+        cc = (cfg.get("fields", {}) or {}).get("clinical_case")
+        if isinstance(cc, dict) and cc.get("strategy"):
+            return cc.get("strategy") == "per_group"
+        code = (cfg.get("config", {}) or {}).get("ClinicalCase")
+        if code:
+            return code == "CC"
+        return True  # no explicit setting → default (DEFAULT_STEP3_CONFIG = per_group)
+    except Exception:
+        return True
+
+
 def run_post_step2_metadata(tracker, context, user_id: str, project: str,
                             step3_config: Optional[Dict] = None) -> Dict:
     """Run Step 3 (metadata) then chain the Step 4+5 auto-build.
@@ -117,7 +140,7 @@ def run_post_step2_metadata(tracker, context, user_id: str, project: str,
     only performs the work and reports the result.
 
     Returns:
-        {"status": "ok",        "step3": "done|skipped", "build": {...}}
+        {"status": "ok",        "step3": "done|skipped", "hint": {...}, "cas_split": {...}, "cc_check": {...}, "build": {...}}
         {"status": "no_qcms",   "step3": "skipped"}        # Step 2 empty
         {"status": "error",     "stage": "step3|build", "detail": str}
     """
@@ -129,6 +152,34 @@ def run_post_step2_metadata(tracker, context, user_id: str, project: str,
     if not _accepted_qcms_exist(context):
         print("[AUTO-ENRICH] No accepted QCMs found after Step 2 — skipping cascade.")
         return {"status": "no_qcms", "step3": "skipped"}
+
+    # 1.5 Phase 3 — Hint detection (always-on, no toggle, no strategy gate):
+    #     parse trailing A(1+2)-style hint blocks out of Step 2 propositions
+    #     into `hint` arrays and scrub the raw lines — BEFORE Step 3, the
+    #     Phase-1 checker, and the Step 4/5 build, so every downstream stage
+    #     sees clean propositions. Pure Python (no LLM). Soft-fail: a hint
+    #     error never blocks the cascade.
+    hint_result: Dict = {"status": "not_run"}
+    try:
+        hint_result = run_hint_detection(context)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        hint_result = {"status": "error", "detail": str(e)}
+        print(f"[HINT] ⚠️ ERROR: Hint detection failed: {e} — continuing without hints.")
+
+    # 1.6 Phase 4 — Cas column split: remove the clinical-case narrative from
+    #     question text (it stays in `cas`/Cas only — never merged into Text).
+    #     Unconditional (keyed on data presence: QCMs without `cas` are
+    #     skipped), idempotent, soft-fail: never blocks the cascade.
+    cas_split_result: Dict = {"status": "not_run"}
+    try:
+        cas_split_result = run_cas_text_split(context)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        cas_split_result = {"status": "error", "detail": str(e)}
+        print(f"[CAS-SPLIT] ⚠️ ERROR: Cas split failed: {e} — continuing with unscrubbed text.")
 
     # 2. Step 3 (metadata) — skip only if Step 3 already enriched the SAME
     #    uid-set as the current all_qcms.json (Q8 fast-path). If Step 2 grew
@@ -161,7 +212,28 @@ def run_post_step2_metadata(tracker, context, user_id: str, project: str,
             import traceback
             traceback.print_exc()
             print(f"[AUTO-ENRICH] ⚠️ Step 3 failed: {e}")
-            return {"status": "error", "stage": "step3", "detail": str(e)}
+            return {"status": "error", "stage": "step3", "detail": str(e),
+                    "hint": hint_result, "cas_split": cas_split_result}
+
+    # 2.5 Phase 1 — Clinical Case Checker: verify every cascaded Cas Clinique
+    #     link with a cheap/fast model, one question per QCM, BEFORE the
+    #     Step 4/5 build consumes the `cas` fields. Runs only when the
+    #     clinical_case strategy is "per_group" (the togglable cascade).
+    #     Soft-fail: a checker error never blocks the build — the unverified
+    #     cascade data is kept and the [CC-CHECK] ⚠️ ERROR marker line below
+    #     raises a persistent alert in the frontend (dismissed only by click).
+    cc_check: Dict = {"status": "not_enabled"}
+    if _clinical_case_enabled(step3_config):
+        print("[AUTO-ENRICH] Clinical Case Checker (per_group) — verification pass...")
+        try:
+            cc_check = run_clinical_case_checker(tracker, context)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            cc_check = {"status": "error", "detail": str(e)}
+            print(f"[CC-CHECK] ⚠️ ERROR: Clinical Case Checker failed: {e} — case links "
+                  "were NOT verified. The build continues with unverified data. Fix the "
+                  "CC Checker model (Settings) and re-run Step 2.")
 
     # 3. Chain the already-shipped Step 4+5 auto-build. run_post_step3_build
     # internally checks for accepted Step3 QCMs and returns {"status":"no_qcms"}
@@ -208,4 +280,5 @@ def run_post_step2_metadata(tracker, context, user_id: str, project: str,
     else:
         print(f"[AUTO-ENRICH] Step 4+5 build reported status={status}")
 
-    return {"status": status, "step3": step3_status, "build": build}
+    return {"status": status, "step3": step3_status, "hint": hint_result,
+            "cas_split": cas_split_result, "cc_check": cc_check, "build": build}

@@ -9,6 +9,11 @@ import { LogLine } from '../../types'
 function getLogLineStyle(text: string): string {
   if (/✅|^\[OK\]|\[SUCCESS\]/.test(text))             return 'text-green-400'
   if (/❌|\[ERROR\]/.test(text))                        return 'text-red-400'
+  // Phase 1 — Clinical Case Checker lines (must sit ABOVE the generic ⚠️
+  // rule so the checker's error marker gets error styling, not warning).
+  if (/\[CC-CHECK\].*ERROR/.test(text))                 return 'text-error font-bold'
+  if (/\[CC-CHECK\]/.test(text))                        return 'text-tertiary'
+  if (/📊 CLINICAL CASE VERIFICATION SUMMARY/.test(text)) return 'text-tertiary font-bold'
   if (/⚠️|\[WARN\]/.test(text))                        return 'text-yellow-400'
   if (/📦\s*Chunk|🔁\s*AUTO/.test(text))               return 'text-primary font-bold'
   if (/💾|\[SAVE\]/.test(text))                         return 'text-primary'

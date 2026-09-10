@@ -14,16 +14,33 @@ interface PipelineStore {
   step6Config: Step6Config
   step8Config: Step8Config
 
+  // Phase 1 — persistent Clinical Case Checker failure alerts, keyed by
+  // project name. Survives reloads (persisted); cleared ONLY by an explicit
+  // user click (dismissCcAlert) — never automatically.
+  ccAlerts: Record<string, { ts: string; text: string }>
+
   setStepStatus: (id: StepId, s: StepStatus) => void
   setStepOutputExists: (id: StepId, exists: boolean) => void
   setActiveStep: (id: StepId) => void
   appendLog: (line: LogLine) => void
   clearLog: () => void
+  raiseCcAlert: (project: string, text: string) => void
+  dismissCcAlert: (project: string) => void
   setStep1Config: (c: Partial<Step1Config>) => void
   setStep2Config: (c: Partial<Step2Config>) => void
   setStep3Config: (c: Partial<Step3Config>) => void
   setStep6Config: (c: Partial<Step6Config>) => void
   setStep8Config: (c: Partial<Step8Config>) => void
+}
+
+/**
+ * Matches the single error marker line emitted by the backend when the
+ * Clinical Case Checker fails (modules/clinical_case_checker.py +
+ * modules/post_step2_metadata.py soft-fail wrapper):
+ *   "[CC-CHECK] ⚠️ ERROR: ..."
+ */
+export function isCcCheckerError(text: unknown): boolean {
+  return typeof text === 'string' && text.includes('[CC-CHECK]') && text.includes('⚠️ ERROR')
 }
 
 // Steps 1.5, 1.6, 3, 4 & 5 are intentionally NOT listed here:
@@ -68,10 +85,12 @@ export const usePipelineStore = create<PipelineStore>()(
           year:           { strategy: 'per_qcm', value: null },
           source:         { strategy: 'skip',    value: 'Externat' },
           category:       { strategy: 'global',  value: null },
-          subcategory:    { strategy: 'per_qcm', value: null },
           clinical_case:  { strategy: 'per_group', value: null }
         },
-        global_pages: '1'
+        global_pages: '1',
+        // Phase 1 — Clinical Case Checker model pair (seeded from
+        // CC_CHECKER_MODEL / CC_CHECKER_FALLBACK_MODEL by Step2_3Config).
+        clinical_case_checker: { model: '', model_fallback: '' }
       },
       step6Config: {
         source: 'auto_detect',
@@ -100,6 +119,8 @@ export const usePipelineStore = create<PipelineStore>()(
         self_scan: false,
       },
 
+      ccAlerts: {},
+
       setStepStatus: (id, s) => set((state) => ({
         steps: state.steps.map(st => st.id === id ? { ...st, status: s } : st)
       })),
@@ -109,6 +130,17 @@ export const usePipelineStore = create<PipelineStore>()(
       setActiveStep: (id) => set({ activeStepId: id }),
       appendLog: (line) => set((state) => ({ logLines: [...state.logLines, line] })),
       clearLog: () => set({ logLines: [] }),
+      raiseCcAlert: (project, text) => set((state) => ({
+        ccAlerts: {
+          ...state.ccAlerts,
+          [project]: { ts: new Date().toLocaleTimeString(), text }
+        }
+      })),
+      dismissCcAlert: (project) => set((state) => {
+        const next = { ...state.ccAlerts }
+        delete next[project]
+        return { ccAlerts: next }
+      }),
       setStep1Config: (c) => set((state) => ({ step1Config: { ...state.step1Config, ...c } })),
       setStep2Config: (c) => set((state) => ({ step2Config: { ...state.step2Config, ...c } })),
       setStep3Config: (c) => set((state) => ({ step3Config: { ...state.step3Config, ...c } })),
@@ -124,6 +156,8 @@ export const usePipelineStore = create<PipelineStore>()(
           step3Config: state.step3Config,
           step6Config: state.step6Config,
           step8Config: state.step8Config,
+          // Persistent until explicitly dismissed by click (Phase 1 CC alert)
+          ccAlerts: state.ccAlerts,
         }),
         migrate: (persisted: any) => {
           if (!persisted) return persisted
@@ -169,9 +203,26 @@ export const usePipelineStore = create<PipelineStore>()(
             if (s8.self_scan === undefined) s8.self_scan = false
             persisted = { ...persisted, step8Config: s8 }
           }
+          // v8->v9: Phase 1 — Clinical Case Checker model pair joins
+          // step3Config, and persistent CC failure alerts (ccAlerts) join
+          // the persisted state.
+          if (persisted.step3Config) {
+            const s3 = { ...persisted.step3Config }
+            if (!s3.clinical_case_checker) s3.clinical_case_checker = { model: '', model_fallback: '' }
+            persisted = { ...persisted, step3Config: s3 }
+          }
+          if (!persisted.ccAlerts) persisted = { ...persisted, ccAlerts: {} }
+          // v9->v10: Phase 2 — Subcategory removed from the Metadata Strategy
+          // entirely. Delete any persisted subcategory field so no dead
+          // "Subcategory … Skip" cycle row renders for old sessions.
+          if (persisted.step3Config?.fields) {
+            const fields = { ...persisted.step3Config.fields }
+            delete fields.subcategory
+            persisted = { ...persisted, step3Config: { ...persisted.step3Config, fields } }
+          }
           return persisted
         },
-        version: 8,
+        version: 10,
       }
   )
 )

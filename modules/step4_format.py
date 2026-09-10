@@ -79,7 +79,6 @@ class Step4Format:
             "Correct": {"desc": "Correct Answer (e.g. ABC)", "default": True, "key": "Correct"},
             "Year": {"desc": "Exam Year", "default": True, "key": "Year"},
             "Category": {"desc": "Medical Module", "default": True, "key": "categoryName"},
-            "Subcategory": {"desc": "Specific Course/Topic", "default": False, "key": "subcategoryName"},
             "Source": {"desc": "University/Origin", "default": False, "key": "Source"},
             "Tag": {"desc": "Combined [Source, Year]", "default": True, "key": "Tag"},
             "ClinicalCase": {"desc": "Cas Clinique narrative linked to QCM", "default": False, "key": "Cas"},
@@ -105,7 +104,6 @@ class Step4Format:
         if selected["Correct"]: new_template["Correct"] = "ABC"
         if selected["Year"]: new_template["Year"] = "2024"
         if selected["Category"]: new_template["categoryName"] = "Cardiologie"
-        if selected["Subcategory"]: new_template["subcategoryName"] = "HTA"
         if selected["Source"]: new_template["Source"] = "Alger"
         if selected["Tag"]: new_template["Tag"] = ["Alger", "2024"]
         if selected["ClinicalCase"]: new_template["Cas"] = "CAS CLINIQUE 1\r\nPatient narrative..."

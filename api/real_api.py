@@ -2155,6 +2155,14 @@ def _call_step(step_id: str, tracker, context, config: dict, cancel_check=None):
         if config.get("model_fallback"):
             os.environ["STEP2_FALLBACK_MODEL"] = config["model_fallback"]
             os.environ["STEP3_FALLBACK_MODEL"] = config["model_fallback"]
+        # Phase 1 — Clinical Case Checker (verification pass inside the
+        # Step 2 auto-enrich cascade). Independent from the Step 2/3 models
+        # so a cheap/fast verifier can be configured (e.g. mercury).
+        cc_cfg = config.get("clinical_case_checker", {}) or {}
+        if cc_cfg.get("model_primary"):
+            os.environ["CC_CHECKER_MODEL"] = cc_cfg["model_primary"]
+        if cc_cfg.get("model_fallback"):
+            os.environ["CC_CHECKER_FALLBACK_MODEL"] = cc_cfg["model_fallback"]
     if step_id == "3":
         if config.get("model"):
             os.environ["STEP3_MODEL"] = config["model"]
@@ -2220,7 +2228,6 @@ def _call_step(step_id: str, tracker, context, config: dict, cancel_check=None):
         if fields.get("Correct",      True):  tmpl["Correct"]      = "ABC"
         if fields.get("Year",         True):  tmpl["Year"]         = "2024"
         if fields.get("Category",     True):  tmpl["categoryName"] = "Cardiologie"
-        if fields.get("Subcategory",  False): tmpl["subcategoryName"] = "HTA"
         if fields.get("Source",       False): tmpl["Source"]       = "Alger"
         if fields.get("Tag",          True):  tmpl["Tag"]          = ["Alger", "2024"]
         if fields.get("ClinicalCase", False): tmpl["Cas"]          = "CAS CLINIQUE 1\r\nNarrative..."
@@ -2531,6 +2538,7 @@ def get_step_models(user: dict = Depends(get_current_user)):
         "step1_6": {"primary": env.get("STEP1_6_MODEL"), "fallback": env.get("STEP1_6_FALLBACK_MODEL")},
         "step2":   {"primary": env.get("STEP2_MODEL"),   "fallback": env.get("STEP2_FALLBACK_MODEL")},
         "step3":   {"primary": env.get("STEP3_MODEL"),   "fallback": env.get("STEP3_FALLBACK_MODEL")},
+        "clinical_case_checker": {"primary": env.get("CC_CHECKER_MODEL"), "fallback": env.get("CC_CHECKER_FALLBACK_MODEL")},
         "step6":   {
             "text_model":         env.get("STEP6_TEXT_MODEL"),
             "text_fallback":      env.get("STEP6_TEXT_FALLBACK_MODEL"),

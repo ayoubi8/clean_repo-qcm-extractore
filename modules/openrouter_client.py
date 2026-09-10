@@ -75,10 +75,13 @@ class OpenRouterClient:
         img_copy.convert('RGB').save(buffered, format=format, quality=65, optimize=True)
         return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
-    def generate_completion(self, prompt: str, images: List[Image.Image] = None, max_tokens: int = 4000, model: str = None) -> Dict[str, Any]:
+    def generate_completion(self, prompt: str, images: List[Image.Image] = None, max_tokens: int = 4000, model: str = None, temperature: float = 0.1) -> Dict[str, Any]:
         """
         Calls the OpenRouter API with the Vision model.
         Returns the full response object to allow access to usage stats.
+        temperature defaults to 0.1 (existing behavior); callers that need
+        deterministic yes/no judgments (e.g. the Clinical Case Checker) pass
+        temperature=0.0 explicitly.
         """
         target_model = model if model else self.model
         
@@ -115,7 +118,7 @@ class OpenRouterClient:
             "model": target_model,
             "messages": messages,
             "max_tokens": max_tokens,
-            "temperature": 0.1 # Low temp for precise extraction
+            "temperature": temperature # Low temp for precise extraction (0.0 = deterministic verification)
         }
 
         retries = 3

@@ -51,6 +51,11 @@ class Step3Metadata:
             normalized_config = {}
             fallback_map = {}
             for field, val in config.items():
+                # Phase 2 — Subcategory was removed completely. Drop it from
+                # any (legacy) payload so it can never re-enter the strategy set.
+                if field.lower() == "subcategory":
+                    continue
+
                 # Handle clinical_case specially (maps to internal key "ClinicalCase")
                 if field in ("clinical_case", "ClinicalCase"):
                     if isinstance(val, dict):
@@ -125,21 +130,19 @@ class Step3Metadata:
 
     def _get_metadata_config(self) -> Dict[str, str]:
         """Interactive menu: Global (G), Per-QCM (P), Skip (S), Cas Clinique (CC)."""
-        fields = ["Year", "Source", "Category", "Subcategory", "ClinicalCase"]
+        fields = ["Year", "Source", "Category", "ClinicalCase"]
         config = {
-            "Year": "P", 
-            "Source": "S", 
-            "Category": "G", 
-            "Subcategory": "S",
+            "Year": "P",
+            "Source": "S",
+            "Category": "G",
             "ClinicalCase": "S",
         }
-        
+
         # Each field has its own toggle cycle
         toggle_cycle = {
             "Year":         ["S", "G", "P"],
             "Source":       ["S", "G", "P"],
             "Category":     ["S", "G", "P"],
-            "Subcategory":  ["S", "G", "P"],
             "ClinicalCase": ["S", "CC", "G"],  # CC = Per-Group (detect per page)
         }
         mode_labels = {
@@ -623,14 +626,12 @@ DOCUMENT:
                 if not qcm.get("year")           and "Year" in global_values:     qcm["year"]           = global_values["Year"]
                 if not qcm.get("source")          and "Source" in global_values:   qcm["source"]         = global_values["Source"]
                 if not qcm.get("module_detected") and "Category" in global_values: qcm["module_detected"]= global_values["Category"]
-                if not qcm.get("subcategory")     and "Subcategory" in global_values: qcm["subcategory"] = global_values["Subcategory"]
-                
+
                 # 2. Per-QCM (batch level)
                 if not qcm.get("year")           and "Year" in batch_metadata:     qcm["year"]           = batch_metadata["Year"]
                 if not qcm.get("source")          and "Source" in batch_metadata:   qcm["source"]         = batch_metadata["Source"]
                 if not qcm.get("module_detected") and "Category" in batch_metadata: qcm["module_detected"]= batch_metadata["Category"]
-                if not qcm.get("subcategory")     and "Subcategory" in batch_metadata: qcm["subcategory"] = batch_metadata["Subcategory"]
-                
+
                 # 2.5 Fallbacks for Per-QCM fields still missing
                 if fallback_map:
                     if config.get("Year") == "P" and not qcm.get("year") and "Year" in fallback_map:
@@ -639,8 +640,6 @@ DOCUMENT:
                         qcm["source"] = fallback_map["Source"]
                     if config.get("Category") == "P" and not qcm.get("module_detected") and "Category" in fallback_map:
                         qcm["module_detected"] = fallback_map["Category"]
-                    if config.get("Subcategory") == "P" and not qcm.get("subcategory") and "Subcategory" in fallback_map:
-                        qcm["subcategory"] = fallback_map["Subcategory"]
                 
                 # 3. Cas Clinique (only for G strategy — CC is handled by propagation above)
                 if cc_strategy == "G" and global_cas:
@@ -880,7 +879,6 @@ INSTRUCTIONS:
 - "Category": the canonical module name from VALID MODULES BY LEVEL (exactly as written). null if unknown.
 - "Year": the START year of any "YYYY/YYYY" pair (e.g. "2025/2026" -> "2025"). Plain 4-digit year stays as-is.
 - "Source": derive per RULES — "Externat {{faculty}}" if Category matched, else "Residanat {{faculty}}". null if faculty unknown.
-- "Subcategory": specific topic if present, else null.
 - "faculty": the matched faculty from VALID FACULTIES (intermediate field, used to derive Source).
 If a field is not found or ambiguous, use null.
 """
@@ -923,7 +921,6 @@ If a field is not found or ambiguous, use null.
                     faculty = normalize_faculty(raw_fac) if raw_fac else None
                     data["Source"] = derive_source(data.get("Category"), faculty)
 
-                    # Subcategory passthrough — keep as-is (free-text topic).
                     # Drop the intermediate "faculty" key so it doesn't leak as a QCM field.
                     data.pop("faculty", None)
 

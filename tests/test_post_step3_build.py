@@ -57,7 +57,6 @@ def test_auto_build_produces_merged_qcms_with_template_xlsx_schema():
             "propositions": {"A": "alpha", "B": "beta", "C": "gamma", "D": "delta", "E": "epsilon"},
             "correction": "AB",
             "module": "Cardiologie",
-            "subcategory": "HTA",
             "year": 2024,
             "source": "Externat",
             "tag": ["Externat", "2024"],
