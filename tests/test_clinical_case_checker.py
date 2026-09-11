@@ -479,6 +479,43 @@ def _test_unresolved_between_no_still_closes():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _test_end_of_step_breakdown():
+    print("\n--- Test 13: end-of-step QCM/case breakdown in stats ---")
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        ctx = FakeContext(tmp)
+        _seed_step3(ctx, "page_1.json", [
+            {"uid": "1_1_0", "page": 1, "number": 1, "text": "Q1",
+             "cas": "CAS 1\r\nNarrative A"},
+            {"uid": "1_1_1", "page": 1, "number": 2, "text": "Q2",
+             "cas": "CAS 1\r\nNarrative A"},
+            {"uid": "1_1_2", "page": 2, "number": 3, "text": "Q3"},
+            {"uid": "1_1_3", "page": 3, "number": 4, "text": "Q4",
+             "cas": "CAS 2\r\nNarrative B"},
+            {"uid": "1_1_4", "page": 3, "number": 5, "text": "Q5",
+             "cas": "CAS 2\r\nNarrative B"},
+        ])
+        with patch("modules.clinical_case_checker.OpenRouterClient",
+                   return_value=_mock_client_by_question({})):
+            res = run_clinical_case_checker(CostTracker(), ctx)
+
+        assert res["status"] == "ok", res
+        stats = res["stats"]
+        assert stats["total_qcms"] == 5, stats
+        assert stats["total_cases"] == 2, stats
+        assert stats["qcms_with_case"] == 4, stats
+        assert stats["qcms_without_case"] == 1, stats
+        assert stats["kept"] == 4, stats
+        # Audit file carries the same distribution via stats.
+        audit = json.loads((ctx.get_path("step3_metadata") / VERIFICATION_FILENAME).read_text(encoding="utf-8"))
+        assert audit["stats"]["total_cases"] == 2
+        assert audit["stats"]["qcms_without_case"] == 1
+        assert len(audit["chains"]) == 2
+        print("✅ breakdown: 5 QCMs, 2 cases (2+2), 1 without case.")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _run_all():
     _test_parse_verdict_variants()
     _test_build_chains()
@@ -492,6 +529,7 @@ def _run_all():
     _test_parallel_cap_five()
     _test_early_stop_off_unlinks_immediately()
     _test_unresolved_between_no_still_closes()
+    _test_end_of_step_breakdown()
 
     print("\n" + "=" * 60)
     print("ALL clinical_case_checker TESTS PASSED")

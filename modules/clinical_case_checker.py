@@ -55,6 +55,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from modules.openrouter_client import OpenRouterClient
+from modules.cas_text_split import split_cas_from_text
 
 VERIFICATION_FILENAME = "clinical_case_verification.json"
 DEFAULT_CC_MODEL = "inception/mercury-2.5-preview"
@@ -322,8 +323,8 @@ async def _verify_chain_async(chain_index: int, chain: Dict,
     preview = narrative[:70].replace("\n", " ") + ("..." if len(narrative) > 70 else "")
     print(f"\n  [CC-CHECK] [CAS {chain_index}] {label} — {len(items)} QCM(s) "
           f"(Q{first_q.get('number', '?')} p.{first_q.get('page', '?')} → "
-          f"Q{last_q.get('number', '?')} p.{last_q.get('page', '?')})")
-    print(f"  [CC-CHECK]   Case: \"{preview}\"")
+          f"Q{last_q.get('number', '?')} p.{last_q.get('page', '?')})", flush=True)
+    print(f"  [CC-CHECK]   Case: \"{preview}\"", flush=True)
 
     decisions: List[Dict] = []
     cstats = {"verified": 0, "kept": 0, "unlinked": 0, "unresolved": 0,
@@ -356,7 +357,7 @@ async def _verify_chain_async(chain_index: int, chain: Dict,
         _f, qcm = entries[entry_idx]
         print(f"[CC-CHECK] Verifying chain {chain_index} — "
               f"QCM {pos + 1}/{len(items)} (Q{qcm.get('number', '?')} "
-              f"p.{qcm.get('page', '?')}) ...")
+              f"p.{qcm.get('page', '?')}) ...", flush=True)
 
         verdict = await _verify_one_async(client, tracker, qcm, chain["cas"],
                                           primary_model, fallback_model, max_tokens)
@@ -368,7 +369,7 @@ async def _verify_chain_async(chain_index: int, chain: Dict,
             # Technical failure is never a rejection — and it neither
             # confirms a pending NO nor resets the consecutive counter.
             cstats["unresolved"] += 1
-            print("     ⚠️ unresolved — link kept (technical failure, not a rejection)")
+            print("     ⚠️ unresolved — link kept (technical failure, not a rejection)", flush=True)
             decisions.append(decision)
             continue
 
@@ -380,7 +381,7 @@ async def _verify_chain_async(chain_index: int, chain: Dict,
         if verdict["applies"]:
             cstats["kept"] += 1
             conf = f" ({verdict.get('confidence'):.2f})" if verdict.get("confidence") is not None else ""
-            print(f"     ✅ belongs{conf} — keeps the clinical case")
+            print(f"     ✅ belongs{conf} — keeps the clinical case", flush=True)
             consecutive_no = 0
             if suspicious is not None and early_stop:
                 # Spec §7: lone NO followed by YES → re-check the suspicious QCM.
@@ -388,7 +389,7 @@ async def _verify_chain_async(chain_index: int, chain: Dict,
                 _sf, s_qcm = entries[s_entry_idx]
                 s_decision = suspicious["decision"]
                 print(f"     ↩️ §7 re-check: Q{s_qcm.get('number', '?')} "
-                      f"(provisional NO followed by YES) ...")
+                      f"(provisional NO followed by YES) ...", flush=True)
                 recheck = await _ask_verdict_async(
                     client, tracker,
                     _recheck_prompt(chain["cas"], s_qcm, qcm),
@@ -400,10 +401,10 @@ async def _verify_chain_async(chain_index: int, chain: Dict,
                     # Provisional NO confirmed — unlink that QCM only.
                     _unlink(s_decision)
                     print(f"     ❌ §7 re-check confirms Q{s_qcm.get('number', '?')} "
-                          f"does NOT belong — link removed (that QCM only)")
+                          f"does NOT belong — link removed (that QCM only)", flush=True)
                 elif recheck["status"] == "ok":
                     print(f"     ✅ §7 re-check: Q{s_qcm.get('number', '?')} actually "
-                          f"belongs — provisional NO was a model error, link kept")
+                          f"belongs — provisional NO was a model error, link kept", flush=True)
                 else:
                     # Re-check failed technically → keep the link and downgrade
                     # to unresolved (a failure is never a rejection).
@@ -413,7 +414,7 @@ async def _verify_chain_async(chain_index: int, chain: Dict,
                     s_decision.pop("model", None)
                     cstats["verified"] -= 1
                     cstats["unresolved"] += 1
-                    print("     ⚠️ §7 re-check failed technically — link kept (needs attention)")
+                    print("     ⚠️ §7 re-check failed technically — link kept (needs attention)", flush=True)
                 suspicious = None
             decisions.append(decision)
             continue
@@ -422,7 +423,7 @@ async def _verify_chain_async(chain_index: int, chain: Dict,
         if not early_stop:
             # Flag off: legacy per-QCM behavior — unlink immediately.
             _unlink(decision)
-            print("     ❌ does NOT belong — clinical case link removed (unlinked)")
+            print("     ❌ does NOT belong — clinical case link removed (unlinked)", flush=True)
             decisions.append(decision)
             continue
 
@@ -450,7 +451,7 @@ async def _verify_chain_async(chain_index: int, chain: Dict,
                 decisions.append(t_dec)
             print(f"     ⛔ Two consecutive NOs — case closed before "
                   f"Q{entries[suspicious['entry_idx']][1].get('number', '?')}; "
-                  f"{len(tail)} remaining QCM(s) unlinked without LLM calls")
+                  f"{len(tail)} remaining QCM(s) unlinked without LLM calls", flush=True)
             suspicious = None
             break
 
@@ -458,7 +459,7 @@ async def _verify_chain_async(chain_index: int, chain: Dict,
         consecutive_no = 1
         decision["provisional"] = True
         suspicious = {"pos": pos, "entry_idx": entry_idx, "decision": decision}
-        print("     ❓ provisional NO — link kept pending next verdict (§6.2)")
+        print("     ❓ provisional NO — link kept pending next verdict (§6.2)", flush=True)
         decisions.append(decision)
 
     # Chain ended on a pending provisional NO with nothing after it: the
@@ -467,7 +468,7 @@ async def _verify_chain_async(chain_index: int, chain: Dict,
         _unlink(suspicious["decision"])
         _sf, _sq = entries[suspicious["entry_idx"]]
         print(f"     ❌ End of chain: pending NO confirmed — "
-              f"Q{_sq.get('number', '?')} link removed (that QCM only)")
+              f"Q{_sq.get('number', '?')} link removed (that QCM only)", flush=True)
 
     # Apply corrections to the in-memory QCM dicts (shared references with
     # file_data — the caller writes the files back after gather).
@@ -475,6 +476,10 @@ async def _verify_chain_async(chain_index: int, chain: Dict,
         if d.get("corrected"):
             _ef, _eq = entries[d["entry_idx"]]
             _eq.pop("cas", None)
+
+    print(f"  [CC-CHECK] [CAS {chain_index}] ✅ Done — "
+          f"{cstats['kept']} kept, {cstats['unlinked']} unlinked, "
+          f"{cstats['unresolved']} unresolved", flush=True)
 
     return {
         "chain_index": chain_index, "label": label, "items": items,
@@ -496,7 +501,8 @@ async def _verify_all_chains_async(chains: List[Dict],
     """Run every chain as its own task, at most max_parallel concurrently."""
     semaphore = asyncio.Semaphore(max(1, int(max_parallel)))
     print(f"[CC-CHECK] Parallel verification: {len(chains)} chain(s), "
-          f"max {max_parallel} concurrent, early_stop={'on' if early_stop else 'off'}")
+          f"max {max_parallel} concurrent, early_stop={'on' if early_stop else 'off'}",
+          flush=True)
 
     async def _bounded(ci: int, chain: Dict) -> Dict:
         async with semaphore:
@@ -579,9 +585,9 @@ def run_clinical_case_checker(tracker, context) -> Dict:
     except (TypeError, ValueError):
         max_parallel = DEFAULT_CC_MAX_PARALLEL
     early_stop = (os.getenv("CC_CHECKER_EARLY_STOP", "1") != "0")
-    print(f"[CC-CHECK] {len(chains)} clinical case chain(s) over "
-          f"{sum(len(c['items']) for c in chains)} QCMs — verifying chains in "
-          f"parallel (max {max_parallel}), QCMs sequential within each chain...")
+    print(f"[CC-CHECK] ▶ Starting: {len(chains)} clinical case chain(s) over "
+          f"{sum(len(c['items']) for c in chains)} QCMs — parallel (max {max_parallel}), "
+          f"early_stop={'on' if early_stop else 'off'}", flush=True)
 
     _gather_kwargs = dict(
         chains=chains, entries=entries, client=client, tracker=tracker,
@@ -625,29 +631,123 @@ def run_clinical_case_checker(tracker, context) -> Dict:
                   f"(two consecutive NOs) — {cr['llm_calls_saved']} LLM call(s) "
                   f"saved in {cr['elapsed_ms']} ms")
 
-    # Write corrected files back (only the ones where a QCM was unlinked).
+    # Post-checker scrub: remove the verified cas narrative from question
+    # text. Runs AFTER verification on the same in-memory QCMs, so only
+    # QCMs whose `cas` survived the checker are scrubbed — unlinked QCMs
+    # have no `cas` and are skipped automatically. Reuses the deterministic
+    # core from cas_text_split (exact + whitespace-normalized match).
+    print("[CASCADE-TRACE] stage=cas_scrub event=START", flush=True)
+    scrub_t0 = time.monotonic()
+    scrubbed_files = set()
+    scrub_stats = {"qcms_with_cas": 0, "texts_scrubbed": 0}
+    for _sf, _sq in entries:
+        _cas = _sq.get("cas") or _sq.get("Cas")
+        if not _cas:
+            continue
+        scrub_stats["qcms_with_cas"] += 1
+        for _key in ("text", "Text"):
+            if _key in _sq and isinstance(_sq[_key], str):
+                _new_text, _removed = split_cas_from_text(_sq[_key], _cas)
+                if _removed:
+                    _sq[_key] = _new_text
+                    scrub_stats["texts_scrubbed"] += 1
+                    scrubbed_files.add(_sf)
+                    print(f"[CAS-SCRUB] Q{_sq.get('number', '?')} "
+                          f"p.{_sq.get('page', '?')} — narrative removed "
+                          f"from '{_key}' ({len(_new_text)} chars kept)")
+                break
+    stats["cas_scrubbed"] = scrub_stats["texts_scrubbed"]
+    print(f"[CASCADE-TRACE] stage=cas_scrub event=END "
+          f"elapsed_ms={int((time.monotonic() - scrub_t0) * 1000)} "
+          f"detail=with_cas={scrub_stats['qcms_with_cas']} "
+          f"scrubbed={scrub_stats['texts_scrubbed']}", flush=True)
+
+    # Write corrected files back (unlinked + scrubbed QCMs share the single
+    # write-back — both mutated the same in-memory dicts).
     corrected_uids = {d["uid"] for d in decisions if d.get("corrected")}
-    if corrected_uids:
+    if corrected_uids or scrubbed_files:
         for q_file, qcms in file_data.items():
-            if any(q.get("uid") in corrected_uids for q in qcms):
+            if q_file in scrubbed_files or \
+                    any(q.get("uid") in corrected_uids for q in qcms):
                 with open(q_file, "w", encoding="utf-8") as f:
                     json.dump(qcms, f, indent=2, ensure_ascii=False)
                 print(f"[CC-CHECK] 💾 Corrections written → {q_file.name}")
 
-    # Summary (streams to the UI terminal log).
-    print("\n" + "═" * 60)
-    print("📊 CLINICAL CASE VERIFICATION SUMMARY")
-    print("═" * 60)
-    print(f"  Chains verified:  {stats['chains']}")
-    print(f"  QCMs verified:    {stats['verified']}")
-    print(f"  Kept:             {stats['kept']}")
-    print(f"  Unlinked:         {stats['unlinked']}  (wrong links corrected)")
-    print(f"  Unresolved:       {stats['unresolved']}  (links kept, need attention)")
-    print(f"  Closed early:     {stats['closed_early_chains']}  (two-consecutive-NO boundary)")
-    print(f"  LLM calls:        {stats['llm_calls_made']} made, {stats['llm_calls_saved']} saved by early stop")
-    print(f"  Re-checked (§7):  {stats['rechecked']}")
-    print(f"  Model:            {primary_model}")
-    print("═" * 60)
+    # ─────────────────────────────────────────────────────────────────────────
+    # Post-verification QCM & Clinical Case Breakdown
+    # (re-group surviving cases from entries — unlinked QCMs had cas popped)
+    # ─────────────────────────────────────────────────────────────────────────
+    total_qcms = len(entries)
+    surviving_cases: List[List[Dict]] = []
+    current_case_qcms: List[Dict] = []
+    current_case_text = None
+    qcms_without_case: List[Dict] = []
+
+    for _ef, _eq in entries:
+        cas_val = _eq.get("cas") or _eq.get("Cas")
+        if cas_val and cas_val.strip():
+            if current_case_text is not None and cas_val == current_case_text:
+                current_case_qcms.append(_eq)
+            else:
+                if current_case_qcms:
+                    surviving_cases.append(current_case_qcms)
+                current_case_text = cas_val
+                current_case_qcms = [_eq]
+        else:
+            if current_case_qcms:
+                surviving_cases.append(current_case_qcms)
+                current_case_qcms = []
+                current_case_text = None
+            qcms_without_case.append(_eq)
+
+    if current_case_qcms:
+        surviving_cases.append(current_case_qcms)
+
+    total_cases = len(surviving_cases)
+    total_qcms_in_cases = sum(len(c) for c in surviving_cases)
+    total_qcms_without_case = len(qcms_without_case)
+    stats["total_qcms"] = total_qcms
+    stats["total_cases"] = total_cases
+    stats["qcms_with_case"] = total_qcms_in_cases
+    stats["qcms_without_case"] = total_qcms_without_case
+
+    # Summary (streams to UI terminal log).
+    print("\n" + "═" * 62, flush=True)
+    print("📊 CLINICAL CASE VERIFICATION & EXTRACTION SUMMARY", flush=True)
+    print("═" * 62, flush=True)
+    print(f"  Total QCMs extracted:    {total_qcms}", flush=True)
+    print(f"  Total Clinical Cases:    {total_cases}", flush=True)
+    print(f"  QCMs with Case:          {total_qcms_in_cases}", flush=True)
+    print(f"  QCMs without Case:       {total_qcms_without_case}", flush=True)
+    print("─" * 62, flush=True)
+    print(f"  Chains verified:         {stats['chains']}", flush=True)
+    print(f"  Kept:                    {stats['kept']}", flush=True)
+    print(f"  Unlinked (wrong links):  {stats['unlinked']}", flush=True)
+    print(f"  Unresolved (flagged):    {stats['unresolved']}", flush=True)
+    print(f"  Closed early:            {stats['closed_early_chains']}", flush=True)
+    print(f"  LLM calls:               {stats['llm_calls_made']} made, {stats['llm_calls_saved']} saved", flush=True)
+    print(f"  Cas text scrubbed:       {stats.get('cas_scrubbed', 0)}", flush=True)
+    print(f"  Model used:              {primary_model}", flush=True)
+
+    if total_cases > 0:
+        print("─" * 62, flush=True)
+        print("📋 Breakdown by Case:", flush=True)
+        for idx, case_qcms in enumerate(surviving_cases, start=1):
+            q_first = case_qcms[0]
+            q_last = case_qcms[-1]
+            c_label, c_narrative = _split_cas(q_first.get("cas") or q_first.get("Cas") or "")
+            clean_narrative = c_narrative.replace("\n", " ").strip()
+            preview = clean_narrative[:55] + ("..." if len(clean_narrative) > 55 else "")
+
+            # Format: Case N: X QCMs (Q12 → Q16, p.3-4) — "narrative..."
+            p_range = f"p.{q_first.get('page', '?')}"
+            if q_first.get('page') != q_last.get('page'):
+                p_range += f"-{q_last.get('page', '?')}"
+
+            print(f"  🔹 Case {idx} ({c_label}): {len(case_qcms)} QCMs "
+                  f"(Q{q_first.get('number', '?')} → Q{q_last.get('number', '?')}, {p_range}) "
+                  f"— \"{preview}\"", flush=True)
+    print("═" * 62 + "\n", flush=True)
 
     # Audit trail (step3_metadata folder root — NOT accepted/, which Step 5
     # glob-reads as QCM lists; the folder-wide Storage upload still persists it).

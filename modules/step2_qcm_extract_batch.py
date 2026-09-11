@@ -741,8 +741,12 @@ Return ONLY the JSON array, no markdown, no explanation.
             p = qcm.get('page', 0)
             qnum = qcm.get('number')
             
-            # Build expanded window [P-1, P, P+1]
-            window_pages = [pg for pg in [p-1, p, p+1] if pg in page_map]
+            # Forward-only window [P, P+1]: a QCM split across a page
+            # break can only spill FORWARD (P → P+1). P-1 holds at most the
+            # already-captured stem — resending it wastes tokens and invites
+            # duplicate re-extractions. Boundary-safe via the page_map guard
+            # (p=1 → [1, 2]; last page → [P]).
+            window_pages = [pg for pg in [p, p+1] if pg in page_map]
             window_files = [page_map[pg] for pg in window_pages]
             
             print(f"\n  🔄 Re-extracting Q{qnum} (page {p}) using window: pages {window_pages}")

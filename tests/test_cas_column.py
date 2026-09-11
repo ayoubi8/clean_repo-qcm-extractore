@@ -19,7 +19,7 @@ import json
 import shutil
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock, AsyncMock
 
 # Force UTF-8 on Windows
 sys.stdout.reconfigure(encoding='utf-8')
@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 
 from modules.utils.cost_tracker import CostTracker
 from modules.cas_text_split import run_cas_text_split, split_cas_from_text
+from modules.clinical_case_checker import run_clinical_case_checker
 from modules.post_step2_metadata import run_post_step2_metadata, DEFAULT_STEP3_CONFIG
 
 NARR = "Patient A, 45 ans, fievre aigue et douleur intense."
@@ -319,6 +320,95 @@ def _test_step8_custom_export_has_cas_column():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _seed_step3(ctx: FakeContext, filename: str, qcms: list):
+    d = ctx.get_path("step3_metadata", "accepted")
+    (d / filename).write_text(json.dumps(qcms), encoding="utf-8")
+
+
+def _read_step3(ctx: FakeContext, filename: str):
+    return json.loads((ctx.get_path("step3_metadata", "accepted") / filename).read_text(encoding="utf-8"))
+
+
+def _ok_client(default_applies: bool = True):
+    """Checker LLM mock (async path): every verdict is `default_applies`."""
+    client = MagicMock()
+    async def gen_async(prompt, **kw):
+        return {"content": json.dumps({"applies": default_applies, "confidence": 0.95}),
+                "usage": {}, "cost": 0.0}
+    client.generate_completion_async = AsyncMock(side_effect=gen_async)
+    return client
+
+
+def _test_post_checker_scrub_verified_cas():
+    print("\n--- Test 12: post-checker scrub removes verified narrative from text ---")
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        ctx = FakeContext(tmp)
+        _seed_step3(ctx, "page_1.json", [
+            {"uid": "1_1_0", "page": 1, "number": 1,
+             "text": f"{CAS}\nQ1: Quel diagnostic ?",
+             "cas": CAS, "propositions": {"A": "a", "B": "b"}},
+        ])
+        with patch("modules.clinical_case_checker.OpenRouterClient",
+                   return_value=_ok_client(True)):
+            res = run_clinical_case_checker(CostTracker(), ctx)
+        assert res["status"] == "ok", res
+        assert res["stats"].get("cas_scrubbed") == 1, res["stats"]
+        data = _read_step3(ctx, "page_1.json")
+        assert data[0]["cas"] == CAS, "cas must stay intact"
+        assert data[0]["text"] == "Q1: Quel diagnostic ?", f"got: {data[0]['text']!r}"
+        assert NARR not in data[0]["text"]
+        print("✅ verified cas scrubbed from text after checker.")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _test_post_checker_unlinked_keeps_text():
+    print("\n--- Test 13: unlinked QCM (cas removed) is not scrubbed ---")
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        ctx = FakeContext(tmp)
+        _seed_step3(ctx, "page_1.json", [
+            {"uid": "1_1_0", "page": 1, "number": 1,
+             "text": f"{CAS}\nQ1: Quel diagnostic ?",
+             "cas": CAS, "propositions": {"A": "a", "B": "b"}},
+        ])
+        with patch("modules.clinical_case_checker.OpenRouterClient",
+                   return_value=_ok_client(False)):
+            res = run_clinical_case_checker(CostTracker(), ctx)
+        assert res["status"] == "ok", res
+        assert res["stats"]["unlinked"] == 1, res["stats"]
+        assert res["stats"].get("cas_scrubbed") == 0, res["stats"]
+        data = _read_step3(ctx, "page_1.json")
+        assert "cas" not in data[0], "rejected QCM must be unlinked"
+        assert NARR in data[0]["text"], "no cas left to match — text untouched"
+        print("✅ unlinked QCM keeps its text (nothing to match against).")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _test_post_checker_capital_text_key():
+    print("\n--- Test 14: scrub works on capitalized `Text` key ---")
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        ctx = FakeContext(tmp)
+        _seed_step3(ctx, "page_1.json", [
+            {"uid": "1_1_0", "page": 1, "number": 1,
+             "Text": f"{CAS}\nQ1: Quel diagnostic ?",
+             "cas": CAS, "propositions": {"A": "a", "B": "b"}},
+        ])
+        with patch("modules.clinical_case_checker.OpenRouterClient",
+                   return_value=_ok_client(True)):
+            res = run_clinical_case_checker(CostTracker(), ctx)
+        assert res["status"] == "ok", res
+        data = _read_step3(ctx, "page_1.json")
+        assert data[0]["Text"] == "Q1: Quel diagnostic ?", f"got: {data[0]['Text']!r}"
+        assert data[0]["cas"] == CAS
+        print("✅ capitalized Text key scrubbed.")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _run_all():
     _test_exact_removal_keeps_cas()
     _test_whitespace_variant_removal()
@@ -331,6 +421,9 @@ def _run_all():
     _test_split_soft_fail_never_blocks_build()
     _test_merged_cas_column_text_clean()
     _test_step8_custom_export_has_cas_column()
+    _test_post_checker_scrub_verified_cas()
+    _test_post_checker_unlinked_keeps_text()
+    _test_post_checker_capital_text_key()
 
     print("\n" + "=" * 60)
     print("ALL cas_column TESTS PASSED")

@@ -308,7 +308,10 @@ def run_post_step2_metadata(tracker, context, user_id: str, project: str,
     status = build.get("status", "ok")
     if status == "ok":
         total = build.get("step5", {}).get("total_qcms", 0)
-        print(f"[AUTO-ENRICH] ✅ Cascade complete. step5 total_qcms={total}")
+        cc_stats = cc_check.get("stats", {}) if isinstance(cc_check, dict) else {}
+        total_cases = cc_stats.get("total_cases", 0)
+        print(f"[AUTO-ENRICH] ✅ Cascade complete: {total} total QCMs, "
+              f"{total_cases} clinical case(s) verified.")
 
         # Surface the final merged artifacts into step2_qcm/accepted/ so the
         # Step 2 OutputViewer (which lists step2_qcm/ files) shows the xlsx +

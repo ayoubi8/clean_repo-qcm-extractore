@@ -7,6 +7,19 @@ import { LogLine } from '../../types'
  * Preserves the beautiful terminal output from the original pipeline.
  */
 function getLogLineStyle(text: string): string {
+  // CC Checker & Summary enhancements (must sit ABOVE the generic ✅/▶
+  // rules so checker-specific lines get their own styling).
+  if (/\[CC-CHECK\].*▶\s*Starting/.test(text))                     return 'text-tertiary font-bold tracking-wide'
+  if (/\[CC-CHECK\]\s*\[CAS\s*\d+\]/.test(text))                   return 'text-tertiary font-bold'
+  if (/\[CC-CHECK\].*✅\s*Done/.test(text))                         return 'text-green-400 font-medium'
+  if (/❓\s*provisional/.test(text))                                return 'text-yellow-400/80 italic'
+  if (/⛔\s*Two consecutive/.test(text))                            return 'text-error font-bold'
+  if (/📊 CLINICAL CASE VERIFICATION & EXTRACTION SUMMARY/.test(text)) return 'text-tertiary font-black'
+  if (/Total QCMs extracted:/.test(text))                          return 'text-primary font-bold'
+  if (/Total Clinical Cases:/.test(text))                          return 'text-cyan-400 font-bold'
+  if (/QCMs with Case:/.test(text))                                return 'text-secondary font-medium'
+  if (/QCMs without Case:/.test(text))                             return 'text-on-surface-variant font-medium'
+  if (/🔹\s*Case\s*\d+:/.test(text))                               return 'pl-2 text-cyan-300 font-mono text-[11px]'
   if (/✅|^\[OK\]|\[SUCCESS\]/.test(text))             return 'text-green-400'
   if (/❌|\[ERROR\]/.test(text))                        return 'text-red-400'
   // Phase 1 — Clinical Case Checker lines (must sit ABOVE the generic ⚠️
