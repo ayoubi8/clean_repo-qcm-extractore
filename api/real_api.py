@@ -1922,40 +1922,46 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
             # user can still re-run Step 2 to retry the whole cascade.
             auto_build_folders: list = []
             if step_id == "2":
-                try:
-                    from modules.post_step2_metadata import run_post_step2_metadata
-                    step3_cfg = config.get("step3", config.get("step3_config", {}))
-                    res = await loop.run_in_executor(
-                        None,
-                        lambda: run_post_step2_metadata(tracker, context, user_id, project, step3_cfg)
-                    )
-                    rstatus = res.get("status")
-                    if rstatus == "ok":
-                        total = res.get("build", {}).get("step5", {}).get("total_qcms", 0)
-                        log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "ok", "text": f"⚡ Auto-enrich (Step 3 + build) completed: {total} QCMs merged."})
-                        job_manager.set_done(project, "3")
-                        job_manager.set_done(project, "4")
-                        job_manager.set_done(project, "5")
-                        auto_build_folders = ["step3_metadata", "step4_format", "step5_json"]
-                        # Record success badges for the hidden steps so history matches reality
-                        for _sid in ("3", "4", "5"):
-                            try:
-                                _b, _s = _compute_step_badge(project, user_id, _sid)
-                                _record_step_history(project, user_id, _sid, _step_start_time.get(f"{project}-{_sid}", time.time()), _b, _s)
-                            except Exception as _be:
-                                print(f"[POST-STEP-2] badge record failed for {_sid}: {_be}")
-                    elif rstatus == "no_qcms":
-                        log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "warn", "text": "ℹ️ Auto-enrich skipped: no accepted QCMs after Step 2."})
-                    else:
-                        log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "warn", "text": f"⚠️ Auto-enrich (Step 3 + build) reported: {res}. You can re-run Step 2 to retry."})
-                except Exception as abe:
-                    import traceback
-                    traceback.print_exc()
-                    log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "warn", "text": f"⚠️ Auto-enrich (Step 3 + build) failed: {str(abe)}. You can re-run Step 2 to retry."})
-                finally:
-                    # Now mark Step 2 as done — the WS log stream will see
-                    # "done" and close AFTER pushing all cascade log lines.
-                    job_manager.set_done(project, step_id)
+                # Route cascade prints (hint / cas-split / Step 3 / checker /
+                # build, incl. [CASCADE-TRACE] + [CC-CHECK] progress lines) to
+                # execution_log via the same capture used for step output.
+                # Without this, only the explicit log_callback lines below
+                # reach the WS stream and the cascade looks silent in the UI.
+                with LogCapture(log_callback):
+                    try:
+                        from modules.post_step2_metadata import run_post_step2_metadata
+                        step3_cfg = config.get("step3", config.get("step3_config", {}))
+                        res = await loop.run_in_executor(
+                            None,
+                            lambda: run_post_step2_metadata(tracker, context, user_id, project, step3_cfg)
+                        )
+                        rstatus = res.get("status")
+                        if rstatus == "ok":
+                            total = res.get("build", {}).get("step5", {}).get("total_qcms", 0)
+                            log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "ok", "text": f"⚡ Auto-enrich (Step 3 + build) completed: {total} QCMs merged."})
+                            job_manager.set_done(project, "3")
+                            job_manager.set_done(project, "4")
+                            job_manager.set_done(project, "5")
+                            auto_build_folders = ["step3_metadata", "step4_format", "step5_json"]
+                            # Record success badges for the hidden steps so history matches reality
+                            for _sid in ("3", "4", "5"):
+                                try:
+                                    _b, _s = _compute_step_badge(project, user_id, _sid)
+                                    _record_step_history(project, user_id, _sid, _step_start_time.get(f"{project}-{_sid}", time.time()), _b, _s)
+                                except Exception as _be:
+                                    print(f"[POST-STEP-2] badge record failed for {_sid}: {_be}")
+                        elif rstatus == "no_qcms":
+                            log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "warn", "text": "ℹ️ Auto-enrich skipped: no accepted QCMs after Step 2."})
+                        else:
+                            log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "warn", "text": f"⚠️ Auto-enrich (Step 3 + build) reported: {res}. You can re-run Step 2 to retry."})
+                    except Exception as abe:
+                        import traceback
+                        traceback.print_exc()
+                        log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "warn", "text": f"⚠️ Auto-enrich (Step 3 + build) failed: {str(abe)}. You can re-run Step 2 to retry."})
+                    finally:
+                        # Now mark Step 2 as done — the WS log stream will see
+                        # "done" and close AFTER pushing all cascade log lines.
+                        job_manager.set_done(project, step_id)
 
         except Exception as e:
             import traceback
