@@ -32,6 +32,15 @@ function StatusIcon({ status }: { status: string }) {
       </div>
     )
   }
+  if (status === 'stopped' || status === 'cancelled' || status === 'stopping') {
+    return (
+      <div className="w-5 h-5 rounded-full bg-amber-500/20 flex items-center justify-center">
+        <span className="material-symbols-outlined text-[14px] text-amber-500 font-bold">
+          {status === 'stopping' ? 'hourglass_top' : 'pause'}
+        </span>
+      </div>
+    )
+  }
   return (
     <div className="w-5 h-5 rounded-full border border-outline-variant" />
   )
@@ -59,6 +68,33 @@ export function StepRow({ step, isActive, onClick }: StepRowProps) {
       type: 'info', 
       text: `▶ Starting ${step.label}...` 
     })
+
+    // After the log stream closes, poll the step status until it reaches a
+    // terminal state. A single one-shot poll races with the backend flipping
+    // "stopping" → "stopped"/"cancelled"/"done", which used to leave the Run
+    // button permanently gone.
+    const pollStatusUntilTerminal = async (attempt = 0) => {
+      if (!activeProject) return
+      try {
+        const status = await getStepStatus(activeProject.name, step.id)
+        if (status.status === 'running' || status.status === 'stopping') {
+          if (attempt < 60) {
+            setTimeout(() => pollStatusUntilTerminal(attempt + 1), 1000)
+            return
+          }
+        }
+        setStepStatus(step.id, status.status)
+        setStepOutputExists(step.id, status.output_exists)
+        setPipelineStatus('idle')
+      } catch {
+        if (attempt < 10) {
+          setTimeout(() => pollStatusUntilTerminal(attempt + 1), 1000)
+          return
+        }
+        setStepStatus(step.id, 'error')
+        setPipelineStatus('idle')
+      }
+    }
 
     try {
       // Map step ID to config object
@@ -98,30 +134,19 @@ export function StepRow({ step, isActive, onClick }: StepRowProps) {
           }
         },
         async () => {
-          // On close, poll status
-          const status = await getStepStatus(activeProject.name, step.id)
-          setStepStatus(step.id, status.status)
-          setStepOutputExists(step.id, status.output_exists)
-          setPipelineStatus('idle')
+          // On close, poll status until terminal
+          pollStatusUntilTerminal()
         }
       )
     } catch (err: any) {
       setStepStatus(step.id, 'error')
+      setPipelineStatus('idle')
       appendLog({ 
         ts: new Date().toLocaleTimeString(), 
         type: 'error', 
         text: `Failed: ${err.message}` 
       })
     }
-  }
-  if (status === 'stopped' || status === 'cancelled' || status === 'stopping') {
-    return (
-      <div className="w-5 h-5 rounded-full bg-amber-500/20 flex items-center justify-center">
-        <span className="material-symbols-outlined text-[14px] text-amber-500 font-bold">
-          {status === 'stopping' ? 'hourglass_top' : 'pause'}
-        </span>
-      </div>
-    )
   }
 
   const handleStop = async (e: React.MouseEvent, mode: 'stop' | 'cancel') => {

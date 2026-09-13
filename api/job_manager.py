@@ -36,6 +36,15 @@ class JobManager:
         self._stop_modes[k] = mode
         self._stop_events.setdefault(k, threading.Event()).set()
         self._status[k] = "stopping"
+        if mode == "cancelled":
+            # Hard-cancel: the cooperative event may never be honored if the
+            # executor thread is blocked in a long call (LLM request, I/O).
+            # Cancelling the asyncio task guarantees the job leaves the
+            # "stopping" state immediately; the cleanup thread keeps running.
+            try:
+                task.cancel()
+            except RuntimeError:
+                pass
         return True
 
     def should_stop(self, project: str, step: str) -> bool:

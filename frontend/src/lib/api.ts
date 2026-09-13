@@ -186,7 +186,9 @@ export async function runStep(projectName: string, stepId: number, config: objec
     body: JSON.stringify(config),
   })
   if (!res.ok) throw new Error('Failed to run step')
-  return res.json()
+  const data = await res.json()
+  if (data?.error) throw new Error(data.error)
+  return data
 }
 
 // POST /projects/{name}/steps/{stepId}/stop

@@ -39,8 +39,9 @@ class Step2QCMExtractBatch:
         except (ValueError, TypeError):
             return default
         
-    def run(self, input_dir: str = None, page_range: str = None, config: Dict = None) -> Dict:
-        """Main execution for Step 2 - Batch mode."""
+    def run(self, input_dir: str = None, page_range: str = None, config: Dict = None, cancel_check=None) -> Dict:
+        """Main execution for Step 2 - Batch mode. cancel_check: cooperative
+        stop hook (returns True to abort). Partial chunks are preserved."""
         print("\n" + "="*60)
         print("STEP 2: BATCH QCM EXTRACTION (v7.0 - All Pages)")
         print("="*60)
@@ -88,7 +89,7 @@ class Step2QCMExtractBatch:
         
         if loop_match:
             chunk_size = int(loop_match.group(1))
-            total_extracted = self._run_loop_mode(txt_files, chunk_size, correction_map, config)
+            total_extracted = self._run_loop_mode(txt_files, chunk_size, correction_map, config, cancel_check)
             print(f"\n✅ Step 2 Complete. Total new/updated QCMs in this loop run: {total_extracted}")
             return {"total_extracted": total_extracted}
         else:
@@ -125,7 +126,7 @@ class Step2QCMExtractBatch:
                 print(f"✅ Applied {applied} corrections to extracted QCMs.")
             
             # INTEGRITY CHECK: detect and fix incomplete QCMs
-            all_qcms = self._apply_incomplete_fix(all_qcms, txt_files, config)
+            all_qcms = self._apply_incomplete_fix(all_qcms, txt_files, config, cancel_check)
             
             # Save results (Accumulate safe)
             self._save_batch_results_accumulate(all_qcms)
@@ -179,7 +180,7 @@ class Step2QCMExtractBatch:
         
         return "\n\n".join(parts)
     
-    def _extract_all_qcms_batch(self, full_text: str, start_page: int, end_page: int, config: Dict = None, prev_page_qcm_numbers: list = None) -> List[Dict]:
+    def _extract_all_qcms_batch(self, full_text: str, start_page: int, end_page: int, config: Dict = None, prev_page_qcm_numbers: list = None, cancel_check=None) -> List[Dict]:
         """Extract all QCMs using batch LLM call with smart fallback.
         prev_page_qcm_numbers: list of integer QCM numbers extracted from the previous page/chunk.
         When provided, injected into the prompt so the LLM can infer sequential numbers
@@ -292,6 +293,9 @@ Return ONLY the JSON array, no markdown, no explanation.
 
         result_qcms: List[Dict] = []
         for attempt in range(1, retries + 1):
+            if cancel_check and cancel_check():
+                print(f"\n⏸ Stop requested during chunk retry loop — aborting LLM attempts.")
+                break
             # Escalate max_token per retry: the most common failure is a
             # *truncated* JSON response (model hits its token cap mid-array).
             # A larger budget on the retry lets the model finish writing all QCMs.
@@ -649,7 +653,7 @@ Return ONLY the JSON array, no markdown, no explanation.
 
         return qcms
 
-    def _run_loop_mode(self, txt_files: List[Path], chunk_size: int, correction_map: Dict, config: Dict = None) -> int:
+    def _run_loop_mode(self, txt_files: List[Path], chunk_size: int, correction_map: Dict, config: Dict = None, cancel_check=None) -> int:
         """
         Auto-loop: split all pages into chunks of chunk_size,
         run one LLM call per chunk, accumulate results.
@@ -665,6 +669,10 @@ Return ONLY the JSON array, no markdown, no explanation.
         prev_page_qcm_numbers = None  # Tracks QCM numbers from the last processed chunk
 
         for i, chunk in enumerate(chunks, start=1):
+            if cancel_check and cancel_check():
+                print(f"\n⏸ Stop requested before chunk {i}/{total_chunks} — "
+                      f"{total_extracted} QCM(s) already saved.")
+                break
             start_p = self._extract_page_number(chunk[0].name)
             end_p   = self._extract_page_number(chunk[-1].name)
             print(f"\n{'='*60}")
@@ -677,7 +685,8 @@ Return ONLY the JSON array, no markdown, no explanation.
             full_text = self._concatenate_pages(chunk)
             qcms = self._extract_all_qcms_batch(
                 full_text, start_p, end_p, config,
-                prev_page_qcm_numbers=prev_page_qcm_numbers
+                prev_page_qcm_numbers=prev_page_qcm_numbers,
+                cancel_check=cancel_check
             )
 
             if qcms:
@@ -703,7 +712,7 @@ Return ONLY the JSON array, no markdown, no explanation.
                     print(f"✅ Applied {applied} corrections to extracted QCMs.")
 
                 # INTEGRITY CHECK: detect and fix incomplete QCMs
-                qcms = self._apply_incomplete_fix(qcms, txt_files, config)
+                qcms = self._apply_incomplete_fix(qcms, txt_files, config, cancel_check)
 
                 self._save_batch_results_accumulate(qcms)
                 total_extracted += len(qcms)
@@ -749,7 +758,7 @@ Return ONLY the JSON array, no markdown, no explanation.
                       f"(threshold={threshold}) → flagged for re-extraction")
         return incomplete
 
-    def _reextract_for_incomplete(self, flagged: List[Dict], all_txt_files: List[Path], config: Dict) -> List[Dict]:
+    def _reextract_for_incomplete(self, flagged: List[Dict], all_txt_files: List[Path], config: Dict, cancel_check=None) -> List[Dict]:
         """
         For each incomplete QCM, re-run the LLM on a ±1 page window to capture
         any propositions that spilled onto the adjacent page.
@@ -759,6 +768,10 @@ Return ONLY the JSON array, no markdown, no explanation.
         results = []
         
         for qcm in flagged:
+            if cancel_check and cancel_check():
+                print(f"\n⏸ Stop requested during incomplete-QCM re-extraction — "
+                      f"keeping {len(results)} re-extracted (and all remaining original) QCM(s).")
+                break
             p = qcm.get('page', 0)
             qnum = qcm.get('number')
             
@@ -831,7 +844,7 @@ Return ONLY the JSON array, no markdown, no explanation.
             print(f"   → Q{q.get('number')} (page {q.get('page')}) — {len(q.get('propositions', {}))} props")
         print("   These QCMs are kept in all_qcms.json but need manual review.")
 
-    def _apply_incomplete_fix(self, qcms: List[Dict], all_txt_files: List[Path], config: Dict) -> List[Dict]:
+    def _apply_incomplete_fix(self, qcms: List[Dict], all_txt_files: List[Path], config: Dict, cancel_check=None) -> List[Dict]:
         """
         Full pipeline for detecting and fixing incomplete QCMs.
         Phase 1: Compute dynamic threshold
@@ -852,7 +865,7 @@ Return ONLY the JSON array, no markdown, no explanation.
         print(f"[INTEGRITY] Found {len(flagged)} incomplete QCM(s). Running re-extraction...")
         
         # Re-extract on ±1 page window
-        fixed = self._reextract_for_incomplete(flagged, all_txt_files, config)
+        fixed = self._reextract_for_incomplete(flagged, all_txt_files, config, cancel_check)
         
         # Merge fixed back into main list
         fixed_map = {(self._safe_int(q.get('page')), self._safe_int(q.get('number'))): q for q in fixed}

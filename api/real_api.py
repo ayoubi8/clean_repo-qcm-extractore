@@ -1963,6 +1963,19 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
                         # "done" and close AFTER pushing all cascade log lines.
                         job_manager.set_done(project, step_id)
 
+        except asyncio.CancelledError:
+            # Cancel-mode hard-cancel interrupts the pending awaits here.
+            # Record the terminal "cancelled" status and log before
+            # re-raising so the WebSocket stream sees a terminal state and
+            # the frontend can recover its Run/Resume button.
+            job_manager.set_stopped(project, step_id, "cancelled")
+            step_outcome = "cancelled"
+            log_callback({
+                "ts": datetime.now().strftime("%H:%M:%S"),
+                "type": "warn",
+                "text": f"✕ Step {step_id} cancelled. Partial outputs preserved.",
+            })
+            raise
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -2058,6 +2071,17 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
             except Exception as be:
                 print(f"[POST-STEP] Badge recording failed for step {step_id}: {be}")
 
+    except asyncio.CancelledError:
+        # A hard-cancel during setup (archive/PDF restore awaits) must also
+        # land in a terminal state — otherwise the UI stays stuck at
+        # "stopping" forever.
+        job_manager.set_stopped(project, step_id, "cancelled")
+        log_callback({
+            "ts": datetime.now().strftime("%H:%M:%S"),
+            "type": "warn",
+            "text": f"✕ Step {step_id} cancelled during setup.",
+        })
+        raise
     except Exception as outer_e:
         # Outer except catches setup failures (archive, PDF restore, ref DB restore)
         # that happen before the step even starts.
@@ -2293,7 +2317,8 @@ def _call_step(step_id: str, tracker, context, config: dict, cancel_check=None):
                             "extraction_guidance": config.get("extraction_guidance", ""),
                             "clinical_case_hints": config.get("clinical_case_hints", False),
                         }
-                    }
+                    },
+                    cancel_check=cancel_check,
                ),
         "4":   lambda: _run_step4_auto(tracker, context, config),
         "5":   lambda: Step5Builder(tracker, context).run(),
