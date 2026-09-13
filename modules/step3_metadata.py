@@ -25,7 +25,8 @@ class Step3Metadata:
         
     def run(self, step2_dir: str = None, step1_dir: str = None,
             auto_mode: bool = False, config: Dict = None,
-            global_values: Dict = None, global_pages: List[int] = None) -> Dict:
+            global_values: Dict = None, global_pages: List[int] = None,
+            cancel_check=None) -> Dict:
         """Main execution for Step 3 with User Config or Auto-Mode."""
         print("\n" + "="*60)
         print("STEP 3: METADATA DETECTION (Smart Config)")
@@ -124,7 +125,7 @@ class Step3Metadata:
         print("   Global Values set:", global_vals)
 
         # 4. Process All QCM Files (pass step1_dir for Cas Clinique detection)
-        self._process_qcms(target_step2_dir, target_step1_dir, config, global_vals, fallback_map)
+        self._process_qcms(target_step2_dir, target_step1_dir, config, global_vals, fallback_map, cancel_check)
         
         return {"config": config, "global_values": global_vals}
 
@@ -444,7 +445,8 @@ DOCUMENT:
     # ─────────────────────────────────────────────────────────────
 
     def _process_qcms(self, step2_dir: Path, step1_dir: Path,
-                      config: Dict, global_values: Dict, fallback_map: Dict = None):
+                      config: Dict, global_values: Dict, fallback_map: Dict = None,
+                      cancel_check=None):
         """Apply global values and detect per-QCM / per-Group values for each batch."""
         qcm_files = sorted(Path(step2_dir).glob("*.json"))
         total = len(qcm_files)
@@ -476,6 +478,10 @@ DOCUMENT:
         cc_all_qcms   = []    # [(page_num, qcm_num, cas_text)] for end-of-run stats
         
         for i, q_file in enumerate(qcm_files, 1):
+            if cancel_check and cancel_check():
+                print(f"\n⏸ Stop requested before metadata batch {i}/{total} — "
+                      f"already-processed batches are saved.")
+                break
             with open(q_file, 'r', encoding='utf-8') as f:
                 qcms = json.load(f)
             
@@ -570,6 +576,10 @@ DOCUMENT:
                         print(f"   📑 Merged file: {len(sorted_pages)} distinct pages found → \nprocessing sequentially ({sorted_pages[0]}–{sorted_pages[-1]})")
 
                         for pg_num in sorted_pages:
+                            if cancel_check and cancel_check():
+                                print(f"\n⏸ Stop requested before CC page {pg_num} "
+                                      f"— already-processed pages are saved.")
+                                break
                             pg_qcms = page_groups[pg_num]
                             pg_txt  = Path(step1_dir) / f"page_{pg_num}.txt"
 

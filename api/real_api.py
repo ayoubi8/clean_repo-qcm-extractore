@@ -1933,7 +1933,7 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
                         step3_cfg = config.get("step3", config.get("step3_config", {}))
                         res = await loop.run_in_executor(
                             None,
-                            lambda: run_post_step2_metadata(tracker, context, user_id, project, step3_cfg)
+                            lambda: run_post_step2_metadata(tracker, context, user_id, project, step3_cfg, cancel_check=cancel_check)
                         )
                         rstatus = res.get("status")
                         if rstatus == "ok":
@@ -3472,9 +3472,23 @@ async def _autorun_task(project: str, email: str, body: dict):
 
     for step_id in active_sequence:
         cfg = run_config.get(f"step{step_id}", {})
-        # Re-use the step task runner logic
-        await _run_step_task(project, email, step_id, cfg)
-        
-        # Stop sequence if any step fails
-        if job_manager.get_status(project, step_id) == "error":
+        # Register each autorun step with the JobManager. Previously the task
+        # was awaited directly with no set_running() call, so Stop/Cancel on
+        # any autorun step returned 409 "Step is not running" forever.
+        if job_manager.is_running(project, step_id):
+            continue
+        task = asyncio.ensure_future(_run_step_task(project, email, step_id, cfg))
+        job_manager.set_running(project, step_id, task)
+        _job_user_ids[job_manager.key(project, step_id)] = email
+
+        try:
+            await task
+        except asyncio.CancelledError:
+            # Hard-cancel on the child task propagates here as the parent's
+            # own cancellation — end the sequence. Status was already set to
+            # "cancelled" inside _run_step_task before re-raising.
+            raise
+
+        # Stop the sequence if the step did not complete cleanly.
+        if job_manager.get_status(project, step_id) in ("error", "stopped", "cancelled"):
             break

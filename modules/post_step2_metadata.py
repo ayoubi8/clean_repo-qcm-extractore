@@ -153,7 +153,8 @@ def _clinical_case_enabled(step3_config: Optional[Dict]) -> bool:
 
 
 def run_post_step2_metadata(tracker, context, user_id: str, project: str,
-                            step3_config: Optional[Dict] = None) -> Dict:
+                            step3_config: Optional[Dict] = None,
+                            cancel_check=None) -> Dict:
     """Run Step 3 (metadata) then chain the Step 4+5 auto-build.
 
     Must be called from a background thread (it runs LLM calls). The caller
@@ -224,6 +225,11 @@ def run_post_step2_metadata(tracker, context, user_id: str, project: str,
     #    (e.g. re-run added new QCMs), Step 3 re-runs so the new QCMs get
     #    enriched — otherwise they'd silently bypass metadata and the merge.
     step3_t0 = _now_ms()
+    if cancel_check and cancel_check():
+        _trace("step3", "SKIP", _now_ms() - step3_t0, "stop_requested")
+        print("[AUTO-ENRICH] ⏸ Stop requested — skipping Step 3 metadata + build.")
+        return {"status": "stopped", "step3": "skipped",
+                "hint": hint_result, "cas_split": cas_split_result}
     if _step3_covers_current_step2(context):
         _trace("step3", "SKIP", _now_ms() - step3_t0, "q8_fast_path_uid_sets_equal")
         print("[AUTO-ENRICH] Step 3 accepted metadata already covers the current "
@@ -247,6 +253,7 @@ def run_post_step2_metadata(tracker, context, user_id: str, project: str,
                 auto_mode=True,
                 config=fields,
                 global_pages=gp_list,
+                cancel_check=cancel_check,
             )
             step3_status = "done"
             _trace("step3", "END", _now_ms() - step3_t0, "status=done")
