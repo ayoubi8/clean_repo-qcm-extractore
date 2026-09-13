@@ -2150,6 +2150,12 @@ def _call_step(step_id: str, tracker, context, config: dict, cancel_check=None):
     if step_id == "1" and config.get("model"):
         os.environ["STEP1_MODEL"] = config["model"]
     if step_id == "2":
+        # Visibility: log where the effective models came from. The run
+        # payload (Step 2 panel, persisted in the browser) overrides the
+        # Settings env whenever non-empty — a stale panel value silently
+        # stomps a fresh Settings change, which looks "hardcoded".
+        _prev_s2_primary = os.getenv("STEP2_MODEL", "")
+        _prev_s2_fallback = os.getenv("STEP2_FALLBACK_MODEL", "")
         if config.get("model_primary"):
             os.environ["STEP2_MODEL"] = config["model_primary"]
             # Sync Step 2's model to Step 3 so the metadata cascade (which
@@ -2161,6 +2167,11 @@ def _call_step(step_id: str, tracker, context, config: dict, cancel_check=None):
         if config.get("model_fallback"):
             os.environ["STEP2_FALLBACK_MODEL"] = config["model_fallback"]
             os.environ["STEP3_FALLBACK_MODEL"] = config["model_fallback"]
+        print(f"[STEP2] models — run-config primary={config.get('model_primary') or '(empty → keep env)'} "
+              f"fallback={config.get('model_fallback') or '(empty → keep env)'} | "
+              f"effective STEP2_MODEL={os.getenv('STEP2_MODEL')} "
+              f"STEP2_FALLBACK_MODEL={os.getenv('STEP2_FALLBACK_MODEL')} "
+              f"(env was: {_prev_s2_primary or '(unset)'} / {_prev_s2_fallback or '(unset)'})")
         # Phase 1 — Clinical Case Checker (verification pass inside the
         # Step 2 auto-enrich cascade). Independent from the Step 2/3 models
         # so a cheap/fast verifier can be configured (e.g. mercury).

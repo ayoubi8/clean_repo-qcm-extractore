@@ -57,6 +57,7 @@ export function Step2Config() {
               <option>Loading...</option>
             ) : (
               <>
+                <option value="">⚙️ Use Settings default{models?.step2?.primary ? ` (${models.step2.primary})` : ''}</option>
                 <option value={models?.step2?.primary}>{models?.step2?.primary} (Primary)</option>
                 <option value={models?.step2?.fallback}>{models?.step2?.fallback} (Fallback)</option>
                 <option value="custom">Custom…</option>
@@ -91,6 +92,7 @@ export function Step2Config() {
               <option>Loading...</option>
             ) : (
               <>
+                <option value="">⚙️ Use Settings default{models?.step2?.fallback ? ` (${models.step2.fallback})` : ''}</option>
                 <option value={models?.step2?.primary}>{models?.step2?.primary}</option>
                 <option value={models?.step2?.fallback}>{models?.step2?.fallback} (Fallback)</option>
                 <option value="custom">Custom…</option>
@@ -108,6 +110,24 @@ export function Step2Config() {
             />
           )}
         </div>
+      </div>
+
+      {/* ── Reset to Settings defaults ──
+          Clears the persisted panel values so the next run follows the
+          Settings env (a stale persisted model otherwise overrides Settings
+          on every run without any visible warning). */}
+      <div className="flex justify-end -mt-3">
+        <button
+          id="btn-step2-models-reset"
+          onClick={() => {
+            setConfig({ model_primary: '', model_fallback: '' })
+            setIsCustomPrimary(false)
+            setIsCustomFallback(false)
+          }}
+          className="text-[10px] font-bold uppercase tracking-widest text-outline hover:text-primary transition-colors"
+        >
+          ↺ Reset models to Settings defaults
+        </button>
       </div>
 
       {/* ── Extraction Guidance ── */}

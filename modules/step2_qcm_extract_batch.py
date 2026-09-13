@@ -44,9 +44,11 @@ class Step2QCMExtractBatch:
         print("\n" + "="*60)
         print("STEP 2: BATCH QCM EXTRACTION (v7.0 - All Pages)")
         print("="*60)
-        # Model selection is scoped to one Step 2 run. Once the primary fails,
-        # all later chunks use the fallback instead of repeating known failures.
+        # Model selection is scoped to one Step 2 run. The primary-failure
+        # streak counts CONSECUTIVE chunks the primary failed; promotion to
+        # fallback kicks in at 2 in a row and resets on any primary success.
         self._step2_promoted_to_fallback = False
+        self._step2_primary_fail_streak = 0
         
         # Determine input directory
         if self.context:
@@ -274,7 +276,16 @@ Return ONLY the JSON array, no markdown, no explanation.
         
         primary_model = os.getenv("STEP2_MODEL", "google/gemini-2.5-flash-lite-preview-09-2025")
         fallback_model = os.getenv("STEP2_FALLBACK_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
-        active_model = fallback_model if getattr(self, "_step2_promoted_to_fallback", False) else primary_model
+        # Promotion scope = THIS call (one chunk) only: start on primary
+        # unless the primary failed 2+ consecutive chunks (fail streak). The
+        # old sticky latch pinned fallback for the rest of Step 2 after a
+        # single bad chunk — including an unwanted fallback model.
+        streak = int(getattr(self, "_step2_primary_fail_streak", 0) or 0)
+        self._step2_promoted_to_fallback = streak >= 2
+        self._step2_chunk_primary_failed = False
+        if self._step2_promoted_to_fallback:
+            print(f"[INFO] Primary failed {streak} chunk(s) in a row — starting this chunk on fallback: {fallback_model}")
+        active_model = fallback_model if self._step2_promoted_to_fallback else primary_model
         base_max_tokens = int(os.getenv("STEP2_MAX_TOKENS", "20000"))
         max_retries = int(os.getenv("STEP2_MAX_RETRIES", "3"))
         retries = max(1, max_retries)  # at least 1 attempt
@@ -301,9 +312,10 @@ Return ONLY the JSON array, no markdown, no explanation.
                 except Exception as e:
                     if active_model == primary_model:
                         self._step2_promoted_to_fallback = True
+                        self._step2_chunk_primary_failed = True
                         active_model = fallback_model
                         print(f"[WARN] Primary model failed: {e}")
-                        print(f"[INFO] Promoting fallback for the rest of Step 2: {fallback_model}")
+                        print(f"[INFO] Promoting fallback for the rest of this chunk: {fallback_model}")
                     else:
                         print(f"[WARN] Fallback model failed: {e}")
                     response = self.client.generate_completion(
@@ -318,6 +330,8 @@ Return ONLY the JSON array, no markdown, no explanation.
                 if attempt < retries:
                     print(f"   ↻ Retrying page (attempt next) after API failure...")
                     continue
+                if self._step2_chunk_primary_failed:
+                    self._step2_primary_fail_streak = int(getattr(self, "_step2_primary_fail_streak", 0) or 0) + 1
                 return []
 
             # Parse response
@@ -338,6 +352,10 @@ Return ONLY the JSON array, no markdown, no explanation.
 
             if qcms:
                 result_qcms = qcms
+                if model_used == primary_model:
+                    self._step2_primary_fail_streak = 0
+                elif self._step2_chunk_primary_failed:
+                    self._step2_primary_fail_streak = int(getattr(self, "_step2_primary_fail_streak", 0) or 0) + 1
                 print(f"[SUCCESS] Extracted {len(qcms)} QCMs")
 
                 # Show preview
@@ -353,8 +371,9 @@ Return ONLY the JSON array, no markdown, no explanation.
             else:
                 if active_model == primary_model:
                     self._step2_promoted_to_fallback = True
+                    self._step2_chunk_primary_failed = True
                     active_model = fallback_model
-                    print(f"[INFO] Primary response was unusable; promoting fallback for the rest of Step 2: {fallback_model}")
+                    print(f"[INFO] Primary response was unusable; promoting fallback for the rest of this chunk: {fallback_model}")
                 if attempt < retries:
                     print(f"⚠️  No QCMs parsed on attempt {attempt}/{retries} "
                           f"(chunk pages {start_page}–{end_page}). Retrying "
@@ -363,6 +382,8 @@ Return ONLY the JSON array, no markdown, no explanation.
                     print(f"❌ Failed to extract any QCMs after {retries} attempts "
                           f"for pages {start_page}–{end_page}.")
 
+        if not result_qcms and self._step2_chunk_primary_failed:
+            self._step2_primary_fail_streak = int(getattr(self, "_step2_primary_fail_streak", 0) or 0) + 1
         return result_qcms
     
     def _parse_json(self, content: str) -> List[Dict]:
