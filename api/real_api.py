@@ -1791,6 +1791,11 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
     context = ctx_data["context"]
     tracker = ctx_data["tracker"]
 
+    # Shared cooperative-stop check for this step (used by both the worker
+    # thread inside _run_with_capture and the auto-enrich cascade).
+    def cancel_check():
+        return job_manager.should_stop(project, step_id)
+
     # TELEMETRY: run_id follows the SAME convention as step_results
     # ("YYYY-MM-DDThh-mm-ss" from the step's start time). A step_run row is
     # inserted into step_call_logs BEFORE anything runs and updated with the
@@ -1840,7 +1845,7 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
                 tracker,
                 context,
                 config,
-                cancel_check=lambda: job_manager.should_stop(project, step_id),
+                cancel_check=cancel_check,
             )
 
     try:
