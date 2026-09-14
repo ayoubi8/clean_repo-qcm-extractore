@@ -9,8 +9,19 @@ import httpx
 from PIL import Image
 from dotenv import load_dotenv
 
+from modules.utils.call_logger import log_ai_call_start, log_ai_call_finish
+
 # Load environment variables
 load_dotenv()
+
+
+def _payload_to_text(payload: dict, prompt: str) -> str:
+    """Debug-friendly request representation WITHOUT base64 image blobs."""
+    return prompt
+
+
+def _usage_to_dict(usage) -> dict:
+    return usage if isinstance(usage, dict) else {}
 
 class OpenRouterClient:
     def __init__(self, cache_enabled: bool = False):
@@ -89,79 +100,108 @@ class OpenRouterClient:
         if not self.api_key:
              raise ValueError("OPENROUTER_API_KEY is not set. Please check your .env file.")
 
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text", 
-                        "text": prompt,
-                        # OpenRouter Prompt Caching (Cost Opt #2)
-                        # Ensure static parts of the prompt are at the beginning 
-                        # and effectively cached if supported by the model/provider
-                        "cache_control": {"type": "ephemeral"} 
-                    }
-                ]
+        # TELEMETRY: insert a 'running' row BEFORE the request (incl. retries).
+        _t0 = time.time()
+        _row = log_ai_call_start(
+            user_id=None, project_name=None, step_number=None,
+            model=target_model, request_payload=prompt,
+        )
+        _status = "error"
+        _response_payload = None
+        _usage = None
+        _cost = None
+        _err = None
+        _answered_model = target_model
+        try:
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text", 
+                            "text": prompt,
+                            # OpenRouter Prompt Caching (Cost Opt #2)
+                            # Ensure static parts of the prompt are at the beginning 
+                            # and effectively cached if supported by the model/provider
+                            "cache_control": {"type": "ephemeral"} 
+                        }
+                    ]
+                }
+            ]
+
+            if images:
+                for img in images:
+                    base64_img = self._encode_image(img)
+                    messages[0]["content"].append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{base64_img}"
+                        }
+                    })
+
+            payload = {
+                "model": target_model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": temperature # Low temp for precise extraction (0.0 = deterministic verification)
             }
-        ]
 
-        if images:
-            for img in images:
-                base64_img = self._encode_image(img)
-                messages[0]["content"].append({
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/jpeg;base64,{base64_img}"
-                    }
-                })
-
-        payload = {
-            "model": target_model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature # Low temp for precise extraction (0.0 = deterministic verification)
-        }
-
-        retries = 3
-        backoff = 2
-        
-        for attempt in range(retries):
-            try:
-                # Use a new client for each request to avoid pool issues, or reuse if better
-                with httpx.Client(timeout=60.0) as client:
-                    response = client.post(
-                        "https://openrouter.ai/api/v1/chat/completions",
-                        headers=self.headers,
-                        json=payload
-                    )
-                    
-                    if response.status_code != 200:
-                        error_msg = f"HTTP {response.status_code}: {response.text}"
-                        print(f"API Error (Attempt {attempt + 1}): {error_msg}")
-                        raise httpx.HTTPStatusError(error_msg, request=response.request, response=response)
-
-                    result = response.json()
-                    
-                    if 'error' in result:
-                         raise ValueError(f"OpenRouter API Error: {result['error']}")
-                         
-                    if 'choices' not in result or not result['choices']:
-                         raise ValueError("Empty response from API")
-
-                    usage = result.get('usage', {})
-                    return {
-                        "content": result['choices'][0]['message']['content'],
-                        "usage": usage,
-                        "cost": usage.get('cost', 0.0)  # Real cost from OpenRouter API
-                    }
+            retries = 3
+            backoff = 2
             
-            except Exception as e:
-                print(f"Error calling OpenRouter (Attempt {attempt + 1}/{retries}): {e}")
-                if attempt < retries - 1:
-                    time.sleep(backoff * (attempt + 1))
-                else:
-                    raise RuntimeError(f"Failed to get response from OpenRouter after {retries} attempts") from e
-        return {}
+            for attempt in range(retries):
+                try:
+                    # Use a new client for each request to avoid pool issues, or reuse if better
+                    with httpx.Client(timeout=60.0) as client:
+                        response = client.post(
+                            "https://openrouter.ai/api/v1/chat/completions",
+                            headers=self.headers,
+                            json=payload
+                        )
+                        
+                        if response.status_code != 200:
+                            error_msg = f"HTTP {response.status_code}: {response.text}"
+                            print(f"API Error (Attempt {attempt + 1}): {error_msg}")
+                            raise httpx.HTTPStatusError(error_msg, request=response.request, response=response)
+
+                        result = response.json()
+                        
+                        if 'error' in result:
+                             raise ValueError(f"OpenRouter API Error: {result['error']}")
+                             
+                        if 'choices' not in result or not result['choices']:
+                             raise ValueError("Empty response from API")
+
+                        usage = result.get('usage', {})
+                        _status = "success"
+                        _response_payload = result['choices'][0]['message']['content']
+                        _usage = _usage_to_dict(usage)
+                        _cost = usage.get('cost', 0.0)
+                        _answered_model = result.get('model') or target_model
+                        return {
+                            "content": result['choices'][0]['message']['content'],
+                            "usage": usage,
+                            "cost": usage.get('cost', 0.0)  # Real cost from OpenRouter API
+                        }
+                
+                except (httpx.HTTPError, ValueError) as e:
+                    print(f"Error calling OpenRouter (Attempt {attempt + 1}/{retries}): {e}")
+                    _err = str(e)
+                    if attempt < retries - 1:
+                        time.sleep(backoff * (attempt + 1))
+                    else:
+                        raise RuntimeError(f"Failed to get response from OpenRouter after {retries} attempts") from e
+            return {}
+        except Exception as e:
+            _status = "error"
+            _err = _err or str(e)
+            raise
+        finally:
+            log_ai_call_finish(
+                _row, status=_status, model=_answered_model,
+                response_payload=_response_payload, usage=_usage, cost=_cost,
+                error=_err, started_ts=_t0,
+            )
 
     def _compose_messages(self, prompt: str, images: List[Image.Image] = None) -> List[Dict]:
         """Build the chat messages payload shared by the sync and async paths."""
@@ -197,12 +237,26 @@ class OpenRouterClient:
         Async mirror of generate_completion — same payload, headers, timeout and
         retry policy, but using httpx.AsyncClient so many calls can run
         concurrently on one event loop (used by the parallel CC checker).
-        The sync method is left untouched.
+        TELEMETRY: same write-on-start / update-on-finish pattern as the sync
+        path; the SQL writes run in a worker thread so the event loop never
+        blocks on them.
         """
         target_model = model if model else self.model
 
         if not self.api_key:
              raise ValueError("OPENROUTER_API_KEY is not set. Please check your .env file.")
+
+        _t0 = time.time()
+        _row = await asyncio.to_thread(
+            log_ai_call_start,
+            None, None, None, target_model, prompt,
+        )
+        _status = "error"
+        _response_payload = None
+        _usage = None
+        _cost = None
+        _err = None
+        _answered_model = target_model
 
         messages = self._compose_messages(prompt, images)
 
@@ -213,45 +267,62 @@ class OpenRouterClient:
             "temperature": temperature # Low temp for precise extraction (0.0 = deterministic verification)
         }
 
-        retries = 3
-        backoff = 2
+        try:
+            retries = 3
+            backoff = 2
 
-        for attempt in range(retries):
-            try:
-                async with httpx.AsyncClient(timeout=60.0) as client:
-                    response = await client.post(
-                        "https://openrouter.ai/api/v1/chat/completions",
-                        headers=self.headers,
-                        json=payload
-                    )
+            for attempt in range(retries):
+                try:
+                    async with httpx.AsyncClient(timeout=60.0) as client:
+                        response = await client.post(
+                            "https://openrouter.ai/api/v1/chat/completions",
+                            headers=self.headers,
+                            json=payload
+                        )
 
-                    if response.status_code != 200:
-                        error_msg = f"HTTP {response.status_code}: {response.text}"
-                        print(f"API Error (Attempt {attempt + 1}): {error_msg}")
-                        raise httpx.HTTPStatusError(error_msg, request=response.request, response=response)
+                        if response.status_code != 200:
+                            error_msg = f"HTTP {response.status_code}: {response.text}"
+                            print(f"API Error (Attempt {attempt + 1}): {error_msg}")
+                            raise httpx.HTTPStatusError(error_msg, request=response.request, response=response)
 
-                    result = response.json()
+                        result = response.json()
 
-                    if 'error' in result:
-                         raise ValueError(f"OpenRouter API Error: {result['error']}")
+                        if 'error' in result:
+                             raise ValueError(f"OpenRouter API Error: {result['error']}")
 
-                    if 'choices' not in result or not result['choices']:
-                         raise ValueError("Empty response from API")
+                        if 'choices' not in result or not result['choices']:
+                             raise ValueError("Empty response from API")
 
-                    usage = result.get('usage', {})
-                    return {
-                        "content": result['choices'][0]['message']['content'],
-                        "usage": usage,
-                        "cost": usage.get('cost', 0.0)  # Real cost from OpenRouter API
-                    }
+                        usage = result.get('usage', {})
+                        _status = "success"
+                        _response_payload = result['choices'][0]['message']['content']
+                        _usage = _usage_to_dict(usage)
+                        _cost = usage.get('cost', 0.0)
+                        _answered_model = result.get('model') or target_model
+                        return {
+                            "content": result['choices'][0]['message']['content'],
+                            "usage": usage,
+                            "cost": usage.get('cost', 0.0)  # Real cost from OpenRouter API
+                        }
 
-            except Exception as e:
-                print(f"Error calling OpenRouter (Attempt {attempt + 1}/{retries}): {e}")
-                if attempt < retries - 1:
-                    await asyncio.sleep(backoff * (attempt + 1))
-                else:
-                    raise RuntimeError(f"Failed to get response from OpenRouter after {retries} attempts") from e
-        return {}
+                except (httpx.HTTPError, ValueError) as e:
+                    print(f"Error calling OpenRouter (Attempt {attempt + 1}/{retries}): {e}")
+                    _err = str(e)
+                    if attempt < retries - 1:
+                        await asyncio.sleep(backoff * (attempt + 1))
+                    else:
+                        raise RuntimeError(f"Failed to get response from OpenRouter after {retries} attempts") from e
+            return {}
+        except Exception as e:
+            _status = "error"
+            _err = _err or str(e)
+            raise
+        finally:
+            await asyncio.to_thread(
+                log_ai_call_finish,
+                _row, _status, _answered_model, _response_payload,
+                _usage, _cost, _err, _t0,
+            )
 
     @staticmethod
     def get_cost(response: Dict) -> float:

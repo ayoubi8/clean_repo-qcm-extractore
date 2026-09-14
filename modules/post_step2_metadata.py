@@ -191,8 +191,10 @@ def run_post_step2_metadata(tracker, context, user_id: str, project: str,
     hint_result: Dict = {"status": "not_run"}
     _trace("hint", "START")
     hint_t0 = _now_ms()
+    from modules.utils.call_logger import sub_step_scope
     try:
-        hint_result = run_hint_detection(context)
+        with sub_step_scope("hint"):
+            hint_result = run_hint_detection(context)
         _trace("hint", "END", _now_ms() - hint_t0,
                f"status={hint_result.get('status')}")
     except Exception as e:
@@ -210,7 +212,8 @@ def run_post_step2_metadata(tracker, context, user_id: str, project: str,
     _trace("cas_split", "START")
     cas_t0 = _now_ms()
     try:
-        cas_split_result = run_cas_text_split(context)
+        with sub_step_scope("cas_split"):
+            cas_split_result = run_cas_text_split(context)
         _trace("cas_split", "END", _now_ms() - cas_t0,
                f"status={cas_split_result.get('status')}")
     except Exception as e:
@@ -249,12 +252,13 @@ def run_post_step2_metadata(tracker, context, user_id: str, project: str,
               f"fields={list(fields.keys())}, global_pages={gp_list}")
         _trace("step3", "START", detail=f"llm_run fields={list(fields.keys())} global_pages={gp_list}")
         try:
-            Step3Metadata(tracker, context).run(
-                auto_mode=True,
-                config=fields,
-                global_pages=gp_list,
-                cancel_check=cancel_check,
-            )
+            with sub_step_scope("step3_metadata"):
+                Step3Metadata(tracker, context).run(
+                    auto_mode=True,
+                    config=fields,
+                    global_pages=gp_list,
+                    cancel_check=cancel_check,
+                )
             step3_status = "done"
             _trace("step3", "END", _now_ms() - step3_t0, "status=done")
         except Exception as e:
@@ -279,7 +283,8 @@ def run_post_step2_metadata(tracker, context, user_id: str, project: str,
         _trace("checker", "START")
         cc_t0 = _now_ms()
         try:
-            cc_check = run_clinical_case_checker(tracker, context)
+            with sub_step_scope("cc_checker"):
+                cc_check = run_clinical_case_checker(tracker, context)
             _trace("checker", "END", _now_ms() - cc_t0,
                    f"status={cc_check.get('status')}")
         except Exception as e:
@@ -300,7 +305,8 @@ def run_post_step2_metadata(tracker, context, user_id: str, project: str,
     _trace("build", "START")
     build_t0 = _now_ms()
     try:
-        build = run_post_step3_build(tracker, context, user_id, project)
+        with sub_step_scope("build"):
+            build = run_post_step3_build(tracker, context, user_id, project)
         _trace("build", "END", _now_ms() - build_t0,
                f"status={build.get('status')}")
     except Exception as e:

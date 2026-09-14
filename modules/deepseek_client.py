@@ -45,7 +45,17 @@ class DeepSeekClient:
     def generate_completion(self, prompt: str, system_prompt: str = "") -> Dict[str, Any]:
         """
         Public method to get a completion with cost and usage information.
+        TELEMETRY: inserts a 'running' step_call_logs row immediately before
+        the API attempt and updates it with the outcome (the swallowed
+        exception below is still logged as an error row).
         """
+        from modules.utils.call_logger import log_ai_call_start, log_ai_call_finish
+        import time as _time
+        _t0 = _time.time()
+        _row = log_ai_call_start(
+            user_id=None, project_name=None, step_number=None,
+            model=self.primary_model, request_payload=prompt,
+        )
         try:
             result = self._call_api(prompt, system_prompt)
             content = result['choices'][0]['message']['content']
@@ -53,7 +63,12 @@ class DeepSeekClient:
             # Prefer real cost from API, fall back to local estimate
             api_cost = usage.get('cost', 0.0)
             cost = float(api_cost) if api_cost and float(api_cost) > 0 else self.estimate_cost(result)
-            
+
+            log_ai_call_finish(
+                _row, status="success", model=result.get('used_model'),
+                response_payload=content, usage=usage, cost=cost,
+                started_ts=_t0,
+            )
             return {
                 "content": content,
                 "usage": usage,
@@ -61,6 +76,10 @@ class DeepSeekClient:
                 "model": result.get('used_model')
             }
         except Exception as e:
+            log_ai_call_finish(
+                _row, status="error", error=str(e),
+                response_payload=str(e), started_ts=_t0,
+            )
             return {
                 "content": str(e),
                 "usage": {},

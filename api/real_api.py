@@ -1791,10 +1791,49 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
     context = ctx_data["context"]
     tracker = ctx_data["tracker"]
 
+    # TELEMETRY: run_id follows the SAME convention as step_results
+    # ("YYYY-MM-DDThh-mm-ss" from the step's start time). A step_run row is
+    # inserted into step_call_logs BEFORE anything runs and updated with the
+    # outcome afterwards — identical for the 1st and the 100th run.
+    _tele_start_ts = _step_start_time.get(f"{project}-{step_id}", time.time())
+    _tele_run_id = datetime.utcfromtimestamp(_tele_start_ts).strftime("%Y-%m-%dT%H-%M-%S")
+    _tele_row = None
+    _tele_finished = {"done": False}
+
+    def _tele_status(status: str, model=None, error_message=None, sub_step=None):
+        if _tele_finished["done"] or not _tele_row:
+            return
+        _tele_finished["done"] = True
+        try:
+            from modules.utils.call_logger import finish_step_run as _t_finish_step_run
+            _t_finish_step_run(
+                _tele_row, status=status, model=model,
+                duration_seconds=time.time() - _tele_start_ts,
+                error_message=error_message, sub_step=sub_step,
+            )
+        except Exception as _te:
+            print(f"[TELEMETRY] step_run finish failed for step {step_id}: {_te}")
+
+    try:
+        from modules.utils.call_logger import (
+            start_step_run as _t_start_step_run,
+            set_call_context as _t_set_call_context,
+        )
+        _tele_row = _t_start_step_run(user_id, project, step_id, _tele_run_id)
+    except Exception as _te:
+        print(f"[TELEMETRY] step_run start failed for step {step_id}: {_te}")
+
     def log_callback(line: dict):
         job_manager.append_log(project, step_id, line)
 
     def _run_with_capture():
+        # ContextVars do not propagate into run_in_executor worker threads —
+        # set the call context HERE (inside the worker) so every AI call made
+        # by the step is tagged with project/run/step.
+        try:
+            _t_set_call_context(user_id, project, _tele_run_id, str(step_id))
+        except Exception:
+            pass
         with LogCapture(log_callback):
             _call_step(
                 step_id,
@@ -1933,7 +1972,10 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
                         step3_cfg = config.get("step3", config.get("step3_config", {}))
                         res = await loop.run_in_executor(
                             None,
-                            lambda: run_post_step2_metadata(tracker, context, user_id, project, step3_cfg, cancel_check=cancel_check)
+                            lambda: _cascade_with_telemetry(
+                                tracker, context, user_id, project,
+                                step3_cfg, cancel_check, step_id, _tele_run_id,
+                            )
                         )
                         rstatus = res.get("status")
                         if rstatus == "ok":
@@ -1984,6 +2026,16 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
             log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "error", "text": f"❌ Step {step_id} failed: {str(e)}"})
 
         finally:
+            # TELEMETRY: step duration = start → step end (before the
+            # post-step Storage upload so the number reflects pure work time).
+            try:
+                if step_succeeded:
+                    _tele_status("success")
+                else:
+                    _tele_status(step_outcome)
+            except Exception:
+                pass
+
             # Always attempt to save outputs to Supabase — even on failed steps,
             # partial outputs may exist and are worth preserving.
             # This is isolated so it can never change the step's success/error status.
@@ -2076,6 +2128,7 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
         # land in a terminal state — otherwise the UI stays stuck at
         # "stopping" forever.
         job_manager.set_stopped(project, step_id, "cancelled")
+        _tele_status("cancelled", error_message="cancelled during setup")
         log_callback({
             "ts": datetime.now().strftime("%H:%M:%S"),
             "type": "warn",
@@ -2089,11 +2142,28 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
         traceback.print_exc()
         job_manager.set_error(project, step_id)
         step_outcome = "error"
+        _tele_status("error", error_message=f"setup: {outer_e}")
         log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "error", "text": f"❌ Step {step_id} setup failed: {str(outer_e)}"})
         try:
             _record_step_history(project, user_id, step_id, _step_start_time.get(f"{project}-{step_id}", time.time()), "error", {})
         except Exception as be:
             print(f"[POST-STEP] Badge recording failed for step {step_id}: {be}")
+
+def _cascade_with_telemetry(tracker, context, user_id: str, project: str,
+                            step3_cfg, cancel_check, step_id: str, run_id: str):
+    """Worker-thread wrapper for run_post_step2_metadata: sets the per-thread
+    call context so every AI call inside the cascade (Step 3 metadata, hint
+    detection, CC checker...) is logged with the right project/run/step."""
+    try:
+        from modules.utils.call_logger import set_call_context
+        set_call_context(user_id, project, run_id, str(step_id))
+    except Exception:
+        pass
+    from modules.post_step2_metadata import run_post_step2_metadata
+    return run_post_step2_metadata(
+        tracker, context, user_id, project, step3_cfg, cancel_check=cancel_check,
+    )
+
 
 def _call_step(step_id: str, tracker, context, config: dict, cancel_check=None):
     """Synchronous step dispatcher. Runs in a thread via run_in_executor."""

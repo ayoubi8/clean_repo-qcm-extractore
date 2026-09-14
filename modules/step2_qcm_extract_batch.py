@@ -675,6 +675,7 @@ Return ONLY the JSON array, no markdown, no explanation.
                 break
             start_p = self._extract_page_number(chunk[0].name)
             end_p   = self._extract_page_number(chunk[-1].name)
+
             print(f"\n{'='*60}")
             print(f"📦 Chunk {i}/{total_chunks}: pages {start_p}–{end_p}  ({len(chunk)} pages)")
             print(f"{'='*60}")
@@ -683,11 +684,13 @@ Return ONLY the JSON array, no markdown, no explanation.
                 print(f"   📌 [SEQ-CONTEXT] Previous chunk QCM numbers: {sorted(prev_page_qcm_numbers)} → next expected #{max(prev_page_qcm_numbers) + 1}")
 
             full_text = self._concatenate_pages(chunk)
-            qcms = self._extract_all_qcms_batch(
-                full_text, start_p, end_p, config,
-                prev_page_qcm_numbers=prev_page_qcm_numbers,
-                cancel_check=cancel_check
-            )
+            from modules.utils.call_logger import item_scope
+            with item_scope(f"chunk_{i}/{total_chunks} (pages {start_p}-{end_p})"):
+                qcms = self._extract_all_qcms_batch(
+                    full_text, start_p, end_p, config,
+                    prev_page_qcm_numbers=prev_page_qcm_numbers,
+                    cancel_check=cancel_check
+                )
 
             if qcms:
                 qcms = self._stamp_pages(qcms, chunk)

@@ -494,7 +494,9 @@ DOCUMENT:
                 combined_text = "\\n".join([q.get('text', '') or q.get('Text', '') for q in qcms])[:2000]
                 context = f"Multiple QCMs context:\\n{combined_text}"
                 print(f"   Batch {i}/{total}: Detecting {per_qcm_fields}...")
-                batch_metadata = self._extract_metadata_with_ai(context, per_qcm_fields, f"QCM Context (File {i})")
+                from modules.utils.call_logger import item_scope
+                with item_scope(f"batch_{i}/{total} ({q_file.name})"):
+                    batch_metadata = self._extract_metadata_with_ai(context, per_qcm_fields, f"QCM Context (File {i})")
             else:
                 print(f"   Batch {i}/{total}: Applying metadata...")
             
@@ -525,7 +527,9 @@ DOCUMENT:
                         qcm_numbers = [q.get("number") or q.get("Num") for q in qcms]
                         qcm_numbers = [n for n in qcm_numbers if n is not None]
                         print(f"   🔍 Page {page_num}: Detecting CC ({len(qcm_numbers)} QCMs) → LLM call...")
-                        llm_results = self._detect_cc_sequential_page(page_text, qcm_numbers)
+                        from modules.utils.call_logger import item_scope as _is2
+                        with _is2(f"page_{page_num}"):
+                            llm_results = self._detect_cc_sequential_page(page_text, qcm_numbers)
 
                         triggers = {num: cas for num, cas in llm_results.items() if cas is not None}
                         if triggers:
@@ -601,7 +605,9 @@ DOCUMENT:
                             qcm_numbers = [n for n in qcm_numbers if n is not None]
                             print(f"      🔍 Page {pg_num}: Detecting CC ({len(qcm_numbers)} QCMs) → LLM call...")
 
-                            llm_results = self._detect_cc_sequential_page(pg_text, qcm_numbers)
+                            from modules.utils.call_logger import item_scope as _is3
+                            with _is3(f"page_{pg_num}"):
+                                llm_results = self._detect_cc_sequential_page(pg_text, qcm_numbers)
 
                             triggers = {num: cas for num, cas in llm_results.items() if cas is not None}
                             if triggers:
