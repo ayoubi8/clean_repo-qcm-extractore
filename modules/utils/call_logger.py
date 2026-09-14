@@ -128,15 +128,38 @@ def _fail(msg: str):
 
 
 def _sb():
-    from api.supabase_client import get_supabase
+    try:
+        from api.supabase_client import get_supabase
+    except ImportError:
+        # The Space adds `api/` itself to sys.path — import directly there.
+        from supabase_client import get_supabase
     return get_supabase()
+
+
+def _is_uuid(value: str) -> bool:
+    import uuid as _uuid
+    try:
+        _uuid.UUID(str(value))
+        return True
+    except Exception:
+        return False
 
 
 def _project_id(user_id: str, project_name: str) -> Optional[str]:
     try:
         from project_manager import lookup_project_id
-        from api.real_api import _is_uuid
-        uid = user_id if _is_uuid(user_id) else user_id
+        uid = user_id
+        # Normalize the auth-level user id to the SQL users row id, same way
+        # real_api._resolve_project_id does (auth id ≠ SQL id sometimes).
+        if not _is_uuid(user_id):
+            try:
+                try:
+                    from auth import get_db_user_id
+                except ImportError:
+                    from api.auth import get_db_user_id
+                uid = get_db_user_id({"id": user_id})
+            except Exception:
+                pass
         return lookup_project_id(uid, project_name)
     except Exception:
         return None
@@ -158,7 +181,10 @@ def _trim_safely(text: Optional[str]):
         prefix = f"{ctx.user_id}/{ctx.project_name}/telemetry/{ctx.run_id}/{ctx.step_number}"
     storage_path = f"{prefix}/{task_id}.txt"
     try:
-        from api.storage_client import write_file
+        try:
+            from api.storage_client import write_file
+        except ImportError:
+            from storage_client import write_file
         write_file(storage_path, text)
         return text[:_MAX_INLINE], storage_path
     except Exception as e:
