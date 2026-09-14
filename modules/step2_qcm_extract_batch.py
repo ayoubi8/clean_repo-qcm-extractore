@@ -222,6 +222,19 @@ class Step2QCMExtractBatch:
             "lines of proposition \"e\"."
         )
 
+        # Correction-page detection: a page containing ONLY answer markings
+        # (answer key / annexe) and NO question text. Return a marker object
+        # instead of inventing QCMs so Step 6 can target these pages directly.
+        corr_rule = (
+            "- CORRECTION PAGE detection: if a page contains ONLY answer markings "
+            "(X marks, check marks ✓/V, underlined/bold letters, or merged answer "
+            "letters like \"ABE\" or \"1+3\" positioned next to proposition rows or "
+            "standalone QCM numbers) and NO question text, do NOT invent QCMs from it. "
+            "Return a single object for that page: {\"page\": X, \"correction_page\": true}. "
+            "If ANY question text is present on the page, it is NOT a correction page — "
+            "extract the QCMs normally."
+        )
+
         # Build previous-page QCM number context (single lean line, empty if first page)
         prev_numbers_block = ""
         if prev_page_qcm_numbers:
@@ -251,6 +264,7 @@ IMPORTANT RULES:
 {guidance}
 {cc_hint_rule}
 {hint_rule}
+{corr_rule}
 
 OUTPUT FORMAT (JSON array):
 [
@@ -284,6 +298,7 @@ Return ONLY the JSON array, no markdown, no explanation.
         streak = int(getattr(self, "_step2_primary_fail_streak", 0) or 0)
         self._step2_promoted_to_fallback = streak >= 2
         self._step2_chunk_primary_failed = False
+        self._step2_chunk_was_correction_page = False
         if self._step2_promoted_to_fallback:
             print(f"[INFO] Primary failed {streak} chunk(s) in a row — starting this chunk on fallback: {fallback_model}")
         active_model = fallback_model if self._step2_promoted_to_fallback else primary_model
@@ -351,8 +366,25 @@ Return ONLY the JSON array, no markdown, no explanation.
 
             print(f"[OK] Used {model_used} (${cost:.4f})")
 
-            # Parse JSON
+            # Parse JSON and separate correction-page markers from real QCM
+            # rows BEFORE deciding whether to retry.
             qcms = self._parse_json(content)
+            qcms = self._parse_json(content)
+
+            markers, rest = self._split_correction_markers(qcms, start_page, end_page)
+            if markers:
+                self._save_correction_pages(markers)
+            if rest:
+                qcms = rest
+            else:
+                if markers:
+                    # Correction-only page: NOT a failure — no retry escalation,
+                    # no fallback promotion, no fail-streak increment.
+                    print(f"[CORRECTION-PAGE] Page(s) {min(markers)}–{max(markers)} "
+                          f"hold only answer key(s) — saved for Step 6 (pages: {markers}).")
+                    self._step2_chunk_was_correction_page = True
+                    break
+                qcms = []
 
             if qcms:
                 result_qcms = qcms
@@ -386,9 +418,90 @@ Return ONLY the JSON array, no markdown, no explanation.
                     print(f"❌ Failed to extract any QCMs after {retries} attempts "
                           f"for pages {start_page}–{end_page}.")
 
-        if not result_qcms and self._step2_chunk_primary_failed:
+        if (not result_qcms and self._step2_chunk_primary_failed
+                and not getattr(self, "_step2_chunk_was_correction_page", False)):
             self._step2_primary_fail_streak = int(getattr(self, "_step2_primary_fail_streak", 0) or 0) + 1
         return result_qcms
+
+    # ------------------------------------------------------------------
+    # Correction-page markers (Step 2 → Step 6 answer-key passthrough)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def is_correction_marker(row) -> bool:
+        """True when the row is a bare correction-page marker object:
+        {"page": X, "correction_page": true} — no question text, no
+        propositions. A row that ALSO carries text/propositions is treated
+        as a malformed/normal row, never a marker."""
+        if not isinstance(row, dict):
+            return False
+        if not row.get("correction_page"):
+            return False
+        has_content = bool(
+            row.get("text") or row.get("Text") or
+            (isinstance(row.get("propositions"), dict) and row.get("propositions"))
+        )
+        return not has_content
+
+    def _split_correction_markers(self, rows, start_page: int, end_page: int) -> tuple:
+        """Separate correction-page markers from real QCM rows. Marker pages
+        outside the chunk's source range are DROPPED with a warning (the LLM
+        can only invent the page from ordering anyway) — the rest are clamped
+        to the chunk range like _stamp_pages does. Returns (marker_pages, qcm_rows).
+        marker_pages is a sorted, deduplicated list of ints."""
+        if not rows:
+            return [], []
+        markers: List[int] = []
+        rest: List[Dict] = []
+        valid_range = range(start_page, end_page + 1)
+        for row in rows:
+            num = self._safe_int(row.get("page"), default=0) if isinstance(row, dict) else 0
+            if self.is_correction_marker(row) and num in valid_range:
+                markers.append(num)
+            elif self.is_correction_marker(row):
+                print(f"[CORRECTION-PAGE] ⚠️ marker page {row.get('page')} outside "
+                      f"chunk range {start_page}-{end_page} — dropped.")
+            else:
+                rest.append(row)
+        return sorted(set(markers)), rest
+
+    def _correction_pages_path(self) -> Path:
+        if self.context:
+            d = self.context.get_path("step2_qcm", "accepted")
+        else:
+            d = Path("output/step2_qcm/accepted")
+        d.mkdir(parents=True, exist_ok=True)
+        return d / "correction_pages.json"
+
+    def _save_correction_pages(self, pages: List[int]):
+        """Merge detected correction-page numbers into the sidecar
+        step2_qcm/accepted/correction_pages.json (idempotent, append-only).
+        Step 6 reads this file to target answer-key pages directly."""
+        if not pages:
+            return
+        path = self._correction_pages_path()
+        existing: List[int] = []
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                existing = list(data.get("correction_pages", []) if isinstance(data, dict) else [])
+            except Exception as e:
+                print(f"[CORRECTION-PAGE] ⚠️ could not parse existing file: {e}")
+                existing = []
+        merged = sorted(set(existing) | set(int(p) for p in pages))
+        try:
+            path.write_text(
+                json.dumps({"correction_pages": merged}, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            if set(existing) != set(merged):
+                print(f"[CORRECTION-PAGE] 💾 correction_pages.json → {merged}")
+        except Exception as e:
+            print(f"[CORRECTION-PAGE] ⚠️ save failed: {e}")
+
+    # Back-compat name for run()/tests
+    def _save_correction_page_markers(self, pages: List[int]):
+        self._save_correction_pages(pages)
     
     def _parse_json(self, content: str) -> List[Dict]:
         """Parse JSON from LLM response. Truncation-safe AND bracket-safe:

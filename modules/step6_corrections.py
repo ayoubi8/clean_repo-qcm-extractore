@@ -1066,9 +1066,47 @@ DOCUMENT TEXT:
         # Running correction map accumulated across all pages
         correction_map: Dict[str, str] = {}
 
-        for pn in all_pages:
+        # Correction-page passthrough from Step 2: pages the extractor marked
+        # as answer-key-only ({"page": X, "correction_page": true}) are scanned
+        # FIRST and tagged correction_page_X in telemetry. Everything else
+        # keeps the normal scan. Without the marker file the scan order is
+        # unchanged (fully backward compatible).
+        try:
+            if self.context:
+                _marker_path = self.context.get_path("step2_qcm", "accepted") / "correction_pages.json"
+            else:
+                _marker_path = Path("output/step2_qcm/accepted/correction_pages.json")
+            _marker_data = {}
+            if _marker_path.exists():
+                try:
+                    _marker_data = json.loads(_marker_path.read_text(encoding="utf-8"))
+                except Exception as _me:
+                    print(f"[STEP6] ⚠️ could not parse correction_pages.json: {_me}")
+            corr_pages = sorted(
+                int(p) for p in (_marker_data.get("correction_pages", []) if isinstance(_marker_data, dict) else [])
+                if isinstance(p, (int, float, str)) and str(p).lstrip('.').isdigit()
+            )
+        except Exception as _me:
+            corr_pages = []
+
+        if corr_pages:
+            valid = set(all_pages)
+            valid_corr = [p for p in corr_pages if p in valid]
+            dropped = [p for p in corr_pages if p not in valid]
+            if dropped:
+                print(f"[STEP6] ⚠️ correction pages {dropped} are outside the scanned set — ignored.")
+            scan_order = sorted(valid_corr) + [p for p in all_pages if p not in set(valid_corr)]
+            print(f"⚡ Step 2 marked {len(valid_corr)} answer-key page(s) {valid_corr} — "
+                  "scanned first; remaining pages in normal order.")
+        else:
+            scan_order = list(all_pages)
+
+        from modules.utils import call_logger as _telemetry
+        for pn in scan_order:
+            _telemetry.set_item_ref(
+                f"correction_page_{pn}" if pn in set(corr_pages) else f"page_{pn}")
             text = page_texts.get(pn, "")
-            print(f"\n   📄 Page {pn} ({len(text)} chars)...")
+            print(f"\n   📄 Page {pn} ({len(text)} chars){' [answer-key page from Step 2]' if pn in set(corr_pages) else ''}...")
 
             # 1) Deterministic cascade first — fast, free, exact on clean tables
             page_map = self._extract_single_page_corrections(text, pn, deterministic_only=True)
@@ -1175,6 +1213,9 @@ PAGE {pn} TEXT:
                 print(f"     → Page {pn}: merged {len(page_map)} correction(s). Running total: {len(correction_map)}")
             else:
                 print(f"     → Page {pn}: no corrections found.")
+
+        # Clear the per-page telemetry reference before the map-apply phase
+        _telemetry.set_item_ref(None)
 
         # ── Apply the accumulated correction map ──
         if not correction_map:

@@ -98,6 +98,16 @@ def item_scope(item_ref: Optional[str]):
         _item_ref.reset(item_token)
 
 
+def set_item_ref(item_ref: Optional[str]):
+    """Set/clear a long-lived item_ref (multi-call blocks). Returns a token
+    for reset_item_ref()."""
+    return _item_ref.set(item_ref)
+
+
+def reset_item_ref(token):
+    _item_ref.reset(token)
+
+
 def current_sub_step() -> Optional[str]:
     ctx = _call_ctx.get()
     return ctx.sub_step if ctx else None
