@@ -31,7 +31,7 @@ from modules.cas_text_split import run_cas_text_split
 def _trace(stage: str, event: str, elapsed_ms: int = None, detail: str = ""):
     """Single-line greppable cascade marker. Print-only, no DB, no side effects.
 
-    Stages: guard | hint | cas_split | step3 | checker | build | copyback | cascade
+    stages: guard | hint | cas_split | step3 | boundary | checker | build | copyback | cascade
     Events: START | END | ERROR | SKIP
     A "stuck after Step 2" repro = find the last START with no matching END.
     """
@@ -270,6 +270,31 @@ def run_post_step2_metadata(tracker, context, user_id: str, project: str,
             return {"status": "error", "stage": "step3", "detail": str(e),
                     "hint": hint_result, "cas_split": cas_split_result}
 
+    # 2.4 Phase 5 — BOUNDED boundary check: one verification call per
+    #     `ends_here` transition (only fired when a case actually ended, and
+    #     only when Step 3 actually ran — a skipped Step 3 produces no fresh
+    #     queue). YES ⇒ cas re-attached; NO/unresolved ⇒ unlink stands.
+    #     Soft-fail: never blocks the cascade.
+    boundary_result: Dict = {"status": "not_run"}
+    if step3_status == "done" and _clinical_case_enabled(step3_config):
+        _trace("boundary", "START")
+        b_t0 = _now_ms()
+        from modules.clinical_case_checker import run_boundary_checks
+        try:
+            with sub_step_scope("boundary_checks"):
+                boundary_result = run_boundary_checks(tracker, context)
+            _trace("boundary", "END", _now_ms() - b_t0,
+                   f"status={boundary_result.get('status')}")
+        except Exception as e:
+            traceback.print_exc()
+            boundary_result = {"status": "error", "detail": str(e)}
+            _trace("boundary", "ERROR", _now_ms() - b_t0,
+                   f"{type(e).__name__}: {e}")
+            print(f"[CC-BOUNDARY] ⚠️ ERROR: boundary check failed: {e} — "
+                  "ends_here relinks were NOT re-verified. Cascade continues.")
+    elif step3_status == "skipped":
+        _trace("boundary", "SKIP", 0, "step3_skipped_no_fresh_queue")
+
     # 2.5 Phase 1 — Clinical Case Checker: verify every cascaded Cas Clinique
     #     link with a cheap/fast model, one question per QCM, BEFORE the
     #     Step 4/5 build consumes the `cas` fields. Runs only when the
@@ -363,4 +388,5 @@ def run_post_step2_metadata(tracker, context, user_id: str, project: str,
 
     _trace("cascade", "END", _now_ms() - cascade_t0, f"status={status}")
     return {"status": status, "step3": step3_status, "hint": hint_result,
-            "cas_split": cas_split_result, "cc_check": cc_check, "build": build}
+            "cas_split": cas_split_result, "boundary": boundary_result,
+            "cc_check": cc_check, "build": build}

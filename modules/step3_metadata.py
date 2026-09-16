@@ -2,7 +2,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 
 from modules.openrouter_client import OpenRouterClient
 from modules.utils.cost_tracker import CostTracker
@@ -476,6 +476,7 @@ DOCUMENT:
         
         cc_carry_over = None  # Carries active CC text from page to page (sequential mode)
         cc_all_qcms   = []    # [(page_num, qcm_num, cas_text)] for end-of-run stats
+        cc_boundary_queue = []  # ends_here transitions collected per file (Phase 5 consumer)
         
         for i, q_file in enumerate(qcm_files, 1):
             if cancel_check and cancel_check():
@@ -500,15 +501,20 @@ DOCUMENT:
             else:
                 print(f"   Batch {i}/{total}: Applying metadata...")
             
-            # ── Cas Clinique (Per-Group) detection ─────────────────────
+            # ── Cas Clinique detection (per_group CC) or hygiene-only skip ──
+            # Phase 6: strategy "S" reuses the SAME per-page detection call,
+            # but propagation/linkage is disabled (text hygiene without
+            # linkage). Strategy "G" (global) is untouched by the redesign.
             cas_by_number: Dict[int, str] = {}
-            if cc_strategy == "CC":
+            if cc_strategy in ("CC", "S"):
+                linkage_on = (cc_strategy == "CC")
                 # Try to derive page number from filename (page_1.json → 1)
                 page_num = None
                 m = re.search(r'(\d+)', q_file.name)
                 if m:
                     page_num = int(m.group(1))
 
+                page_carry = cc_carry_over if linkage_on else None
                 if page_num is not None:
                     # ── Named page file (page_N.json) — sequential propagation logic ──
                     hints = [q.get("clinical_case_hint") for q in qcms if q.get("clinical_case_hint")]
@@ -529,13 +535,14 @@ DOCUMENT:
                         print(f"   🔍 Page {page_num}: Detecting CC ({len(qcm_numbers)} QCMs) → LLM call...")
                         from modules.utils.call_logger import item_scope as _is2
                         with _is2(f"page_{page_num}"):
-                            llm_results = self._detect_cc_sequential_page(page_text, qcm_numbers)
+                            cc_map = self._detect_cc_sequential_page(page_text, qcm_numbers, carry_over=page_carry)
 
-                        triggers = {num: cas for num, cas in llm_results.items() if cas is not None}
+                        triggers = {num: info for num, info in cc_map.items()
+                                    if info.get("status") == "new_case"}
                         if triggers:
-                            for num, cas in triggers.items():
-                                label     = cas.split("\r\n")[0] if "\r\n" in cas else "CAS CLINIQUE"
-                                narrative = cas.split("\r\n", 1)[1] if "\r\n" in cas else cas
+                            for num, info in triggers.items():
+                                label     = info.get("label") or "CAS CLINIQUE"
+                                narrative = info.get("text") or ""
                                 preview   = narrative[:80] + ("..." if len(narrative) > 80 else "")
                                 print(f"      📋 CC triggered at Q{num} ({label}): \"{preview}\"")
                         else:
@@ -544,7 +551,11 @@ DOCUMENT:
                             else:
                                 print(f"      ℹ️  No Cas Clinique on page {page_num}.")
 
-                        qcms, cc_carry_over = self._propagate_cas_clinique(qcms, llm_results, cc_carry_over)
+                        qcms, cc_carry_over, _notes, _bq = self._propagate_cas_clinique(
+                            qcms, cc_map, page_carry, linkage=linkage_on
+                        )
+                        if linkage_on:
+                            cc_boundary_queue.extend(_bq)
 
                         if cc_carry_over:
                             carry_label = cc_carry_over.split("\r\n")[0] if "\r\n" in cc_carry_over else "CAS CLINIQUE"
@@ -552,7 +563,8 @@ DOCUMENT:
 
                     else:
                         # No page text found — apply carry-over without LLM call
-                        if cc_carry_over:
+                        # (linkage only; under skip nothing carries anyway)
+                        if cc_carry_over and linkage_on:
                             for qcm in qcms:
                                 qcm["cas"] = cc_carry_over
 
@@ -589,7 +601,7 @@ DOCUMENT:
 
                             if not pg_txt.exists():
                                 print(f"      ⚠️  No page_{pg_num}.txt — applying carry-over only.")
-                                if cc_carry_over:
+                                if cc_carry_over and linkage_on:
                                     for q in pg_qcms:
                                         q["cas"] = cc_carry_over
                                 # Collect for stats
@@ -607,26 +619,29 @@ DOCUMENT:
 
                             from modules.utils.call_logger import item_scope as _is3
                             with _is3(f"page_{pg_num}"):
-                                llm_results = self._detect_cc_sequential_page(pg_text, qcm_numbers)
+                                cc_map = self._detect_cc_sequential_page(pg_text, qcm_numbers, carry_over=page_carry)
 
-                            triggers = {num: cas for num, cas in llm_results.items() if cas is not None}
+                            triggers = {num: info for num, info in cc_map.items()
+                                        if info.get("status") == "new_case"}
                             if triggers:
-                                for num, cas in triggers.items():
-                                    label     = cas.split("\r\n")[0] if "\r\n" in cas else "CAS CLINIQUE"
-                                    narrative = cas.split("\r\n", 1)[1] if "\r\n" in cas else cas
+                                for num, info in triggers.items():
+                                    label     = info.get("label") or "CAS CLINIQUE"
+                                    narrative = info.get("text") or ""
                                     preview   = narrative[:80] + ("..." if len(narrative) > 80 else "")
                                     print(f"         📋 CC triggered at Q{num} ({label}): \"{preview}\"")
                             else:
-                                if cc_carry_over:
+                                if cc_carry_over and linkage_on:
                                     print(f"         ↩️  No new CC on page {pg_num} — carry-over active.")
                                 else:
                                     print(f"         ℹ️  No Cas Clinique on page {pg_num}.")
 
-                            pg_qcms, cc_carry_over = self._propagate_cas_clinique(
-                                pg_qcms, llm_results, cc_carry_over
+                            pg_qcms, cc_carry_over, _notes, _bq = self._propagate_cas_clinique(
+                                pg_qcms, cc_map, page_carry, linkage=linkage_on
                             )
+                            if linkage_on:
+                                cc_boundary_queue.extend(_bq)
 
-                            if cc_carry_over:
+                            if cc_carry_over and linkage_on:
                                 carry_label = cc_carry_over.split("\r\n")[0] if "\r\n" in cc_carry_over else "CAS CLINIQUE"
                                 print(f"         ↪️  Carry-over to next page: \"{carry_label}\" (active)")
 
@@ -676,21 +691,109 @@ DOCUMENT:
         if cc_strategy == "CC" and cc_all_qcms:
             self._print_cc_stats(cc_all_qcms)
 
+        # Phase 2 boundary-transition stash: Phase 5's bounded boundary check
+        # (run_boundary_checks) is the designated consumer. Phase 5: the
+        # queue is persisted for that consumer (no longer inert in-memory only).
+        # Phase 6: under skip, linkage is off — no transitions ever queue.
+        self._cc_boundary_pending_queue = list(cc_boundary_queue)
+        if cc_boundary_queue and cc_strategy == "CC":
+            self._save_boundary_transitions(list(cc_boundary_queue))
+        if cc_boundary_queue:
+            print(f"[CC-STATE] {len(cc_boundary_queue)} ends_here transition(s) "
+                  f"queued for the boundary check")
+
+    def _save_boundary_transitions(self, transitions: List[Dict]) -> None:
+        """Phase 5: persist the ends_here transition queue for
+        run_boundary_checks. Written to the step3_metadata folder ROOT (NOT
+        accepted/, which downstream glob-reads as QCM lists). Replaces the
+        file each run — every fired Step 3 enqueue is fresh."""
+        payload = {"transitions": transitions or []}
+        try:
+            if self.context:
+                d = self.context.get_path("step3_metadata")
+            else:
+                d = Path("output/step3_metadata")
+            d.mkdir(parents=True, exist_ok=True)
+            with open(d / "cc_boundary_transitions.json", "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"[CC-STATE] ⚠️ could not save boundary transitions: {e}")
+
     # ─────────────────────────────────────────────────────────────
     # NEW: Sequential CC detection + propagation methods
     # ─────────────────────────────────────────────────────────────
 
-    def _detect_cc_sequential_page(self, page_text: str, qcm_numbers: List[int]) -> Dict:
+    # Valid 5-status enum for the Phase 1 state-aware classifier
+    _CC_STATUSES = ("new_case", "continues", "ends_here", "unrelated", "uncertain")
+
+    def _parse_cc_statuses(self, content: str, qcm_numbers: List[int]) -> Dict[int, Dict]:
+        """Parse the 5-status classifier response into
+        {qcm_number: {"status": ..., "label": ..., "text": ...}}.
+
+        Robustness contract:
+        - Status strings outside the enum are coerced to "uncertain".
+        - A listed number with NO entry in the response defaults to "uncertain"
+          (never silently dropped).
+        - An entry with no explicit "status" infers one: cas_text non-null
+          → "new_case", else "uncertain" (keeps simple responses parseable).
+        - A response that parses to an EMPTY array → {} (no entries at all).
         """
-        Per-page LLM call for sequential CC detection.
+        cleaned = re.sub(r'```(?:json)?\s*', '', content or '')
+        cleaned = re.sub(r'```\s*', '', cleaned).strip()
+        match = re.search(r'\[.*\]', cleaned, re.DOTALL)
+        if not match:
+            return None
+        json_str = re.sub(r',(\s*[}\]])', r'\1', match.group(0))
+        try:
+            data = json.loads(json_str)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, list):
+            return None
+        if not data:
+            return {}
+        result: Dict[int, Dict] = {}
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            num = entry.get("number")
+            if num is None:
+                continue
+            status = entry.get("status")
+            if isinstance(status, str):
+                status = status.strip().lower()
+            if status not in self._CC_STATUSES:
+                cas_text = entry.get("cas_text")
+                status = "new_case" if cas_text else "uncertain"
+            label = entry.get("cas_label") or "CAS CLINIQUE"
+            text = entry.get("cas_text")
+            result[num] = {"status": status, "label": label, "text": text}
+        for n in qcm_numbers:
+            if n not in result:
+                result[n] = {"status": "uncertain", "label": None, "text": None}
+        return result
 
-        Asks the LLM which QCM (if any) is the FIRST question of a new Cas Clinique.
-        Only the trigger QCM gets the narrative text — all others return null.
-        Python propagation (_propagate_cas_clinique) spreads the text downstream.
+    def _detect_cc_sequential_page(self, page_text: str, qcm_numbers: List[int],
+                                   carry_over: Optional[str] = None) -> Dict:
+        """
+        Per-page LLM call for state-aware CC detection (Phase 2 contract).
 
-        Returns:
-            { qcm_number: "LABEL\\r\\nNarrative" }  for trigger QCMs
-            { qcm_number: None }                    for all others
+        State-aware classifier: for each QCM number it picks exactly ONE of:
+          new_case  — first question of a fresh narrative on THIS page (+ label/text)
+          continues — explicitly depends on the currently active (carried-over) case
+          ends_here — the active case does NOT cover this QCM (explicit termination)
+          unrelated — no case applies, and none was running
+          uncertain — ambiguous, defer to the checker (same as today's fallback)
+
+        Narratives in this corpus usually have NO "CAS CLINIQUE" header, so the
+        classifier anchors on patient-specific content vs question-stem language,
+        including narratives FUSED into the QCM's own text block.
+
+        Returns (Phase 2 contrat — the raw status map):
+            { qcm_number: {"status", "label", "text"} }
+            An EMPTY map ({}) means the call produced no usable page decision
+            (failure/garbage/empty response) — the Python state machine then
+            treats every listed number as "uncertain" (legacy-propagate).
         """
         if not page_text.strip() or not qcm_numbers:
             return {}
@@ -698,25 +801,60 @@ DOCUMENT:
         nums_str = ", ".join(str(n) for n in qcm_numbers)
         max_input_chars = int(os.getenv("STEP3_MAX_INPUT_CHARS", "24000"))
 
-        prompt = f"""You are analyzing a French medical exam page for Cas Clinique (clinical case) detection.
+        if carry_over:
+            co = carry_over
+            if "\r\n" in co:
+                co_label, co_narrative = co.split("\r\n", 1)
+            elif "\n" in co:
+                co_label, co_narrative = co.split("\n", 1)
+            else:
+                co_label, co_narrative = "CAS CLINIQUE", co
+            co_preview = co_narrative[:1500]
+            carry_block = f"""
+CURRENTLY ACTIVE CASE (carried over from an earlier page — running now):
+- Label: {co_label}
+- Narrative (may be truncated): {co_preview}
+Questions on THIS page may belong to THAT case ("continues") or the case may
+end before them ("ends_here") — judge each number individually.
+"""
+        else:
+            carry_block = """
+CURRENTLY ACTIVE CASE (carried over from an earlier page): NONE.
+A new narrative may START on this page ("new_case") — none is running already.
+"""
 
-TASK: For each QCM number listed below, decide if it is the VERY FIRST question of a NEW clinical case narrative introduced on this page.
+        prompt = f"""You are analyzing a French medical exam page for Cas Clinique (clinical case) detection.
+{carry_block}
+TASK: For EACH QCM number listed below, output exactly ONE status:
+- "new_case"   : this question is the FIRST question of a NEW clinical case narrative appearing on this page. Fill "cas_label" (exact label as written, or "CAS CLINIQUE" if none exists) and "cas_text" (the patient story ONLY — everything between the case header/start and the first numbered question; do NOT include the title or the questions).
+- "continues"  : a case is already running (see CURRENTLY ACTIVE CASE), this question belongs to it, and NO new case starts here.
+- "ends_here"  : a case WAS running, but the active case does NOT inform this question. No new case starts.
+- "unrelated"  : no clinical case applies, and none is running.
+- "uncertain"  : genuinely ambiguous — you cannot decide confidently.
+
+FUSED-NARRATIVE RULE (critical): in this corpus a patient narrative often has NO
+"CAS CLINIQUE" header, and it may even be FUSED directly into what looks like a
+single question block with no separator. Even when patient-specific content
+(age, presenting complaint, history, exam or lab findings, started treatment)
+precedes the actual interrogative/imperative sentence inside one question block,
+classify that block "new_case" (derive the label as "CAS CLINIQUE"). A patient
+narrative is NEVER background for the question — extract it, never fold it in.
+Anchor on third-person descriptive patient content, NOT on imperative or
+interrogative stems like "Quelle est votre conduite...", "Parmi les
+propositions suivantes..." or "Conduite face a...".
 
 CRITICAL RULES:
 1. Return a JSON array with EXACTLY ONE entry per QCM number listed below — no more, no less.
-2. "cas_text" must be non-null ONLY for the very first question of each new clinical case.
-3. All other questions of the SAME case → "cas_text": null  (do NOT repeat the narrative)
-4. Questions with no clinical case → "cas_text": null
-5. "cas_text" must contain ONLY the patient story (everything between the "CAS CLINIQUE" header and the first numbered question). Do NOT include the case title.
-6. "cas_label" must be the exact label as written in the text (e.g. "CAS CLINIQUE 1"). Use "CAS CLINIQUE" if no label exists.
+2. Questions of the SAME case after its first one → "continues" (or "ends_here"); do NOT repeat the narrative in them.
+3. "cas_text" is required ONLY for "new_case"; all other statuses use null.
+4. Do NOT include the case title inside "cas_text".
 
-EXAMPLE — page has "CAS CLINIQUE 1: Patient X, 45 ans..." then Q5, Q6, Q7, then "CAS CLINIQUE 2: Patient Y, 30 ans..." then Q8, Q9:
+ANSWER FORMAT (JSON array):
 [
-  {{"number": 5, "cas_label": "CAS CLINIQUE 1", "cas_text": "Patient X, 45 ans..."}},
-  {{"number": 6, "cas_label": null, "cas_text": null}},
-  {{"number": 7, "cas_label": null, "cas_text": null}},
-  {{"number": 8, "cas_label": "CAS CLINIQUE 2", "cas_text": "Patient Y, 30 ans..."}},
-  {{"number": 9, "cas_label": null, "cas_text": null}}
+  {{"number": 5, "status": "new_case", "cas_label": "CAS CLINIQUE 1", "cas_text": "Patient X, 45 ans..."}},
+  {{"number": 6, "status": "continues", "cas_label": null, "cas_text": null}},
+  {{"number": 7, "status": "ends_here", "cas_label": null, "cas_text": null}},
+  {{"number": 8, "status": "unrelated", "cas_label": null, "cas_text": null}}
 ]
 
 QCM NUMBERS ON THIS PAGE: [{nums_str}]
@@ -741,31 +879,18 @@ PAGE TEXT:
                 model_used = fallback_model
 
             content = resp["content"].strip()
-            content = re.sub(r'```(?:json)?\s*', '', content)
-            content = re.sub(r'```\s*', '', content).strip()
 
-            match = re.search(r'\[.*\]', content, re.DOTALL)
-            if match:
-                json_str = match.group(0)
-                json_str = re.sub(r',(\s*[}\]])', r'\1', json_str)
-                data = json.loads(json_str)
-
+            status_map = self._parse_cc_statuses(content, qcm_numbers)
+            if status_map is not None:
                 cost = resp.get('cost', 0.0) or self.client.estimate_cost(model_used, resp["usage"])
                 self.cost_tracker.log_api_call("step3_cc_sequential", model_used, resp["usage"], cost)
+                # Phase 2: return the raw 5-status map. An empty array
+                # response also yields {} — downstream propagation then
+                # treats every listed number as "uncertain"
+                # (legacy-propagate), never as a hard negative.
+                return status_map
 
-                if isinstance(data, list):
-                    result = {}
-                    for entry in data:
-                        num       = entry.get("number")
-                        cas_text  = entry.get("cas_text")
-                        cas_label = entry.get("cas_label") or "CAS CLINIQUE"
-                        if num is not None:
-                            result[num] = f"{cas_label}\r\n{cas_text}" if cas_text else None
-                    return result
-            else:
-                if content.strip() in ["[]", "[ ]"]:
-                    return {n: None for n in qcm_numbers}
-                print("⚠️ No JSON array found in CC sequential detection response.")
+            print("⚠️ No JSON array found in CC sequential detection response.")
 
         except json.JSONDecodeError as e:
             print(f"⚠️ CC sequential detection JSON decode error: {e}")
@@ -774,39 +899,110 @@ PAGE TEXT:
 
         return {}
 
+    def _normalize_cc_info(self, info) -> Dict:
+        """Normalize one per-QCM detection payload into a status dict.
+        Accepts the current 5-status dict shape and, for robustness, the
+        legacy string shape ("LABEL\\r\\nNarrative" implied a new_case)."""
+        if not info:
+            return {"status": "uncertain", "label": None, "text": None}
+        if isinstance(info, str):
+            if "\r\n" in info:
+                label, text = info.split("\r\n", 1)
+            elif "\n" in info:
+                label, text = info.split("\n", 1)
+            else:
+                label, text = "CAS CLINIQUE", info
+            return {"status": "new_case",
+                    "label": label or "CAS CLINIQUE", "text": text}
+        return info
+
     def _propagate_cas_clinique(self, qcms: List[Dict],
-                                llm_results: Dict,
-                                carry_over: Optional[str] = None) -> tuple:
-        """
-        Deterministic Python propagation of Cas Clinique text.
+                                cc_map: Dict,
+                                carry_over: Optional[str] = None,
+                                linkage: bool = True) -> tuple:
+        """Phase 2 — status-driven propagation state machine (pure Python).
 
-        Walks QCMs in document order. When a QCM has a non-null LLM result,
-        it becomes the new 'current_cas' and is applied to that QCM and all
-        subsequent ones until a new trigger is found. The carry_over from the
-        previous page is the initial state — enabling seamless cross-page cases.
+        Consumes the 5-status detector map {qcm_number: {"status", "label",
+        "text"}} per page and replaces the legacy blind forward-propagation:
 
-        Args:
-            qcms        : QCM dicts for this page (in Step 2 document order)
-            llm_results : { qcm_number: cas_str | None } from _detect_cc_sequential_page()
-            carry_over  : Active CC text inherited from the previous page (or None)
+          new_case  -> current case replaced by the fresh narrative; attached
+                       here and downstream until the next change.
+          continues -> the active (carried-over) case EXPLICITLY confirmed;
+                       attached. If nothing is running this degrades to a
+                       no-op (cannot confirm a case that does not exist).
+          ends_here -> the case CLOSES: no attach here or downstream until
+                       the next new_case. The immediate boundary is queued
+                       for the Phase 5 bounded boundary check (one call per
+                       transition, fired only when a case actually ended).
+                       Outcomes land in "case_belonging_check" later via
+                       _process_qcms; the queue itself stays inert in this
+                       module (auditable, no side effects beyond the note).
+          unrelated -> no linkage at all; NO case_belonging_check entry.
+          uncertain -> legacy safety valve: persist the running case if any
+                       (today's blind-propagate behavior), and record an
+                       audit note; a technical failure or an individual
+                       uncertain can NEVER clear a case.
+
+        Also attaches per-QCM "case_belonging_check" notes directly (only for
+        real linkage decisions — new_case/continues/ends_here/uncertain;
+        unrelated is deliberately unnoted, per the population rule).
 
         Returns:
-            (updated_qcms, new_carry_over)
+            (updated_qcms, new_carry_over, check_notes, boundary_queue)
+            boundary_queue: [{case_cas, trigger_page/number/uid}] — inert
+            until Phase 5 (run_boundary_checks).
         """
-        current_cas = carry_over
+        current_cas = carry_over if linkage else None
+        check_notes: Dict[Any, str] = {}
+        boundary_queue: List[Dict] = []
 
         for qcm in qcms:
-            num     = qcm.get("number") or qcm.get("Num")
-            llm_cas = llm_results.get(num) if num is not None else None
+            num   = qcm.get("number") or qcm.get("Num")
+            info  = self._normalize_cc_info(cc_map.get(num) if num is not None else None)
+            st    = info.get("status") or "uncertain"
 
-            if llm_cas is not None:
-                current_cas = llm_cas  # New case triggered — update running state
+            if not linkage:
+                # Phase 6 — skip strategy: hygiene WITHOUT linkage.
+                # Text hygiene only: a detected narrative is applied to the
+                # QCM(s) it is directly attached to (fused/triggered QCM),
+                # NEVER carried forward — no chains, no "continues" linkage,
+                # NO case_belonging_check entries (they are reserved for
+                # actual linkage decisions, and none are made under skip).
+                # The CC Checker / boundary check must not run under skip.
+                if st == "new_case" and info.get("text"):
+                    qcm["cas"] = (f"{info.get('label') or 'CAS CLINIQUE'}"
+                                  f"\r\n{info['text']}")
+                continue
 
-            if current_cas is not None:
+            if st == "new_case" and info.get("text"):
+                current_cas = f"{info.get('label') or 'CAS CLINIQUE'}\r\n{info['text']}"
                 qcm["cas"] = current_cas
-            # If current_cas is None → no "cas" key set (clean, no null stored)
+                note = f"new_case: {info.get('label') or 'CAS CLINIQUE'} starts this case"
+            elif st == "continues" and current_cas is not None:
+                qcm["cas"] = current_cas
+                note = "continues: detector confirmed the carried-over case"
+            elif st == "ends_here" and current_cas is not None:
+                boundary_queue.append({
+                    "case_cas": current_cas,
+                    "trigger_page": qcm.get("page"),
+                    "trigger_number": num,
+                    "trigger_uid": qcm.get("uid"),
+                })
+                current_cas = None
+                note = "ends_here: case does not inform this question"
+            elif st == "uncertain":
+                if current_cas is not None:
+                    qcm["cas"] = current_cas
+                note = ("uncertain: ambiguous — legacy propagation kept"
+                        + (" (attached)" if qcm.get("cas") else " (nothing running)"))
+            else:
+                note = None  # unrelated (or continues/ends_here with no case running)
 
-        return qcms, current_cas
+            if note and note != "unrelated":
+                qcm["case_belonging_check"] = note
+                check_notes[num] = note
+
+        return qcms, current_cas, check_notes, boundary_queue
 
     def _print_cc_stats(self, cc_all_qcms: List[tuple]) -> None:
         """

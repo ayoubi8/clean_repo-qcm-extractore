@@ -62,6 +62,10 @@ DEFAULT_CC_MODEL = "inception/mercury-2.5-preview"
 DEFAULT_CC_FALLBACK = "google/gemini-2.0-flash-lite-001"
 DEFAULT_CC_MAX_PARALLEL = 5
 
+# Phase 5 — bounded boundary check (one verification call per ends_here transition)
+BOUNDARY_QUEUE_FILENAME = "cc_boundary_transitions.json"   # written by Step 3
+BOUNDARY_AUDIT_FILENAME = "cc_boundary_checks.json"        # written by this module
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Loading + chain building
@@ -146,10 +150,27 @@ def _render_propositions(qcm: Dict) -> str:
     return "\n".join(lines) if lines else "(no propositions)"
 
 
-def _verification_prompt(cas: str, qcm: Dict) -> str:
+def _render_case_facts(ledger: Optional[List[str]]) -> str:
+    """Render the accumulated patient-fact ledger as a prompt block (Phase 4).
+    Empty/None -> "" (no block). Patient-scoped guard is baked into the text
+    so every prompt shape (main + §7 re-check) enforces the same constraint."""
+    if not ledger:
+        return ""
+    lines = "\n".join(f"- {item}" for item in ledger)
+    return (
+        "ACCUMULATED CASE FACTS (established by earlier questions of this case):\n"
+        f"{lines}\n"
+        "This list contains ONLY patient-specific facts (age, findings, labs,\n"
+        "established diagnosis). It never contains general subject/topic\n"
+        "language. Judge with the definition exactly.\n"
+    )
+
+
+def _verification_prompt(cas: str, qcm: Dict, ledger: Optional[List[str]] = None) -> str:
     label, narrative = _split_cas(cas)
     question = qcm.get("text") or qcm.get("Text") or "(no question text)"
     propositions = _render_propositions(qcm)
+    ledger_block = _render_case_facts(ledger)
     return f"""You verify whether a multiple-choice question (QCM) really belongs to a clinical case.
 
 DEFINITION — apply it exactly:
@@ -160,7 +181,7 @@ NOT belong — even if it deals with the same medical subject.
 
 CLINICAL CASE — {label}:
 {narrative}
-
+{ledger_block}
 QUESTION:
 {question}
 
@@ -168,7 +189,7 @@ PROPOSITIONS:
 {propositions}
 
 Reply with ONE line of JSON only — no markdown, no explanation:
-{{"applies": true, "confidence": 0.9}}"""
+{{"applies": true, "confidence": 0.9, "case_facts_used": "<short note naming the patient-specific facts (if any) needed to answer>"}}"""
 
 
 def _parse_verdict(content: str) -> Optional[Dict]:
@@ -197,20 +218,29 @@ def _parse_verdict(content: str) -> Optional[Dict]:
             confidence = max(0.0, min(1.0, float(confidence)))
         else:
             confidence = None
+        case_facts = data.get("case_facts_used")
+        if isinstance(case_facts, str) and case_facts.strip():
+            return {"applies": applies, "confidence": confidence,
+                    "case_facts_used": case_facts}
         return {"applies": applies, "confidence": confidence}
     except Exception:
         return None
 
 
-def _recheck_prompt(cas: str, suspicious_qcm: Dict, next_qcm: Dict) -> str:
+def _recheck_prompt(cas: str, suspicious_qcm: Dict, next_qcm: Dict,
+                    ledger: Optional[List[str]] = None) -> str:
     """Spec §7 re-check prompt: one provisional NO followed by a YES.
 
     Decides ONLY for QCM A (the provisional NO). QCM B (the confirmed YES
     right after it) is shown as context evidence.
+    Phase 4: also receives the accumulated patient-fact ledger with the same
+    patient-facts-only guard, so the lone-NO judgement sees the same case
+    context as the surrounding chain — never different evidence per shape.
     """
     label, narrative = _split_cas(cas)
     a_text = suspicious_qcm.get("text") or suspicious_qcm.get("Text") or "(no question text)"
     b_text = next_qcm.get("text") or next_qcm.get("Text") or "(no question text)"
+    ledger_block = _render_case_facts(ledger)
     return f"""You are re-checking one judgment about a multiple-choice question (QCM) and a clinical case.
 
 QCM A below was provisionally judged NOT to belong to the clinical case, but the
@@ -225,7 +255,7 @@ NOT belong — even if it deals with the same medical subject.
 
 CLINICAL CASE — {label}:
 {narrative}
-
+{ledger_block}
 QCM A (provisional NO — judge this one):
 {a_text}
 
@@ -263,17 +293,233 @@ async def _ask_verdict_async(client: OpenRouterClient, tracker, prompt: str,
 
 
 async def _verify_one_async(client: OpenRouterClient, tracker, qcm: Dict, cas: str,
-                            primary_model: str, fallback_model: str,
-                            max_tokens: int) -> Dict:
-    """One simple verification request for one QCM. Primary then fallback."""
+                            primary_model: str, fallback_model: str, max_tokens: int,
+                            ledger: Optional[List[str]] = None) -> Dict:
+    """One simple verification request for one QCM. Primary then fallback.
+    Phase 4: the accumulating patient-fact ledger is passed verbatim into
+    the prompt (same guard text as main-chain verification)."""
     return await _ask_verdict_async(
-        client, tracker, _verification_prompt(cas, qcm),
-        primary_model, fallback_model, max_tokens)
+        client, tracker, _verification_prompt(cas, qcm, ledger), primary_model,
+        fallback_model, max_tokens)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Idempotency
+# Phase 5 — bounded boundary check (ends_here reconciliation)
 # ─────────────────────────────────────────────────────────────────────────────
+
+def run_boundary_checks(tracker, context) -> Dict:
+    """Phase 5 — ONE verification call per `ends_here` transition.
+
+    Mechanism (plan §5 FIX 1): the state-aware detector can close a running
+    case ("ends_here"), which produces a QCM that carries NO `cas` — a QCM
+    the normal checker will structurally never see (chains are built only
+    over linked QCMs). A wrongly-fired `ends_here` would silently under-link
+    forever. This check catches exactly that, bounded: it fires per
+    case-ending transition, never per QCM.
+
+    Input queue (written by Step 3):
+        step3_metadata/cc_boundary_transitions.json
+        {"transitions": [{"case_cas", "trigger_page", "trigger_number",
+                          "trigger_uid"}, ...]}    # one entry per transition
+
+    Per transition:
+      1. Resolve the BOUNDARY QCM = the entry immediately AFTER the trigger
+         QCM in document order (cross-file resolution included: a case can
+         leak past a page boundary).
+      2. Skip without a call when: no following QCM (trigger is the last
+         entry of the document), or the boundary QCM already carries a case
+         (a later new_case claimed it — relinking would overwrite).
+      3. Otherwise ONE verification call using `_verification_prompt` with
+         the case that just closed (same applies/confidence definition,
+         same cheap model budget).
+      4. Outcome handling, stated plainly:
+           - YES         -> `cas` IS re-attached ("LABEL\\r\\nNarrative") and
+                            case_belonging_check records the re-link reason;
+                            the QCM now carries cas, so normal chain
+                            building verifies it afterwards organically.
+           - NO          -> unlink stands; note recorded.
+           - unresolved  -> unlink stands (technical failure never
+                            silently relinks); note recorded.
+
+    Idempotency: sha1 of (accepted uid set + queue content) stored in
+    step3_metadata/cc_boundary_checks.json; an identical re-run is skipped.
+    Soft-fail: the only bounded extra-budget item in the redesign; an error
+    is reported and never blocks the cascade.
+
+    Returns {"status": "ok|no_transitions|skipped", "stats": {...}}.
+    """
+    import hashlib
+
+    try:
+        step3_dir = Path(context.get_path("step3_metadata"))
+        accepted_dir = Path(context.get_path("step3_metadata", "accepted"))
+    except Exception as e:
+        return {"status": "error", "detail": f"project context error: {e}"}
+
+    queue_file = step3_dir / BOUNDARY_QUEUE_FILENAME
+    if not queue_file.exists():
+        return {"status": "no_transitions"}
+    try:
+        with open(queue_file, "r", encoding="utf-8") as f:
+            queue_raw = json.load(f)
+        queue = queue_raw.get("transitions", []) if isinstance(queue_raw, dict) else queue_raw
+    except Exception as e:
+        return {"status": "error", "detail": f"queue read failed: {e}"}
+    if not queue:
+        return {"status": "no_transitions"}
+
+    entries, file_data = _load_step3_qcms(accepted_dir)
+    if not entries:
+        return {"status": "no_transitions"}
+
+    current_uids = {q.get("uid") for _f, q in entries}
+    digest_src = json.dumps({
+        "uids": sorted(u for u in current_uids if u),
+        "queue": sorted(json.dumps(t, sort_keys=True, ensure_ascii=False) for t in queue),
+    }, sort_keys=True)
+    signature = hashlib.sha1(digest_src.encode("utf-8")).hexdigest()
+    audit_file = step3_dir / BOUNDARY_AUDIT_FILENAME
+    if audit_file.exists():
+        try:
+            with open(audit_file, "r", encoding="utf-8") as f:
+                prior = json.load(f)
+            if prior.get("signature") == signature:
+                print("[CC-BOUNDARY] Same transitions + QCM set already boundary-checked — skipping.")
+                return {"status": "skipped"}
+        except Exception:
+            pass
+
+    primary_model  = os.getenv("CC_CHECKER_MODEL", DEFAULT_CC_MODEL)
+    fallback_model = os.getenv("CC_CHECKER_FALLBACK_MODEL", DEFAULT_CC_FALLBACK)
+    max_tokens = max(int(os.getenv("CC_CHECKER_MAX_TOKENS") or "500"), 500)
+
+    results: List[Dict] = []
+    client = OpenRouterClient()
+
+    for t in queue:
+        case_cas = t.get("case_cas")
+        row = {
+            "trigger_uid": t.get("trigger_uid"),
+            "trigger_page": t.get("trigger_page"),
+            "trigger_number": t.get("trigger_number"),
+            "case_label": (case_cas.split("\r\n")[0]
+                           if case_cas and "\r\n" in case_cas else "CAS CLINIQUE"),
+        }
+
+        trigger_pos = _find_entry(entries, t)
+        if trigger_pos is None:
+            results.append({**row, "status": "no_trigger",
+                            "noted": "trigger not found"})
+            continue
+
+        boundary_pos = trigger_pos + 1
+        if boundary_pos >= len(entries):
+            results.append({**row, "status": "no_following_qcm",
+                            "noted": "trigger is the last QCM of the document"})
+            continue
+
+        _bf, boundary_qcm = entries[boundary_pos]
+        row["boundary_uid"] = boundary_qcm.get("uid")
+        row["boundary_page"] = boundary_qcm.get("page")
+        row["boundary_number"] = boundary_qcm.get("number")
+
+        if boundary_qcm.get("cas") or boundary_qcm.get("Cas"):
+            results.append({**row, "status": "already_linked",
+                            "note": "boundary QCM belongs to another case — no relink, no call"})
+            continue
+
+        # ONE verification call per transition (primary then fallback)
+        verdict = asyncio.run(_ask_verdict_async(
+            client, tracker, _verification_prompt(case_cas, boundary_qcm),
+            primary_model, fallback_model, max_tokens))
+
+        label, _narr = _split_cas(case_cas or "")
+        if verdict["status"] == "ok" and verdict.get("applies"):
+            boundary_qcm["cas"] = case_cas            # re-attach the closed case
+            conf = (f" ({verdict.get('confidence'):.2f})"
+                    if verdict.get("confidence") is not None else "")
+            boundary_qcm["case_belonging_check"] = (
+                f"boundary re-check YES{conf}: case actually informs this "
+                f"question — cas re-attached")
+            results.append({**row, "status": "relinked",
+                            "confidence": verdict.get("confidence")})
+        elif verdict["status"] == "ok":
+            conf = (f" ({verdict.get('confidence'):.2f})"
+                    if verdict.get("confidence") is not None else "")
+            boundary_qcm["case_belonging_check"] = \
+                f"boundary re-check NO{conf}: ends_here confirmed"
+            results.append({**row, "status": "no_relink",
+                            "confidence": verdict.get("confidence")})
+        else:
+            boundary_qcm["case_belonging_check"] = (
+                "boundary re-check unresolved: call failed — unlink stands "
+                "(failure never silently relinks)")
+            results.append({**row, "status": "unresolved"})
+
+    # Write back every touched file (single pass, single-threaded writes)
+    stats = {"transitions": len(queue), "calls": 0, "relinked": 0,
+             "no_relink": 0, "unresolved": 0, "no_trigger": 0,
+             "no_following_qcm": 0, "already_linked": 0}
+    for r in results:
+        stats[r["status"]] = stats.get(r["status"], 0) + 1
+        if r["status"] in ("relinked", "no_relink", "unresolved"):
+            stats["calls"] += 1
+    touched_uids = {r["boundary_uid"] for r in results
+                    if r["status"] in ("relinked", "no_relink", "unresolved")}
+    if touched_uids:
+        for q_file, qcms in file_data.items():
+            if any(q.get("uid") in touched_uids for q in qcms):
+                try:
+                    with open(q_file, "w", encoding="utf-8") as f:
+                        json.dump(qcms, f, indent=2, ensure_ascii=False)
+                    print(f"[CC-BOUNDARY] 💾 written → {q_file.name}")
+                except Exception as e:
+                    print(f"[CC-BOUNDARY] ⚠️ write failed {q_file.name}: {e}")
+
+    audit = {
+        "run_ts": datetime.now().isoformat(),
+        "signature": signature,
+        "uid_set": sorted(u for u in current_uids if u),
+        "primary_model": primary_model,
+        "fallback_model": fallback_model,
+        "transitions": results,
+    }
+    try:
+        with open(audit_file, "w", encoding="utf-8") as f:
+            json.dump(audit, f, indent=2, ensure_ascii=False)
+        print(f"[CC-BOUNDARY] 💾 audit → {BOUNDARY_AUDIT_FILENAME}")
+    except Exception as e:
+        print(f"[CC-BOUNDARY] ⚠️ audit write failed: {e}")
+
+    # UI U2 — EXACTLY ONE summary line per run when the bounded boundary
+    # check disagreed with the detector ("relinked": the case close was
+    # demonstrably wrong and cas was re-attached — relink covers one QCM
+    # only, so further swept QCMs need human review via the audit column).
+    # Marker is matched on the frontend by isCcBoundaryDisagreement.
+    disputed = [r for r in results if r["status"] == "relinked"]
+    if disputed:
+        print(f"[CC-BOUNDARY] ⚠️ {len(disputed)} disagreement(s) flagged — "
+              f"review case_belonging_check")
+
+    return {"status": "ok", "stats": stats, "transitions": results}
+
+
+def _find_entry(entries, transition: Dict):
+    """Locate the QCM identified by a boundary transition (uid first, then
+    page+number). Returns the positional index in `entries`, or None."""
+    want_uid = transition.get("trigger_uid")
+    want_page = transition.get("trigger_page")
+    want_number = transition.get("trigger_number")
+    if want_uid:
+        for i, (_f, q) in enumerate(entries):
+            if q.get("uid") == want_uid:
+                return i
+    if want_page is not None:
+        for i, (_f, q) in enumerate(entries):
+            if q.get("page") == want_page and q.get("number") == want_number:
+                return i
+    return None
+
 
 def _verification_covers(step3_dir: Path, current_uids: set) -> bool:
     """True when a previous verification run covered the exact same uid set."""
@@ -337,6 +583,9 @@ async def _verify_chain_async(chain_index: int, chain: Dict,
     last_member_entry_idx = None
     llm_calls_made = 0
     llm_calls_saved = 0
+    # Phase 4: accumulated patient-fact ledger, chain-scoped; only confirmed
+    # (applies=true) verdicts write to it; resets per chain/new case.
+    ledger: List[str] = []
 
     def _base_decision(pos: int, entry_idx: int) -> Dict:
         _f, _q = entries[entry_idx]
@@ -346,6 +595,7 @@ async def _verify_chain_async(chain_index: int, chain: Dict,
             "entry_idx": entry_idx, "pos": pos,
             "status": "pending", "corrected": False,
             "provisional": False, "rechecked": False, "after_close": False,
+            "note": None,
         }
 
     def _unlink(decision: Dict) -> None:
@@ -360,7 +610,8 @@ async def _verify_chain_async(chain_index: int, chain: Dict,
               f"p.{qcm.get('page', '?')}) ...", flush=True)
 
         verdict = await _verify_one_async(client, tracker, qcm, chain["cas"],
-                                          primary_model, fallback_model, max_tokens)
+                                          primary_model, fallback_model, max_tokens,
+                                          ledger=ledger)
         llm_calls_made += 1
         decision = _base_decision(pos, entry_idx)
         decision["status"] = verdict["status"]
@@ -368,6 +619,7 @@ async def _verify_chain_async(chain_index: int, chain: Dict,
         if verdict["status"] != "ok":
             # Technical failure is never a rejection — and it neither
             # confirms a pending NO nor resets the consecutive counter.
+            decision["note"] = "unresolved: call failed — link kept"
             cstats["unresolved"] += 1
             print("     ⚠️ unresolved — link kept (technical failure, not a rejection)", flush=True)
             decisions.append(decision)
@@ -381,8 +633,15 @@ async def _verify_chain_async(chain_index: int, chain: Dict,
         if verdict["applies"]:
             cstats["kept"] += 1
             conf = f" ({verdict.get('confidence'):.2f})" if verdict.get("confidence") is not None else ""
+            facts = verdict.get("case_facts_used")
+            decision["case_facts_used"] = facts
+            decision["note"] = (f"checker YES{conf}: "
+                                f"{facts if facts else 'uses case information'}")
             print(f"     ✅ belongs{conf} — keeps the clinical case", flush=True)
             consecutive_no = 0
+            # Phase 4 ledger: ONLY confirmed links reinforce (guardrail).
+            if facts:
+                ledger.append(facts)
             if suspicious is not None and early_stop:
                 # Spec §7: lone NO followed by YES → re-check the suspicious QCM.
                 s_entry_idx = suspicious["entry_idx"]
@@ -392,7 +651,7 @@ async def _verify_chain_async(chain_index: int, chain: Dict,
                       f"(provisional NO followed by YES) ...", flush=True)
                 recheck = await _ask_verdict_async(
                     client, tracker,
-                    _recheck_prompt(chain["cas"], s_qcm, qcm),
+                    _recheck_prompt(chain["cas"], s_qcm, qcm, ledger=ledger),
                     primary_model, fallback_model, max_tokens)
                 llm_calls_made += 1
                 cstats["rechecked"] += 1
@@ -400,9 +659,16 @@ async def _verify_chain_async(chain_index: int, chain: Dict,
                 if recheck["status"] == "ok" and recheck["applies"] is False:
                     # Provisional NO confirmed — unlink that QCM only.
                     _unlink(s_decision)
+                    sconf = (f" ({recheck.get('confidence'):.2f})"
+                             if recheck.get("confidence") is not None else "")
+                    s_decision["note"] = f"§7 re-check confirmed NO{sconf} — link removed"
                     print(f"     ❌ §7 re-check confirms Q{s_qcm.get('number', '?')} "
                           f"does NOT belong — link removed (that QCM only)", flush=True)
                 elif recheck["status"] == "ok":
+                    sfacts = recheck.get("case_facts_used")
+                    s_decision["case_facts_used"] = sfacts
+                    s_decision["note"] = (f"§7 re-check YES: belongs"
+                                          + (f": {sfacts}" if sfacts else ""))
                     print(f"     ✅ §7 re-check: Q{s_qcm.get('number', '?')} actually "
                           f"belongs — provisional NO was a model error, link kept", flush=True)
                 else:
@@ -412,6 +678,7 @@ async def _verify_chain_async(chain_index: int, chain: Dict,
                     s_decision.pop("applies", None)
                     s_decision.pop("confidence", None)
                     s_decision.pop("model", None)
+                    s_decision["note"] = "unresolved: §7 re-check call failed — link kept"
                     cstats["verified"] -= 1
                     cstats["unresolved"] += 1
                     print("     ⚠️ §7 re-check failed technically — link kept (needs attention)", flush=True)
@@ -422,7 +689,10 @@ async def _verify_chain_async(chain_index: int, chain: Dict,
         # applies == false
         if not early_stop:
             # Flag off: legacy per-QCM behavior — unlink immediately.
+            dconf = (f" ({verdict.get('confidence'):.2f})"
+                     if verdict.get("confidence") is not None else "")
             _unlink(decision)
+            decision["note"] = f"checker NO{dconf}: answerable without case info"
             print("     ❌ does NOT belong — clinical case link removed (unlinked)", flush=True)
             decisions.append(decision)
             continue
@@ -440,6 +710,9 @@ async def _verify_chain_async(chain_index: int, chain: Dict,
             _unlink(s_decision)
             decision["provisional"] = True
             _unlink(decision)
+            dconf = (f" ({verdict.get('confidence'):.2f})"
+                     if verdict.get("confidence") is not None else "")
+            decision["note"] = f"checker NO{dconf}: two consecutive NOs — case closed"
             decisions.append(decision)
             tail = items[pos + 1:]
             llm_calls_saved = len(tail)
@@ -447,6 +720,7 @@ async def _verify_chain_async(chain_index: int, chain: Dict,
                 t_dec = _base_decision(t_pos, t_entry_idx)
                 t_dec["status"] = "unlinked_by_boundary"
                 t_dec["after_close"] = True
+                t_dec["note"] = "unlinked after two-NO case close (not verified individually)"
                 _unlink(t_dec)
                 decisions.append(t_dec)
             print(f"     ⛔ Two consecutive NOs — case closed before "
@@ -456,8 +730,11 @@ async def _verify_chain_async(chain_index: int, chain: Dict,
             break
 
         # First NO of a potential pair → PROVISIONAL (spec §6.2), link kept.
+        dconf = (f" ({verdict.get('confidence'):.2f})"
+                 if verdict.get("confidence") is not None else "")
         consecutive_no = 1
         decision["provisional"] = True
+        decision["note"] = f"provisional checker NO{dconf} — link kept pending §6.2"
         suspicious = {"pos": pos, "entry_idx": entry_idx, "decision": decision}
         print("     ❓ provisional NO — link kept pending next verdict (§6.2)", flush=True)
         decisions.append(decision)
@@ -466,16 +743,21 @@ async def _verify_chain_async(chain_index: int, chain: Dict,
     # verdict was decisive, so confirm it (unlink that QCM only — legacy parity).
     if suspicious is not None and not closed_early:
         _unlink(suspicious["decision"])
+        suspicious["decision"]["note"] = "end of chain: pending NO confirmed — link removed (that QCM only)"
         _sf, _sq = entries[suspicious["entry_idx"]]
         print(f"     ❌ End of chain: pending NO confirmed — "
               f"Q{_sq.get('number', '?')} link removed (that QCM only)", flush=True)
 
     # Apply corrections to the in-memory QCM dicts (shared references with
     # file_data — the caller writes the files back after gather).
+    # Phase 4 (Edit 7): every decision also carries a human-readable
+    # case_belonging_check verdict string, applied alongside the unlink.
     for d in decisions:
+        _eq = entries[d["entry_idx"]][1]
         if d.get("corrected"):
-            _ef, _eq = entries[d["entry_idx"]]
             _eq.pop("cas", None)
+        if d.get("note"):
+            _eq["case_belonging_check"] = d["note"]
 
     print(f"  [CC-CHECK] [CAS {chain_index}] ✅ Done — "
           f"{cstats['kept']} kept, {cstats['unlinked']} unlinked, "
@@ -664,11 +946,15 @@ def run_clinical_case_checker(tracker, context) -> Dict:
 
     # Write corrected files back (unlinked + scrubbed QCMs share the single
     # write-back — both mutated the same in-memory dicts).
+    # Phase 4: QCMs that only received an audit note also count as touched,
+    # so case_belonging_check verdicts persist even without unlinks.
     corrected_uids = {d["uid"] for d in decisions if d.get("corrected")}
-    if corrected_uids or scrubbed_files:
+    noted_uids = {d["uid"] for d in decisions if d.get("note")}
+    if corrected_uids or noted_uids or scrubbed_files:
         for q_file, qcms in file_data.items():
             if q_file in scrubbed_files or \
-                    any(q.get("uid") in corrected_uids for q in qcms):
+                    any(q.get("uid") in corrected_uids or q.get("uid") in noted_uids
+                        for q in qcms):
                 with open(q_file, "w", encoding="utf-8") as f:
                     json.dump(qcms, f, indent=2, ensure_ascii=False)
                 print(f"[CC-CHECK] 💾 Corrections written → {q_file.name}")

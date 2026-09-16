@@ -153,5 +153,13 @@ class Step5Builder:
         if cas_value is not None and cas_value != "":
             if "Cas" not in new_qcm or new_qcm.get("Cas") in [None, "", 0]:
                 new_qcm["Cas"] = cas_value
-                    
+
+        # Auto-propagate the case-belonging audit note (Phase 3): like Cas, it
+        # is always included when present so the XLSX audit surface never
+        # silently loses a linkage verdict for any template.
+        cbc_value = qcm.get("case_belonging_check") or qcm.get("CaseBelongingCheck")
+        if cbc_value is not None and cbc_value != "":
+            if new_qcm.get("case_belonging_check") in [None, "", 0]:
+                new_qcm["case_belonging_check"] = cbc_value
+
         return new_qcm

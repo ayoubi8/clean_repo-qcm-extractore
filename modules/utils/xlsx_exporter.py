@@ -37,7 +37,7 @@ BORDER_THIN   = Border(
 # Hint sits immediately after proposition E (Phase 3).
 # Any extra fields found in the QCM data are appended dynamically at the end.
 _PREFERRED_COLUMNS = [
-    "Num", "Cas", "Text", "A", "B", "C", "D", "E",
+    "Num", "Cas", "case_belonging_check", "Text", "A", "B", "C", "D", "E",
     "Hint",
     "Correct", "Exp",
     "categoryName", "tagSuggere", "subcategoryName",
@@ -46,7 +46,7 @@ _PREFERRED_COLUMNS = [
 
 # Approximate column widths (characters)
 COL_WIDTHS = {
-    "Num": 6, "Cas": 60, "Text": 60,
+    "Num": 6, "Cas": 60, "case_belonging_check": 40, "Text": 60,
     "A": 40, "B": 40, "C": 40, "D": 40, "E": 40,
     "Hint": 30,
     "Correct": 10, "Exp": 40,
