@@ -102,15 +102,25 @@ def resp_now(entries: list) -> dict:
 def empty_page_response(*nums) -> dict:
     return resp_now([{"number": n, "cas_label": None, "cas_text": None} for n in nums])
 
-def status_response(entries: list) -> dict:
+def status_response(entries: list, trailing: dict = None) -> dict:
     """5-status RESPONSE from `_detect_cc_sequential_page` (Phase 1+ contract).
     entries: [{"number": N, "status": "...", "cas_label": str|None,
-               "cas_text": str|None}, ...]"""
-    data = [{"number": e.get("number"),
-             "status": e.get("status"),
-             "cas_label": e.get("cas_label"),
-             "cas_text": e.get("cas_text")}
-            for e in entries]
+               "cas_text": str|None}, ...]
+    Extra keys on an entry (e.g. "claims_pending_case": True) pass through to
+    the JSON verbatim. trailing: optional cross-page trailing narrative
+    (H-fix): {"label": str, "text": str} — emitted as reserved `"_trailing"`."""
+    data = []
+    for e in entries:
+        row = {"number": e.get("number"),
+               "status": e.get("status"),
+               "cas_label": e.get("cas_label"),
+               "cas_text": e.get("cas_text")}
+        for k, v in e.items():
+            if k not in row:
+                row[k] = v
+        data.append(row)
+    if trailing is not None:
+        data.append({"_trailing": trailing})
     return {"content": json.dumps(data, ensure_ascii=False),
             "usage": {"prompt_tokens": 10, "completion_tokens": 5}, "cost": 0.0}
 

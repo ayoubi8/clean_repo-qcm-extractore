@@ -482,6 +482,11 @@ DOCUMENT:
         cc_carry_over = None  # Carries active CC text from page to page (sequential mode)
         cc_all_qcms   = []    # [(page_num, qcm_num, cas_text)] for end-of-run stats
         cc_boundary_queue = []  # ends_here transitions collected per file (Phase 5 consumer)
+        # H-fix — cross-page pending candidate state (distinct from
+        # carry_over: carry_over = an already-ATTACHED running case;
+        # pending_case = a trailing narrative detected on a page holding
+        # ZERO QCMs, waiting for its FIRST QCM-bearing page to claim it).
+        cc_pending_case = None   # {"label": str, "text": str, "page": int} | None
         
         for i, q_file in enumerate(qcm_files, 1):
             if cancel_check and cancel_check():
@@ -548,10 +553,18 @@ DOCUMENT:
                         print(f"   🔍 Page {page_num}: Detecting CC ({len(qcm_numbers)} QCMs) → LLM call...")
                         from modules.utils.call_logger import item_scope as _is2
                         with _is2(f"page_{page_num}"):
-                            cc_map = self._detect_cc_sequential_page(page_text, qcm_numbers, carry_over=page_carry)
+                            cc_map = self._detect_cc_sequential_page(
+                                page_text, qcm_numbers, carry_over=page_carry,
+                                pending_case=cc_pending_case)
+                        trailing = cc_map.pop("_trailing", None)
+
+                        # H-fix — resolve the pending candidate at the FIRST
+                        # QCM-bearing page (one attempt; never retried forward).
+                        cc_map, claim_num, decline_num = self._apply_pending_case_resolution(
+                            qcms, cc_map, cc_pending_case)
 
                         triggers = {num: info for num, info in cc_map.items()
-                                    if info.get("status") == "new_case"}
+                                    if isinstance(info, dict) and info.get("status") == "new_case"}
                         if triggers:
                             for num, info in triggers.items():
                                 label     = info.get("label") or "CAS CLINIQUE"
@@ -569,6 +582,38 @@ DOCUMENT:
                         )
                         if linkage_on:
                             cc_boundary_queue.extend(_bq)
+
+                        # H-fix — pending resolution outcomes (origin page
+                        # captured BEFORE the state clears)
+                        pending_origin = (cc_pending_case or {}).get("page")
+                        if claim_num is not None:
+                            cc_pending_case = None
+                            for qcm in qcms:
+                                num = qcm.get("number") or qcm.get("Num")
+                                if num == claim_num:
+                                    qcm["case_belonging_check"] = (
+                                        f"new_case (cross-page): narrative from page "
+                                        f"{pending_origin} (its own page held no QCM) "
+                                        f"claimed by this question — pending candidate attached")
+                        elif decline_num is not None and linkage_on:
+                            cc_pending_case = None
+                            for qcm in qcms:
+                                num = qcm.get("number") or qcm.get("Num")
+                                if num == decline_num:
+                                    qcm["case_belonging_check"] = (
+                                        f"cross-page: narrative from page "
+                                        f"{pending_origin} pending was offered "
+                                        f"once and declined (this question does not claim it) "
+                                        f"— candidate dropped")
+                        elif decline_num is not None:
+                            # skip strategy: candidate spent, no linkage note
+                            cc_pending_case = None
+                        # trailing from a QCM-bearing page (its own narrative may
+                        # itself trail for a later page — same mechanics)
+                        if trailing and claim_num is None and decline_num is None:
+                            cc_pending_case = {"label": trailing.get("label") or "CAS CLINIQUE",
+                                               "text": trailing.get("text") or "",
+                                               "page": page_num}
 
                         if cc_carry_over:
                             carry_label = cc_carry_over.split("\r\n")[0] if "\r\n" in cc_carry_over else "CAS CLINIQUE"
@@ -600,10 +645,20 @@ DOCUMENT:
                         if pg is not None:
                             page_groups[int(pg)].append(q)
 
-                    if not page_groups:
+                    if not page_groups and not Path(step1_dir).glob("page_*.txt"):
                         print(f"   ⚠️  QCMs in {q_file.name} have no 'page' field. Skipping CC detection.")
                     else:
-                        sorted_pages = sorted(page_groups.keys())
+                        # H-fix — visit QCM-free pages too: a case narrative can
+                        # trail at the END of a page holding ZERO QCMs (its
+                        # claiming QCM lives on a LATER page). Pages that exist
+                        # as step-1 text but have no QCM group join the walk
+                        # (same 1-call-per-page budget; OQ-4 decision (i)).
+                        txt_page_nums: set = set()
+                        for p in Path(step1_dir).glob("page_*.txt"):
+                            m = re.search(r"(\d+)", p.name)
+                            if m:
+                                txt_page_nums.add(int(m.group(1)))
+                        sorted_pages = sorted(set(page_groups.keys()) | txt_page_nums)
                         print(f"   📑 Merged file: {len(sorted_pages)} distinct pages found → \nprocessing sequentially ({sorted_pages[0]}–{sorted_pages[-1]})")
 
                         for pg_num in sorted_pages:
@@ -611,7 +666,7 @@ DOCUMENT:
                                 print(f"\n⏸ Stop requested before CC page {pg_num} "
                                       f"— already-processed pages are saved.")
                                 break
-                            pg_qcms = page_groups[pg_num]
+                            pg_qcms = page_groups.get(pg_num, [])
                             pg_txt  = Path(step1_dir) / f"page_{pg_num}.txt"
 
                             if not pg_txt.exists():
@@ -634,10 +689,18 @@ DOCUMENT:
 
                             from modules.utils.call_logger import item_scope as _is3
                             with _is3(f"page_{pg_num}"):
-                                cc_map = self._detect_cc_sequential_page(pg_text, qcm_numbers, carry_over=page_carry)
+                                cc_map = self._detect_cc_sequential_page(
+                                    pg_text, qcm_numbers, carry_over=page_carry,
+                                    pending_case=cc_pending_case)
+                            trailing = cc_map.pop("_trailing", None)
+
+                            # H-fix — the ONE pending resolution attempt (never
+                            # retried forward; see _apply_pending_case_resolution)
+                            cc_map, claim_num, decline_num = self._apply_pending_case_resolution(
+                                pg_qcms, cc_map, cc_pending_case)
 
                             triggers = {num: info for num, info in cc_map.items()
-                                        if info.get("status") == "new_case"}
+                                        if isinstance(info, dict) and info.get("status") == "new_case"}
                             if triggers:
                                 for num, info in triggers.items():
                                     label     = info.get("label") or "CAS CLINIQUE"
@@ -650,11 +713,48 @@ DOCUMENT:
                                 else:
                                     print(f"         ℹ️  No Cas Clinique on page {pg_num}.")
 
-                            pg_qcms, cc_carry_over, _notes, _bq = self._propagate_cas_clinique(
-                                pg_qcms, cc_map, page_carry, linkage=linkage_on
-                            )
-                            if linkage_on:
-                                cc_boundary_queue.extend(_bq)
+                            if pg_qcms:
+                                pg_qcms, cc_carry_over, _notes, _bq = self._propagate_cas_clinique(
+                                    pg_qcms, cc_map, page_carry, linkage=linkage_on
+                                )
+                                if linkage_on:
+                                    cc_boundary_queue.extend(_bq)
+
+                                # H-fix — pending resolution outcomes
+                                pending_origin = (cc_pending_case or {}).get("page")
+                                if claim_num is not None:
+                                    cc_pending_case = None
+                                    for qcm in pg_qcms:
+                                        num = qcm.get("number") or qcm.get("Num")
+                                        if num == claim_num:
+                                            qcm["case_belonging_check"] = (
+                                                f"new_case (cross-page): narrative from page "
+                                                f"{pending_origin} (its own page held no QCM) "
+                                                f"claimed by this question — pending candidate attached")
+                                elif decline_num is not None and linkage_on:
+                                    cc_pending_case = None
+                                    for qcm in pg_qcms:
+                                        num = qcm.get("number") or qcm.get("Num")
+                                        if num == decline_num:
+                                            qcm["case_belonging_check"] = (
+                                                f"cross-page: narrative from page "
+                                                f"{pending_origin} pending was offered "
+                                                f"once and declined (this question does not claim it) "
+                                                f"— candidate dropped")
+                                elif decline_num is not None:
+                                    cc_pending_case = None   # skip: no linkage note
+                                if trailing and claim_num is None and decline_num is None:
+                                    cc_pending_case = {"label": trailing.get("label") or "CAS CLINIQUE",
+                                                       "text": trailing.get("text") or "",
+                                                       "page": pg_num}
+                            else:
+                                # QCM-free narrative page: the pending candidate
+                                # persists WITHOUT re-affirmation (OQ-3 decision
+                                # A); a NEW trailing narrative replaces it.
+                                if trailing:
+                                    cc_pending_case = {"label": trailing.get("label") or "CAS CLINIQUE",
+                                                       "text": trailing.get("text") or "",
+                                                       "page": pg_num}
 
                             if cc_carry_over and linkage_on:
                                 carry_label = cc_carry_over.split("\r\n")[0] if "\r\n" in cc_carry_over else "CAS CLINIQUE"
@@ -741,7 +841,8 @@ DOCUMENT:
     # Valid 5-status enum for the Phase 1 state-aware classifier
     _CC_STATUSES = ("new_case", "continues", "ends_here", "unrelated", "uncertain")
 
-    def _parse_cc_statuses(self, content: str, qcm_numbers: List[int]) -> Dict[int, Dict]:
+    def _parse_cc_statuses(self, content: str, qcm_numbers: List[int],
+                           include_trailing: bool = False):
         """Parse the 5-status classifier response into
         {qcm_number: {"status": ..., "label": ..., "text": ...}}.
 
@@ -752,24 +853,41 @@ DOCUMENT:
         - An entry with no explicit "status" infers one: cas_text non-null
           → "new_case", else "uncertain" (keeps simple responses parseable).
         - A response that parses to an EMPTY array → {} (no entries at all).
+
+        Cross-page trailing narrative (H-fix): with `include_trailing=True`,
+        a reserved `"_trailing"` element in the array is extracted (NOT a
+        QCM entry) and returned as
+        `({"status_map"}, "trailing" | None)`; QCM numbers are ints so the
+        string key can never collide with a listed QCM number.
         """
         cleaned = re.sub(r'```(?:json)?\s*', '', content or '')
         cleaned = re.sub(r'```\s*', '', cleaned).strip()
         match = re.search(r'\[.*\]', cleaned, re.DOTALL)
         if not match:
-            return None
+            return (None, None) if include_trailing else None
         json_str = re.sub(r',(\s*[}\]])', r'\1', match.group(0))
         try:
             data = json.loads(json_str)
         except json.JSONDecodeError:
-            return None
+            return (None, None) if include_trailing else None
         if not isinstance(data, list):
-            return None
+            return (None, None) if include_trailing else None
         if not data:
-            return {}
+            result = {}
+            if include_trailing:
+                return result, None
+            return result
         result: Dict[int, Dict] = {}
+        trailing = None
         for entry in data:
             if not isinstance(entry, dict):
+                continue
+            if "_trailing" in entry:
+                if include_trailing:
+                    tv = entry.get("_trailing")
+                    if isinstance(tv, dict) and tv.get("text"):
+                        trailing = {"label": tv.get("label") or "CAS CLINIQUE",
+                                    "text": tv.get("text")}
                 continue
             num = entry.get("number")
             if num is None:
@@ -783,13 +901,25 @@ DOCUMENT:
             label = entry.get("cas_label") or "CAS CLINIQUE"
             text = entry.get("cas_text")
             result[num] = {"status": status, "label": label, "text": text}
+            # H-fix: keep cross-page claim evidence — the resolution state
+            # machine reads "claims_pending_case"; only genuinely unknown
+            # keys pass through (raw model duplicates of the canonical keys
+            # — number/cas_label/cas_text — are NOT duplicated on the entry,
+            # keeping exact-dict test contracts unaffected).
+            for k, v in entry.items():
+                if k not in result[num] and k not in ("number", "status",
+                                                      "cas_label", "cas_text"):
+                    result[num][k] = v
         for n in qcm_numbers:
             if n not in result:
                 result[n] = {"status": "uncertain", "label": None, "text": None}
+        if include_trailing:
+            return result, trailing
         return result
 
     def _detect_cc_sequential_page(self, page_text: str, qcm_numbers: List[int],
-                                   carry_over: Optional[str] = None) -> Dict:
+                                   carry_over: Optional[str] = None,
+                                   pending_case: Optional[Dict] = None) -> Dict:
         """
         Per-page LLM call for state-aware CC detection (Phase 2 contract).
 
@@ -804,16 +934,29 @@ DOCUMENT:
         classifier anchors on patient-specific content vs question-stem language,
         including narratives FUSED into the QCM's own text block.
 
-        Returns (Phase 2 contrat — the raw status map):
-            { qcm_number: {"status", "label", "text"} }
+        Cross-page trailing narrative (H-fix): pages may END with a case
+        narrative and hold ZERO QCMs — the claiming QCM lives on a later page.
+        When `qcm_numbers` is EMPTY the call becomes page-level only: it just
+        reports `trailing_narrative`. With QCMs present, the status map is
+        returned normally plus an extra reserved key `"_trailing"` on the
+        returned map (int keys never collide). A pending_case (a detected
+        trailing narrative from an earlier page that has not attached yet) is
+        injected as a distinct prompt block; questions claim it via
+        `"claims_pending_case": true`.
+
+        Returns (Phase 2 contract — the raw status map):
+            { qcm_number: {"status", "label", "text"} [, "_trailing": {label,text}] }
             An EMPTY map ({}) means the call produced no usable page decision
             (failure/garbage/empty response) — the Python state machine then
             treats every listed number as "uncertain" (legacy-propagate).
         """
-        if not page_text.strip() or not qcm_numbers:
+        if not page_text.strip():
             return {}
 
-        nums_str = ", ".join(str(n) for n in qcm_numbers)
+        if not qcm_numbers:
+            nums_str = "none — this page holds no numbered questions"
+        else:
+            nums_str = ", ".join(str(n) for n in qcm_numbers)
         max_input_chars = int(os.getenv("STEP3_MAX_INPUT_CHARS", "24000"))
 
         if carry_over:
@@ -838,14 +981,37 @@ CURRENTLY ACTIVE CASE (carried over from an earlier page): NONE.
 A new narrative may START on this page ("new_case") — none is running already.
 """
 
+        pending_block = ""
+        if pending_case:
+            p_label = pending_case.get("label") or "CAS CLINIQUE"
+            p_text = (pending_case.get("text") or "")[:1500]
+            pending_block = f"""
+PENDING CASE — DETECTED AT THE END OF AN EARLIER PAGE (NOT yet attached to any question):
+- Label: {p_label}
+- Narrative (may be truncated): {p_text}
+Some question on a later page must claim it. A question on THIS page may be
+that claiming question: set "claims_pending_case": true on its entry (with
+status "continues"). If no question on this page depends on it, ignore the
+pending narrative (do NOT claim) — it will be dropped after this page.
+"""
+
         prompt = f"""You are analyzing a French medical exam page for Cas Clinique (clinical case) detection.
-{carry_block}
+{carry_block}{pending_block}
 TASK: For EACH QCM number listed below, output exactly ONE status:
 - "new_case"   : this question is the FIRST question of a NEW clinical case narrative appearing on this page. Fill "cas_label" (exact label as written, or "CAS CLINIQUE" if none exists) and "cas_text" (the patient story ONLY — everything between the case header/start and the first numbered question; do NOT include the title or the questions).
-- "continues"  : a case is already running (see CURRENTLY ACTIVE CASE), this question belongs to it, and NO new case starts here.
-- "ends_here"  : a case WAS running, but the active case does NOT inform this question. No new case starts.
+- "continues"  : a case is already running (see CURRENTLY ACTIVE CASE), this question belongs to it, and NO new case starts here. If this question instead CLAIMS the PENDING CASE, set "claims_pending_case": true.
+- "ends_here"  : a case WAS running, but the active case does NOT cover this QCM. No new case starts.
 - "unrelated"  : no clinical case applies, and none is running.
 - "uncertain"  : genuinely ambiguous — you cannot decide confidently.
+
+TRAILING NARRATIVE (page-level field — cross-page fix):
+If the page ENDS with a patient-narrative block and NO numbered question follows
+it on this page (this includes pages with ZERO numbered questions), append ONE
+extra element at the END of the JSON array:
+  {{"_trailing": {{"label": <exact label or "CAS CLINIQUE">, "text": <full patient story>}}}}
+If there is no such trailing narrative, include {{"_trailing": null}} (or omit it
+entirely). A narrative that is followed by even ONE numbered question on this
+page is NOT trailing — that is a normal "new_case" with the full cas_text.
 
 FUSED-NARRATIVE RULE (critical): in this corpus a patient narrative often has NO
 "CAS CLINIQUE" header, and it may even be FUSED directly into what looks like a
@@ -859,7 +1025,7 @@ interrogative stems like "Quelle est votre conduite...", "Parmi les
 propositions suivantes..." or "Conduite face a...".
 
 CRITICAL RULES:
-1. Return a JSON array with EXACTLY ONE entry per QCM number listed below — no more, no less.
+1. Return a JSON array with EXACTLY ONE entry per QCM number listed below — no more, no less (plus at most one optional "_trailing" element). For a page with no numbered questions, the array may contain ONLY the "_trailing" element.
 2. Questions of the SAME case after its first one → "continues" (or "ends_here"); do NOT repeat the narrative in them.
 3. "cas_text" is required ONLY for "new_case"; all other statuses use null.
 4. Do NOT include the case title inside "cas_text".
@@ -902,7 +1068,8 @@ PAGE TEXT:
                 continue
 
             content = (resp.get("content") or "").strip()
-            status_map = self._parse_cc_statuses(content, qcm_numbers)
+            status_map, trailing = self._parse_cc_statuses(
+                content, qcm_numbers, include_trailing=True)
 
             if not content:
                 print(f"⚠️ {attempt_label} model returned an empty/blank response — treating as failure.")
@@ -917,6 +1084,12 @@ PAGE TEXT:
             # also yields {} — downstream propagation then treats every
             # listed number as "uncertain" (legacy-propagate), never as a
             # hard negative.
+            # H-fix: attach the cross-page trailing narrative as the reserved
+            # "_trailing" key ONLY when actually detected (int keys can never
+            # collide, and the key is omitted entirely when None so every
+            # existing consumer keeps working unchanged).
+            if trailing:
+                status_map["_trailing"] = trailing
             return status_map
 
         return {}
@@ -947,6 +1120,74 @@ PAGE TEXT:
         "cc_boundary_checks.json",
         "clinical_case_verification.json",
     }
+
+    def _apply_pending_case_resolution(self, pg_qcms: List[Dict], cc_map: Dict,
+                                       pending: Optional[Dict]) -> tuple:
+        """H-fix — the ONE resolution attempt for a cross-page pending
+        candidate (`pending_case`: a trailing narrative detected at the end
+        of an earlier page that never attached to any QCM).
+
+        Decided AT the first QCM-bearing page reached (either path), exactly
+        once per candidate — never retried on any later page:
+          - CLAIMED  (an entry sets "claims_pending_case": true with a
+            claim-compatible status) → the entry is rewritten into the
+            standard `new_case` shape using the PENDING narrative, so the
+            existing propagation attaches it (full chain under per_group;
+            single hygienic attach under skip). The caller writes the
+            distinct cross-page note into `case_belonging_check`.
+          - UNRELATED/ENDS_HERE on the FIRST page QCM → DECLINE: candidate
+            dropped permanently (note written by the caller on the deciding
+            QCM; per_group only).
+          - UNCERTAIN on the first QCM → safety-valve CLAIM (same doctrine as
+            the running-case uncertain: attach, let the checker backstop).
+          - Anything else indeterminate (e.g. "continues" on a DIFFERENT
+            running case without a claim flag) → attempt spent → DECLINE
+            with a note.
+
+        Returns (cc_map_after, claim_num, decline_num, origin_page).
+        """
+        if not pending:
+            return cc_map, None, None
+        origin = pending.get("page")
+        p_label = pending.get("label") or "CAS CLINIQUE"
+        p_text = pending.get("text") or ""
+
+        ordered = [q for q in pg_qcms if isinstance(q, dict)]
+        first_num = None
+        first_info = None
+        claim_num = None
+        for q in ordered:
+            num = q.get("number") or q.get("Num")
+            info = cc_map.get(num) if num is not None else None
+            if not isinstance(info, dict):
+                info = None
+            if first_num is None:
+                first_num, first_info = num, info
+            st = (info.get("status") or "uncertain") if info else "uncertain"
+            if info and info.get("claims_pending_case") and st in ("continues", "new_case"):
+                claim_num = num
+                break
+
+        if claim_num is not None:
+            cc_map[claim_num] = {"status": "new_case", "label": p_label, "text": p_text}
+            return cc_map, claim_num, None
+
+        # no claim → decide by the FIRST page QCM's verdict (OQ-5: both
+        # decline statuses count; uncertain = safety-valve claim; other
+        # statuses = attempt spent → decline).
+        first_status = "uncertain"
+        if isinstance(first_info, dict):
+            first_status = first_info.get("status") or "uncertain"
+        if first_status == "uncertain":
+            if first_num is not None:
+                cc_map[first_num] = {"status": "new_case",
+                                     "label": p_label, "text": p_text}
+                cc_map[first_num]["_pending_uncertain_claim"] = True
+                return cc_map, first_num, None
+            return cc_map, None, None
+
+        # decline (unrelated / ends_here / indeterminate) — permanent drop
+        return cc_map, None, first_num
 
     def _propagate_cas_clinique(self, qcms: List[Dict],
                                 cc_map: Dict,
