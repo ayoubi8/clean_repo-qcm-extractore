@@ -38,6 +38,17 @@ function CycleButton({ field, strategy, onCycle }: { field: string, strategy: Me
   )
 }
 
+/** UI U3 — one-line captions under the clinical_case strategy row only
+ * (other fields stay out of scope for this pass). Documented behavior of
+ * the Redesign v2: skip still runs the per-page hygiene detection call, and
+ * per-group includes the CC Checker verification. */
+const CLINICAL_CASE_STRATEGY_NOTES: Record<MetaStrategy, string> = {
+  skip:      'No case grouping — text is still cleaned of any embedded case narrative (~1 extra LLM call per page).',
+  per_group: 'Detects and links related cases across QCMs, verified by the CC Checker.',
+  global:    'One case narrative applied to every QCM in the document.',
+  per_qcm:   '' // not part of the clinical_case cycle order; present for typing
+}
+
 export function Step3Config({ embedded }: { embedded?: boolean }) {
   const config = usePipelineStore(s => s.step3Config)
   const setConfig = usePipelineStore(s => s.setStep3Config)
@@ -64,13 +75,27 @@ export function Step3Config({ embedded }: { embedded?: boolean }) {
         <label className="text-[10px] font-black uppercase tracking-[0.2em] text-outline">Metadata Strategies</label>
         <div className="bg-surface-container-low rounded-2xl border border-outline-variant/10 divide-y divide-outline-variant/5">
           {(Object.keys(config.fields) as Array<keyof typeof config.fields>).map((field) => (
-            <div key={field} className="flex items-center justify-between p-4">
-              <span className="text-sm font-bold capitalize text-on-surface-variant w-32">{field.replace('_', ' ')}</span>
-              <CycleButton
-                field={field}
-                strategy={config.fields[field].strategy}
-                onCycle={() => handleCycle(field)}
-              />
+            <div key={field}>
+              <div className="flex items-center justify-between p-4">
+                <span className="text-sm font-bold capitalize text-on-surface-variant w-32">{field.replace('_', ' ')}</span>
+                <CycleButton
+                  field={field}
+                  strategy={config.fields[field].strategy}
+                  onCycle={() => handleCycle(field)}
+                />
+              </div>
+              {/* UI U3 — captions for the clinical_case strategies only
+                  (uses the panel's existing caption style) */}
+              {field === 'clinical_case' && (
+                <div className="px-4 pb-4 -mt-2 space-y-1">
+                  {STRATEGIES.clinical_case.order.map((st) => (
+                    <p key={st} className="text-[10px] text-outline px-1">
+                      <span className="font-bold text-tertiary">{STRATEGY_STYLING[st].label}:</span>{' '}
+                      {CLINICAL_CASE_STRATEGY_NOTES[st]}
+                    </p>
+                  ))}
+                </div>
+              )}
             </div>
           ))}
         </div>

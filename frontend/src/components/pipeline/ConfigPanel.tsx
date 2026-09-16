@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { usePipelineStore, isCcCheckerError } from '../../store/pipelineStore'
+import { usePipelineStore, isCcCheckerError, isCcBoundaryDisagreement } from '../../store/pipelineStore'
 import { StepId } from '../../types'
 import { Step1Config } from './configs/Step1Config'
 import { Step2_3Config } from './configs/Step2_3Config'
@@ -91,6 +91,7 @@ export function ConfigPanel() {
   const appendLog = usePipelineStore(s => s.appendLog)
   const clearLog = usePipelineStore(s => s.clearLog)
   const raiseCcAlert = usePipelineStore(s => s.raiseCcAlert)
+  const raiseBoundaryAlert = usePipelineStore(s => s.raiseBoundaryAlert)
   const activeProject = useAppStore(s => s.activeProject)
   const setPipelineStatus = useAppStore(s => s.setPipelineStatus)
   const store = usePipelineStore()
@@ -165,6 +166,12 @@ export function ConfigPanel() {
           // single error marker line (kept until the user dismisses it).
           if (activeStep.id === 2 && isCcCheckerError(line?.text) && activeProject?.name) {
             raiseCcAlert(activeProject.name, line.text)
+          }
+          // UI U2 — raise the persistent boundary-check disagreement alert
+          // (amber "review needed" signal) on the backend's one-per-run
+          // summary line; same persistence contract as the CC alert.
+          if (activeStep.id === 2 && isCcBoundaryDisagreement(line?.text) && activeProject?.name) {
+            raiseBoundaryAlert(activeProject.name, line.text)
           }
         },
         async () => {

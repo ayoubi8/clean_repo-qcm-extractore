@@ -58,6 +58,47 @@ function CcAlertCard({ project }: { project: string }) {
   )
 }
 
+/** UI U2 — persistent boundary-check disagreement alert ("review needed",
+ * NOT a run failure). Structurally identical to CcAlertCard (icon + title +
+ * body + dismiss button; persisted in the store, survives reloads) but with
+ * amber/warning styling matching OverwriteWarning's tertiary colors — a
+ * flagged signal a human should review case_belonging_check in the exported
+ * xlsx, not an error. Cleared only by an explicit click. */
+function BoundaryAlertCard({ project }: { project: string }) {
+  const alert = usePipelineStore(s => s.boundaryAlerts[project])
+  const dismissBoundaryAlert = usePipelineStore(s => s.dismissBoundaryAlert)
+  if (!alert) return null
+
+  return (
+    <div
+      id="cc-boundary-alert"
+      className="p-4 bg-tertiary-container/5 border border-tertiary/20 rounded-xl flex items-start gap-3"
+    >
+      <span className="material-symbols-outlined text-tertiary text-lg mt-0.5">warning</span>
+      <div className="flex-1 min-w-0">
+        <p className="text-xs font-black text-tertiary uppercase tracking-[0.15em]">
+          Clinical case boundaries to review
+        </p>
+        <p className="text-[11px] text-on-surface-variant mt-1 break-all">
+          {alert.text.replace('[CC-BOUNDARY] ⚠️ ', '').trim()}
+        </p>
+        <p className="text-[10px] text-outline mt-1 font-mono">
+          The detector closed a case that actually informs a question — cas was
+          re-attached for that QCM only; check the case_belonging_check column.
+        </p>
+      </div>
+      <button
+        id="btn-dismiss-boundary-alert"
+        onClick={() => dismissBoundaryAlert(project)}
+        title="Hide this alert"
+        className="shrink-0 w-7 h-7 rounded-lg border border-tertiary/30 flex items-center justify-center text-tertiary hover:bg-tertiary/10 transition-colors"
+      >
+        <span className="material-symbols-outlined text-[16px]">close</span>
+      </button>
+    </div>
+  )
+}
+
 /** Phase 1 — Clinical Case Checker model pair (cheap/fast verifier).
  * Independent from the Step 2 extraction model: it only double-checks the
  * cascaded Cas Clinique links, one question per QCM. Distinct from the
@@ -187,9 +228,10 @@ export function Step2_3Config() {
 
   return (
     <div className="space-y-8 animate-in fade-in slide-in-from-bottom-2 duration-300">
-      {/* Persistent Clinical Case Checker failure alert (survives reloads,
-          dismissed only by click) */}
+      {/* Persistent alerts (survive reloads, dismissed only by click):
+          red = CC Checker run failure; amber = boundary disagreements to review */}
       {activeProject?.name && <CcAlertCard project={activeProject.name} />}
+      {activeProject?.name && <BoundaryAlertCard project={activeProject.name} />}
 
       {/* Primary: extraction config (Auto-Loop 1-1-1, always on) */}
       <Step2Config />

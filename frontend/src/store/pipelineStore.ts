@@ -19,6 +19,10 @@ interface PipelineStore {
   // user click (dismissCcAlert) — never automatically.
   ccAlerts: Record<string, { ts: string; text: string }>
 
+  // UI U2 — persistent BOUNDARY-check disagreement alerts ("review needed",
+  // not a run failure). Same shape/persistence contract as ccAlerts.
+  boundaryAlerts: Record<string, { ts: string; text: string }>
+
   setStepStatus: (id: StepId, s: StepStatus) => void
   setStepOutputExists: (id: StepId, exists: boolean) => void
   setActiveStep: (id: StepId) => void
@@ -26,6 +30,8 @@ interface PipelineStore {
   clearLog: () => void
   raiseCcAlert: (project: string, text: string) => void
   dismissCcAlert: (project: string) => void
+  raiseBoundaryAlert: (project: string, text: string) => void
+  dismissBoundaryAlert: (project: string) => void
   setStep1Config: (c: Partial<Step1Config>) => void
   setStep2Config: (c: Partial<Step2Config>) => void
   setStep3Config: (c: Partial<Step3Config>) => void
@@ -41,6 +47,17 @@ interface PipelineStore {
  */
 export function isCcCheckerError(text: unknown): boolean {
   return typeof text === 'string' && text.includes('[CC-CHECK]') && text.includes('⚠️ ERROR')
+}
+
+/**
+ * UI U2 — matches the single per-run summary line emitted by the bounded
+ * ends_here boundary check (modules/clinical_case_checker.py):
+ *   "[CC-BOUNDARY] ⚠️ N disagreement(s) flagged — review case_belonging_check"
+ * Emitted ONLY when the boundary re-check disagreed with the detector
+ * (cas was re-attached — the detection close was wrong).
+ */
+export function isCcBoundaryDisagreement(text: unknown): boolean {
+  return typeof text === 'string' && text.includes('[CC-BOUNDARY]') && text.includes('disagreement(s) flagged')
 }
 
 // Steps 1.5, 1.6, 3, 4 & 5 are intentionally NOT listed here:
@@ -121,6 +138,9 @@ export const usePipelineStore = create<PipelineStore>()(
 
       ccAlerts: {},
 
+      // UI U2 — same shape/persistence as ccAlerts
+      boundaryAlerts: {},
+
       setStepStatus: (id, s) => set((state) => ({
         steps: state.steps.map(st => st.id === id ? { ...st, status: s } : st)
       })),
@@ -141,6 +161,17 @@ export const usePipelineStore = create<PipelineStore>()(
         delete next[project]
         return { ccAlerts: next }
       }),
+      raiseBoundaryAlert: (project, text) => set((state) => ({
+        boundaryAlerts: {
+          ...state.boundaryAlerts,
+          [project]: { ts: new Date().toLocaleTimeString(), text }
+        }
+      })),
+      dismissBoundaryAlert: (project) => set((state) => {
+        const next = { ...state.boundaryAlerts }
+        delete next[project]
+        return { boundaryAlerts: next }
+      }),
       setStep1Config: (c) => set((state) => ({ step1Config: { ...state.step1Config, ...c } })),
       setStep2Config: (c) => set((state) => ({ step2Config: { ...state.step2Config, ...c } })),
       setStep3Config: (c) => set((state) => ({ step3Config: { ...state.step3Config, ...c } })),
@@ -158,6 +189,8 @@ export const usePipelineStore = create<PipelineStore>()(
           step8Config: state.step8Config,
           // Persistent until explicitly dismissed by click (Phase 1 CC alert)
           ccAlerts: state.ccAlerts,
+          // UI U2 — persistent until explicitly dismissed by click
+          boundaryAlerts: state.boundaryAlerts,
         }),
         migrate: (persisted: any) => {
           if (!persisted) return persisted
@@ -212,6 +245,9 @@ export const usePipelineStore = create<PipelineStore>()(
             persisted = { ...persisted, step3Config: s3 }
           }
           if (!persisted.ccAlerts) persisted = { ...persisted, ccAlerts: {} }
+          // v10->v11: UI U2 — boundary disagreement alerts join the
+          // persisted state (same shape as ccAlerts).
+          if (!persisted.boundaryAlerts) persisted = { ...persisted, boundaryAlerts: {} }
           // v9->v10: Phase 2 — Subcategory removed from the Metadata Strategy
           // entirely. Delete any persisted subcategory field so no dead
           // "Subcategory … Skip" cycle row renders for old sessions.
@@ -222,7 +258,7 @@ export const usePipelineStore = create<PipelineStore>()(
           }
           return persisted
         },
-        version: 10,
+        version: 11,
       }
   )
 )
