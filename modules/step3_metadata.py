@@ -448,7 +448,12 @@ DOCUMENT:
                       config: Dict, global_values: Dict, fallback_map: Dict = None,
                       cancel_check=None):
         """Apply global values and detect per-QCM / per-Group values for each batch."""
-        qcm_files = sorted(Path(step2_dir).glob("*.json"))
+        # Step-2 sidecar files share this folder but hold non-QCM payloads —
+        # they are consumed elsewhere (Step 6 / boundary check) and must never
+        # enter the per-batch propagation loop (moot bug: iterating their dict
+        # root yields string keys and `q.get("page")` crashed the cascade).
+        qcm_files = sorted(f for f in Path(step2_dir).glob("*.json")
+                           if f.name not in self._STEP2_SIDECAR_FILES)
         total = len(qcm_files)
         
         per_qcm_fields = [k for k, v in config.items() if v == "P"]
@@ -485,8 +490,16 @@ DOCUMENT:
                 break
             with open(q_file, 'r', encoding='utf-8') as f:
                 qcms = json.load(f)
-            
+
             if not qcms:
+                continue
+
+            # Defense-in-depth: a batch file must hold a non-empty list of
+            # QCM dicts. Any other payload (dict root, stray markdown, etc.)
+            # is skipped with a visible warn instead of crashing the cascade.
+            if not isinstance(qcms, list) or not all(isinstance(q, dict) for q in qcms):
+                print(f"   ⚠️  Skipping {q_file.name}: not a QCM list "
+                      f"(unexpected payload shape) — Step 6 / audits unaffected.")
                 continue
             
             # ── Per-QCM metadata detection ─────────────────────────────
@@ -581,6 +594,8 @@ DOCUMENT:
                     from collections import defaultdict as _dd
                     page_groups: dict = _dd(list)
                     for q in qcms:
+                        if not isinstance(q, dict):
+                            continue
                         pg = q.get("page") or q.get("Page")
                         if pg is not None:
                             page_groups[int(pg)].append(q)
@@ -868,34 +883,41 @@ PAGE TEXT:
         fallback_model = os.getenv("STEP3_FALLBACK_MODEL", "google/gemini-2.0-flash-lite-001")
         max_tokens     = int(os.getenv("STEP3_MAX_TOKENS") or "10000")
 
-        try:
-            try:
-                resp = self.client.generate_completion(prompt, model=primary_model, max_tokens=max_tokens)
-                model_used = primary_model
-            except Exception as e:
-                print(f"⚠️ Primary model failed for CC sequential detection: {e}")
+        # FIX-2/FIX-3 (ratrapage run): a model call "succeeding" is not enough
+        # — BLANK responses (null/whitespace) and UNPARSABLE responses are
+        # treated as failures too, so the fallback model gets its try before
+        # the page forfeits. Guardrail: at most 2 calls per page (primary +
+        # fallback — the same 2-model policy as the pipeline elsewhere); if
+        # both fail/blank/unparsable the result is {} = the exact legacy
+        # behavior (whole page -> uncertain/legacy-propagate), so recall can
+        # never regress.
+        attempts = ((primary_model, "primary"), (fallback_model, "fallback"))
+        for attempt_model, attempt_label in attempts:
+            if attempt_label == "fallback":
                 print(f"🔄 Retrying with fallback: {fallback_model}...")
-                resp = self.client.generate_completion(prompt, model=fallback_model, max_tokens=max_tokens)
-                model_used = fallback_model
+            try:
+                resp = self.client.generate_completion(prompt, model=attempt_model, max_tokens=max_tokens)
+            except Exception as e:
+                print(f"⚠️ {attempt_label} model failed for CC sequential detection: {e}")
+                continue
 
-            content = resp["content"].strip()
-
+            content = (resp.get("content") or "").strip()
             status_map = self._parse_cc_statuses(content, qcm_numbers)
-            if status_map is not None:
-                cost = resp.get('cost', 0.0) or self.client.estimate_cost(model_used, resp["usage"])
-                self.cost_tracker.log_api_call("step3_cc_sequential", model_used, resp["usage"], cost)
-                # Phase 2: return the raw 5-status map. An empty array
-                # response also yields {} — downstream propagation then
-                # treats every listed number as "uncertain"
-                # (legacy-propagate), never as a hard negative.
-                return status_map
 
-            print("⚠️ No JSON array found in CC sequential detection response.")
+            if not content:
+                print(f"⚠️ {attempt_label} model returned an empty/blank response — treating as failure.")
+                continue
+            if status_map is None:
+                print(f"⚠️ No JSON array found in CC response ({attempt_label} model).")
+                continue
 
-        except json.JSONDecodeError as e:
-            print(f"⚠️ CC sequential detection JSON decode error: {e}")
-        except Exception as e:
-            print(f"⚠️ CC sequential detection failed: {e}")
+            cost = resp.get('cost', 0.0) or self.client.estimate_cost(attempt_model, resp["usage"])
+            self.cost_tracker.log_api_call("step3_cc_sequential", attempt_model, resp["usage"], cost)
+            # Phase 2: return the raw 5-status map. An empty array response
+            # also yields {} — downstream propagation then treats every
+            # listed number as "uncertain" (legacy-propagate), never as a
+            # hard negative.
+            return status_map
 
         return {}
 
@@ -915,6 +937,16 @@ PAGE TEXT:
             return {"status": "new_case",
                     "label": label or "CAS CLINIQUE", "text": text}
         return info
+
+    # Sidecar files Step 2 writes into step2_qcm/accepted (answer-key page
+    # list) plus cc-redesign audit artifacts that share the folder tree —
+    # none of these are QCM lists.
+    _STEP2_SIDECAR_FILES = {
+        "correction_pages.json",
+        "cc_boundary_transitions.json",
+        "cc_boundary_checks.json",
+        "clinical_case_verification.json",
+    }
 
     def _propagate_cas_clinique(self, qcms: List[Dict],
                                 cc_map: Dict,
