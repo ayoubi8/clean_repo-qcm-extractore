@@ -118,8 +118,10 @@ def _test_carryover_prompt():
         p_carry = captured["prompt"]
         assert "CURRENTLY ACTIVE CASE" in p_carry and "Patient sentinelle XZ-01." in p_carry
         assert "CURRENTLY ACTIVE CASE (carried over from an earlier page): NONE." not in p_carry
-        # fused-narrative rule must always be present
-        assert "FUSED-NARRATIVE RULE" in p_carry and "FUSED" in p_none
+        # fused-narrative rule must always be present (v4: positive definition
+        # carries the fused rule — CC Detection v4 deliberate swap)
+        assert "What IS a clinical case narrative" in p_carry
+        assert "FUSED" in p_carry and "FUSED" in p_none
         assert p_none != p_carry
     print("OK carry-over block present IFF provided; fused rule always in prompt.")
 

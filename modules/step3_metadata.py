@@ -562,6 +562,13 @@ DOCUMENT:
                         # QCM-bearing page (one attempt; never retried forward).
                         cc_map, claim_num, decline_num = self._apply_pending_case_resolution(
                             qcms, cc_map, cc_pending_case)
+                        # V4-3 Num predicate guard (log-only)
+                        self._log_num_gap(
+                            (cc_pending_case or {}).get("prev_max"), qcm_numbers)
+                        # CC Detection v4 — text cleanup + detector notes
+                        # (AFTER resolution: a rewritten claim entry carries
+                        # the pending narrative, not the dropped anchor's extras)
+                        self._apply_anchor_extras(qcms, cc_map)
 
                         triggers = {num: info for num, info in cc_map.items()
                                     if isinstance(info, dict) and info.get("status") == "new_case"}
@@ -613,7 +620,9 @@ DOCUMENT:
                         if trailing and claim_num is None and decline_num is None:
                             cc_pending_case = {"label": trailing.get("label") or "CAS CLINIQUE",
                                                "text": trailing.get("text") or "",
-                                               "page": page_num}
+                                               "page": page_num,
+                                               "prev_max": (max(qcm_numbers)
+                                                            if qcm_numbers else None)}
 
                         if cc_carry_over:
                             carry_label = cc_carry_over.split("\r\n")[0] if "\r\n" in cc_carry_over else "CAS CLINIQUE"
@@ -698,6 +707,15 @@ DOCUMENT:
                             # retried forward; see _apply_pending_case_resolution)
                             cc_map, claim_num, decline_num = self._apply_pending_case_resolution(
                                 pg_qcms, cc_map, cc_pending_case)
+                            # V4-3 Num predicate guard (log-only)
+                            self._log_num_gap(
+                                (cc_pending_case or {}).get("prev_max"),
+                                qcm_numbers)
+                            # CC Detection v4 — text cleanup + detector notes
+                            # (AFTER resolution: a rewritten claim entry
+                            # carries the pending narrative, not the dropped
+                            # anchor's extras)
+                            self._apply_anchor_extras(pg_qcms, cc_map)
 
                             triggers = {num: info for num, info in cc_map.items()
                                         if isinstance(info, dict) and info.get("status") == "new_case"}
@@ -746,7 +764,9 @@ DOCUMENT:
                                 if trailing and claim_num is None and decline_num is None:
                                     cc_pending_case = {"label": trailing.get("label") or "CAS CLINIQUE",
                                                        "text": trailing.get("text") or "",
-                                                       "page": pg_num}
+                                                       "page": pg_num,
+                                                       "prev_max": (max(qcm_numbers)
+                                                                    if qcm_numbers else None)}
                             else:
                                 # QCM-free narrative page: the pending candidate
                                 # persists WITHOUT re-affirmation (OQ-3 decision
@@ -754,7 +774,8 @@ DOCUMENT:
                                 if trailing:
                                     cc_pending_case = {"label": trailing.get("label") or "CAS CLINIQUE",
                                                        "text": trailing.get("text") or "",
-                                                       "page": pg_num}
+                                                       "page": pg_num,
+                                                       "prev_max": None}
 
                             if cc_carry_over and linkage_on:
                                 carry_label = cc_carry_over.split("\r\n")[0] if "\r\n" in cc_carry_over else "CAS CLINIQUE"
@@ -841,6 +862,166 @@ DOCUMENT:
     # Valid 5-status enum for the Phase 1 state-aware classifier
     _CC_STATUSES = ("new_case", "continues", "ends_here", "unrelated", "uncertain")
 
+    def _parse_cc_response(self, content: str, qcm_numbers: List[int]):
+        """Schema-sniffing wrapper (CC Detection v4): new anchor schema vs
+        legacy 5-status schema.
+
+        - v4 schema: entries carry `anchor_num` (int) + `cas_text` +
+          optional `cas_label` / `anchor_text_clean` / `note`.
+          Validation (parser-enforced, never model-hoped): an anchor is
+          accepted ONLY if anchor_num is (a) one of this page's own QCM
+          numbers, or (b) exactly max(qcm_numbers)+1 — the trailing case,
+          routed into the reserved `"_trailing"` key so the SHIPPED
+          pending_case machinery resolves it on the next page's first
+          `number`/`Num` (merged-JSON "Num" requirement, V4-3). Anything
+          else → the entry is dropped + logged (never cascaded).
+        - legacy schema (any entry with "status") → `_parse_cc_statuses`
+          untouched (all phase-0..7 / H-fix tests keep their contracts).
+        """
+        cleaned = re.sub(r'```(?:json)?\s*', '', content or '')
+        cleaned = re.sub(r'```\s*', '', cleaned).strip()
+        match = re.search(r'\[.*\]', cleaned, re.DOTALL)
+        if not match:
+            return None, None
+        json_str = re.sub(r',(\s*[}\]])', r'\1', match.group(0))
+        try:
+            data = json.loads(json_str)
+        except json.JSONDecodeError:
+            return None, None
+        if not isinstance(data, list):
+            return None, None
+        if not (data and any(
+                isinstance(e, dict) and "anchor_num" in e for e in data)):
+            # legacy (5-status) schema or plain empty array
+            status_map, trailing = self._parse_cc_statuses(
+                content, qcm_numbers, include_trailing=True)
+            return status_map, trailing
+
+        valid = set(qcm_numbers)
+        max_plus1 = (max(qcm_numbers) + 1) if qcm_numbers else None
+        result: Dict[int, Dict] = {}
+        trailing = None
+        for entry in data:
+            if "_trailing" in entry:
+                # a reasoning model may STILL emit the old page-level field;
+                # accept it in the same shape (tolerant union).
+                tv = entry.get("_trailing")
+                if isinstance(tv, dict) and tv.get("text"):
+                    trailing = {"label": tv.get("label") or "CAS CLINIQUE",
+                                "text": tv.get("text")}
+                continue
+            num = entry.get("anchor_num")
+            try:
+                num = int(num)
+            except (TypeError, ValueError):
+                print(f"   ⚠️ [CC-V4] anchor proposal rejected: anchor_num "
+                      f"not an integer ({num!r}) — entry dropped, never cascaded")
+                continue
+            text = (entry.get("cas_text") or "").strip()
+            if not text:
+                print(f"   ⚠️ [CC-V4] anchor proposal rejected: Q{num} has no "
+                      f"cas_text — entry dropped, never cascaded")
+                continue
+            note = (entry.get("note") or "").strip()
+            # Zero-QCM page: the WHOLE page is a trailing holder — any
+            # anchor reports the narrative the page ends with; first wins.
+            if not valid:
+                if trailing is None:
+                    trailing = {"label": entry.get("cas_label") or "CAS CLINIQUE",
+                                "text": text}
+                    if note:
+                        trailing["note"] = note
+                continue
+            if num in valid:
+                result[num] = {
+                    "status": "new_case",
+                    "label": entry.get("cas_label") or "CAS CLINIQUE",
+                    "text": text,
+                }
+                if note:
+                    # L1-only field (V4-OQ-2): distinct from the checker's
+                    # own `case_belonging_check` verdicts by the `detector:`
+                    # prefix; stored on the QCM dict by _apply_anchor_extras.
+                    result[num]["detector_note"] = note
+                if entry.get("anchor_text_clean") is not None:
+                    result[num]["anchor_text_clean"] = entry["anchor_text_clean"]
+            elif max_plus1 is not None and num == max_plus1:
+                # trailing narrative: this page ENDS with the case; the NEXT
+                # page's first QCM (by merged "Num") claims it. Emitted as
+                # the reserved "_trailing" so the shipped pending_case
+                # resolution (claims/decline, ONE attempt, Num-keyed)
+                # consumes it unchanged.
+                trailing = {
+                    "label": entry.get("cas_label") or "CAS CLINIQUE",
+                    "text": text,
+                }
+                if note:
+                    trailing["note"] = note
+            else:
+                print(f"   ⚠️ [CC-V4] anchor proposal rejected: Q{num} is "
+                      f"neither this page's number nor max+1 ({max_plus1}) "
+                      f"— entry dropped, never cascaded")
+        for n in qcm_numbers:
+            if n not in result:
+                result[n] = {"status": "uncertain", "label": None, "text": None}
+        return result, trailing
+
+    def _apply_anchor_extras(self, qcms: List[Dict], cc_map: Dict) -> None:
+        """CC Detection v4 — apply `anchor_text_clean` and the `detector:`
+        note from the anchor map onto the page's QCM dicts.
+
+        - anchor_text_clean non-null → the now-clean question text replaces
+          the QCM's own text (key present wins: `text` else `Text`).
+        - anchor_text_clean null/absent (the model judged the narrative
+          already a separate block) → run `cas_text_split` on the anchored
+          QCM as a safety net, in case the model missed a fusion.
+        Runs BEFORE propagation (text shape is read downstream only)."""
+        from modules.cas_text_split import split_cas_from_text
+        for qcm in qcms:
+            num = qcm.get("number") or qcm.get("Num")
+            info = cc_map.get(num) if num is not None else None
+            if not isinstance(info, dict):
+                continue
+            if info.get("detector_note"):
+                qcm["cc_detector_note"] = f"detector: {info['detector_note']}"
+            clean = info.get("anchor_text_clean")
+            if isinstance(clean, str) and clean.strip():
+                if "text" in qcm:
+                    qcm["text"] = clean
+                elif "Text" in qcm:
+                    qcm["Text"] = clean
+                else:
+                    qcm["text"] = clean
+            else:
+                # null clean → safety net: scrub narrative from the stem
+                cas_val = qcm.get("cas")
+                if cas_val:
+                    new_text, removed = split_cas_from_text(
+                        qcm.get("text") or qcm.get("Text"), cas_val)
+                    if removed:
+                        if "text" in qcm:
+                            qcm["text"] = new_text
+                        elif "Text" in qcm:
+                            qcm["Text"] = new_text
+                        else:
+                            qcm["text"] = new_text
+
+    @staticmethod
+    def _log_num_gap(prev_max: Optional[int], pg_nums: List[int]) -> None:
+        """CC Detection v4 (V4-3) — the Num predicate guard: a trailing
+        candidate rescued via `max(per-page nums)+1` arithmetic must land on
+        a CONTIGUOUS `Num` in the merged JSON. Log (never block) when the
+        next page does not start at prev_max+1 — the pending_claim still
+        resolves, but reviewers must know the arithmetic was off."""
+        if prev_max is None or not pg_nums:
+            return
+        if min(pg_nums) != prev_max + 1:
+            print(f"   ⚠️ [CC-V4] Num gap: trailing case expects Num "
+                  f"{prev_max + 1} but this page starts at Num "
+                  f"{min(pg_nums)} — pending resolution proceeds on the "
+                  f"claim rule, review recommended")
+
+
     def _parse_cc_statuses(self, content: str, qcm_numbers: List[int],
                            include_trailing: bool = False):
         """Parse the 5-status classifier response into
@@ -921,31 +1102,26 @@ DOCUMENT:
                                    carry_over: Optional[str] = None,
                                    pending_case: Optional[Dict] = None) -> Dict:
         """
-        Per-page LLM call for state-aware CC detection (Phase 2 contract).
+        Per-page LLM call for CC detection — CC Detection v4 (anchor schema).
 
-        State-aware classifier: for each QCM number it picks exactly ONE of:
-          new_case  — first question of a fresh narrative on THIS page (+ label/text)
-          continues — explicitly depends on the currently active (carried-over) case
-          ends_here — the active case does NOT cover this QCM (explicit termination)
-          unrelated — no case applies, and none was running
-          uncertain — ambiguous, defer to the checker (same as today's fallback)
+        v4 replaces the 5-status enumeration with an ANCHOR-ONLY reasoning
+        prompt: the model reports ONE entry per NEW patient narrative it
+        finds on the page ({anchor_num, cas_label, cas_text,
+        anchor_text_clean, note}); unlisted numbers propagate as the shipped
+        uncertainty semantics (never a hard negative). A narrative at the
+        very END of the page (or on a zero-QCM page) is anchored to
+        max(page numbers)+1 / 1 respectively, which `_parse_cc_response`
+        routes into the reserved `"_trailing"` key so the SHIPPED
+        pending_case machinery attaches it to the NEXT page's first
+        `number`/`Num` (merged-JSON "Num" requirement).
 
-        Narratives in this corpus usually have NO "CAS CLINIQUE" header, so the
-        classifier anchors on patient-specific content vs question-stem language,
-        including narratives FUSED into the QCM's own text block.
-
-        Cross-page trailing narrative (H-fix): pages may END with a case
-        narrative and hold ZERO QCMs — the claiming QCM lives on a later page.
-        When `qcm_numbers` is EMPTY the call becomes page-level only: it just
-        reports `trailing_narrative`. With QCMs present, the status map is
-        returned normally plus an extra reserved key `"_trailing"` on the
-        returned map (int keys never collide). A pending_case (a detected
-        trailing narrative from an earlier page that has not attached yet) is
-        injected as a distinct prompt block; questions claim it via
-        `"claims_pending_case": true`.
+        Legacy compatibility: if the response parses to the OLD 5-status
+        schema, `_parse_cc_response` falls through to `_parse_cc_statuses`
+        untouched — all shipped consumers keep working either way.
 
         Returns (Phase 2 contract — the raw status map):
-            { qcm_number: {"status", "label", "text"} [, "_trailing": {label,text}] }
+            { qcm_number: {"status", "label", "text"[, "detector_note",
+                           "anchor_text_clean"]} [, "_trailing": {...}] }
             An EMPTY map ({}) means the call produced no usable page decision
             (failure/garbage/empty response) — the Python state machine then
             treats every listed number as "uncertain" (legacy-propagate).
@@ -972,13 +1148,13 @@ DOCUMENT:
 CURRENTLY ACTIVE CASE (carried over from an earlier page — running now):
 - Label: {co_label}
 - Narrative (may be truncated): {co_preview}
-Questions on THIS page may belong to THAT case ("continues") or the case may
-end before them ("ends_here") — judge each number individually.
+This case is ALREADY linked — you never need to anchor it again. Report an
+anchor ONLY when a NEW patient narrative starts on this page; the active
+case flows automatically over un-anchored questions.
 """
         else:
             carry_block = """
 CURRENTLY ACTIVE CASE (carried over from an earlier page): NONE.
-A new narrative may START on this page ("new_case") — none is running already.
 """
 
         pending_block = ""
@@ -989,64 +1165,94 @@ A new narrative may START on this page ("new_case") — none is running already.
 PENDING CASE — DETECTED AT THE END OF AN EARLIER PAGE (NOT yet attached to any question):
 - Label: {p_label}
 - Narrative (may be truncated): {p_text}
-Some question on a later page must claim it. A question on THIS page may be
-that claiming question: set "claims_pending_case": true on its entry (with
-status "continues"). If no question on this page depends on it, ignore the
-pending narrative (do NOT claim) — it will be dropped after this page.
+This pending narrative is ALREADY TRACKED by the pipeline: it attaches
+automatically to the first question of a coming page. Do NOT re-report it
+as an anchor of your own — only report anchors for NEW patient narratives
+that genuinely appear on THIS page.
 """
 
-        prompt = f"""You are analyzing a French medical exam page for Cas Clinique (clinical case) detection.
+        if qcm_numbers:
+            trailing_hint_lines = (
+                "When the page ENDS with a narrative and no QCM follows it on"
+                f" this page, report anchor_num = {max(qcm_numbers) + 1}"
+                " — the pipeline delivers it to that QCM's"
+                " \"Num\" on the next page on your behalf.")
+        else:
+            trailing_hint_lines = (
+                "This page holds ZERO numbered questions: if a patient"
+                " narrative exists anywhere in this page text, report it as"
+                " an anchor with anchor_num 1 and full cas_text — the"
+                " pipeline routes it to the next page's first question"
+                " by Num.")
+
+        prompt = f"""You are analyzing one page of a French medical exam (OCR text) to find any
+clinical-case ("Cas Clinique") narratives on it, and to determine exactly
+which QCM number each one belongs to. Think it through before answering.
 {carry_block}{pending_block}
-TASK: For EACH QCM number listed below, output exactly ONE status:
-- "new_case"   : this question is the FIRST question of a NEW clinical case narrative appearing on this page. Fill "cas_label" (exact label as written, or "CAS CLINIQUE" if none exists) and "cas_text" (the patient story ONLY — everything between the case header/start and the first numbered question; do NOT include the title or the questions).
-- "continues"  : a case is already running (see CURRENTLY ACTIVE CASE), this question belongs to it, and NO new case starts here. If this question instead CLAIMS the PENDING CASE, set "claims_pending_case": true.
-- "ends_here"  : a case WAS running, but the active case does NOT cover this QCM. No new case starts.
-- "unrelated"  : no clinical case applies, and none is running.
-- "uncertain"  : genuinely ambiguous — you cannot decide confidently.
+## Trailing cases
+{trailing_hint_lines.strip()}
+## What IS a clinical case narrative
+Descriptive prose about a specific patient: a name or initial, an age, and
+their clinical/paraclinical profile (history, presenting complaint, exam
+findings, lab/imaging results). Third person, describing someone — never
+instructing or asking the reader anything. This is the PATTERN, not literal
+text to match:
+- "Madame F., 37 ans, suivie pour une thyroïdite de Hashimoto..."
+- "Zhor, 77 ans, est diabétique de type II, découvert en 2021. Bilan
+  initial: GAJ: 1.92 g/l, HbA1c=7.9%..."
+A narrative may lack any "Cas Clinique" header and may even be FUSED directly
+into the FIRST question's own text block with no separator — in that fused
+case you STILL report it as an anchor (see anchor_text_clean below).
 
-TRAILING NARRATIVE (page-level field — cross-page fix):
-If the page ENDS with a patient-narrative block and NO numbered question follows
-it on this page (this includes pages with ZERO numbered questions), append ONE
-extra element at the END of the JSON array:
-  {{"_trailing": {{"label": <exact label or "CAS CLINIQUE">, "text": <full patient story>}}}}
-If there is no such trailing narrative, include {{"_trailing": null}} (or omit it
-entirely). A narrative that is followed by even ONE numbered question on this
-page is NOT trailing — that is a normal "new_case" with the full cas_text.
+## What is NOT a clinical case narrative (confirmed real mistakes to avoid)
+- An ordinary question stem, even when medically coherent and well-written:
+  "Parmi les causes de syncope au cours de la cardiomyopathie hypertrophique,
+  on peut citer:" — this is a question, not a patient.
+- Short fragments with no sentence structure — isolated numbers, page
+  annotations, section headers: "HTA 38 30" — OCR noise, not a narrative,
+  regardless of where it sits.
+- A lettered answer-choice list — "a- ... b- ... c- ... d- ... e- ..." (with
+  or without checkmarks) — always propositions, never a narrative.
+If you are not confident something is a genuine patient narrative by this
+definition, do not report it.
 
-FUSED-NARRATIVE RULE (critical): in this corpus a patient narrative often has NO
-"CAS CLINIQUE" header, and it may even be FUSED directly into what looks like a
-single question block with no separator. Even when patient-specific content
-(age, presenting complaint, history, exam or lab findings, started treatment)
-precedes the actual interrogative/imperative sentence inside one question block,
-classify that block "new_case" (derive the label as "CAS CLINIQUE"). A patient
-narrative is NEVER background for the question — extract it, never fold it in.
-Anchor on third-person descriptive patient content, NOT on imperative or
-interrogative stems like "Quelle est votre conduite...", "Parmi les
-propositions suivantes..." or "Conduite face a...".
+## Which QCM it belongs to
+A narrative belongs to the QCM immediately after it in reading order — never
+to a QCM that already appeared earlier in the text, even if no better
+candidate exists on this page.
+If the page ENDS with a narrative and no QCM follows it on this page at all
+(this includes pages with ZERO numbered questions), it belongs to the next
+page's first question — the "Trailing cases" section above tells you what
+anchor_num to report in that situation.
 
-CRITICAL RULES:
-1. Return a JSON array with EXACTLY ONE entry per QCM number listed below — no more, no less (plus at most one optional "_trailing" element). For a page with no numbered questions, the array may contain ONLY the "_trailing" element.
-2. Questions of the SAME case after its first one → "continues" (or "ends_here"); do NOT repeat the narrative in them.
-3. "cas_text" is required ONLY for "new_case"; all other statuses use null.
-4. Do NOT include the case title inside "cas_text".
-
-ANSWER FORMAT (JSON array):
+## Output format
+Return a JSON array. Include an entry ONLY for each QCM number that anchors
+a genuine NEW narrative — do NOT list every QCM on the page:
 [
-  {{"number": 5, "status": "new_case", "cas_label": "CAS CLINIQUE 1", "cas_text": "Patient X, 45 ans..."}},
-  {{"number": 6, "status": "continues", "cas_label": null, "cas_text": null}},
-  {{"number": 7, "status": "ends_here", "cas_label": null, "cas_text": null}},
-  {{"number": 8, "status": "unrelated", "cas_label": null, "cas_text": null}}
+  {{
+    "anchor_num": <int>,
+    "cas_label": "<as written, or \"CAS CLINIQUE\" if unlabeled>",
+    "cas_text": "<the narrative only — patient story, nothing else>",
+    "anchor_text_clean": "<if the narrative was fused directly into this
+       QCM's own question text with no separator, that QCM's own text with
+       the narrative removed — null if the narrative was already a
+       separate block>",
+    "note": "<one short sentence — why this is a genuine narrative>"
+  }}
 ]
+If no genuine narrative starts on this page, return [].
 
-QCM NUMBERS ON THIS PAGE: [{nums_str}]
+QCM NUMBERS ON THIS PAGE (in order): [{nums_str}]
 
 Return ONLY a valid JSON array — no markdown fences, no explanation.
 
 PAGE TEXT:
 {page_text[:max_input_chars]}"""
 
-        primary_model  = os.getenv("STEP3_MODEL", "qwen/qwen3.6-plus-preview:free")
-        fallback_model = os.getenv("STEP3_FALLBACK_MODEL", "google/gemini-2.0-flash-lite-001")
+        # V4-0: reasoning-capable primary, fast model kept for outage
+        # resilience only (env knobs reused — no new config surface).
+        primary_model  = os.getenv("STEP3_MODEL", "google/gemini-2.5-pro")
+        fallback_model = os.getenv("STEP3_FALLBACK_MODEL", "google/gemini-2.5-flash-lite")
         max_tokens     = int(os.getenv("STEP3_MAX_TOKENS") or "10000")
 
         # FIX-2/FIX-3 (ratrapage run): a model call "succeeding" is not enough
@@ -1068,8 +1274,8 @@ PAGE TEXT:
                 continue
 
             content = (resp.get("content") or "").strip()
-            status_map, trailing = self._parse_cc_statuses(
-                content, qcm_numbers, include_trailing=True)
+            status_map, trailing = self._parse_cc_response(
+                content, qcm_numbers)
 
             if not content:
                 print(f"⚠️ {attempt_label} model returned an empty/blank response — treating as failure.")

@@ -135,6 +135,32 @@ def mock_client(map_or_value):
     }
     return c
 
+# ── CC Detection v4 anchor-schema builders ──────────────────────────
+def anchor_response(entries: list) -> dict:
+    """v4 anchor-schema page response: [{anchor_num, cas_label, cas_text,
+    anchor_text_clean, note}] — exactly what the reasoning prompt asks for."""
+    data = []
+    for e in entries:
+        row = {"anchor_num": e.get("anchor_num"),
+               "cas_label": e.get("cas_label") or "CAS CLINIQUE",
+               "cas_text": e.get("cas_text"),
+               "anchor_text_clean": e.get("anchor_text_clean"),
+               "note": e.get("note")}
+        row = {k: v for k, v in row.items() if v is not None or
+               k in ("anchor_num", "cas_text", "anchor_text_clean")}
+        data.append(row)
+    return {"content": json.dumps(data, ensure_ascii=False),
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}, "cost": 0.0}
+
+def anchor(num: int, cas_text: str, label: str = None,
+           clean: str = None, note: str = "patient narrative") -> dict:
+    return {"anchor_num": num, "cas_label": label, "cas_text": cas_text,
+            "anchor_text_clean": clean, "note": note}
+
+TRAILING_NARRATIVE = ("Un patient âgé de 75 ans, sans antécédents particuliers "
+                      "présente des palpitations avec des sueurs, froideurs des "
+                      "extrémités et tension artérielle imprenable. Voici son ECG")
+
 def mock_client_async(respond):
     """For checker-style tests: generate_completion_async = respond(prompt)**async.
     respond: class or func. Used from Phase 4 onward."""

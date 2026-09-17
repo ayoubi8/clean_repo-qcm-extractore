@@ -113,13 +113,16 @@ def _test_detector_primary_failure_falls_back():
     print(f"OK models tried in order: {calls}")
 
 
-# ── F6: prompt content — REVISED AT PHASE 1 (deliberate change) ────────────────
-# Original baseline froze the binary/start-only stateless prompt. Phase 1
-# deliberately rewrites it into the 5-status state-aware classifier. This test
-# now freezes the PHASE-1 prompt contract instead.
+# ── F6: prompt content — REVISED AT PHASE 1, THEN AGAIN AT CC DETECTION V4 ────
+# Phase 1 replaced the binary prompt with the 5-status classifier. CC
+# Detection v4 (see CC_DETECTION_V4_PLAN.md) replaces THAT prompt with the
+# anchor-only reasoning prompt. This test freezes the V4 prompt contract:
+# anchors schema, trailing Num hand-off, positive clinical-narrative
+# definition incl. fused rule, counter-examples (OCR noise, question stems),
+# and the NONE carry block.
 
 def _test_detector_prompt_content():
-    print("\n--- F6 (P1 baseline): prompt is now state-aware 5-status ---")
+    print("\n--- F6 (v4 baseline): prompt is anchor-oriented ---")
     sm = _make_step3()
     captured = {}
     def side_effect(prompt, model=None, max_tokens=None, **kw):
@@ -129,14 +132,16 @@ def _test_detector_prompt_content():
         mc.generate_completion.side_effect = side_effect
         sm._detect_cc_sequential_page(P5_TEXT_UNMARKED, [5, 12])
     p = captured["prompt"]
-    for status in ("new_case", "continues", "ends_here", "unrelated", "uncertain"):
-        assert f'"{status}"' in p, f"missing status {status}"
-    assert "QCM NUMBERS ON THIS PAGE: [5, 12]" in p
+    assert "QCM NUMBERS ON THIS PAGE (in order): [5, 12]" in p
     assert "5/ Rachid" in p, "raw page text must be embedded"
-    assert "FUSED-NARRATIVE RULE" in p
+    assert "What IS a clinical case narrative" in p, "v4 positive definition"
+    assert "anchor_num" in p and "anchor_text_clean" in p, "v4 answer schema"
+    assert "HTA 38 30" in p, "OCR-noise counter-example frozen"
+    assert "FUSED" in p, "fused-narrative rule survives v4"
     assert "CURRENTLY ACTIVE CASE (carried over from an earlier page): NONE." in p, \
         "no carry-over input -> explicit NONE block"
-    print("OK P1 prompt contract frozen (5 statuses, fused rule, NONE block).")
+    assert f"anchor_num = 13" in p, "trailing hint anchors to max(nums)+1 = 12+1"
+    print("OK v4 prompt contract frozen (anchors, trailing Num, NONE block).")
 
 
 # ── F7: propagation semantics — REVISED AT PHASE 2 (deliberate change) ───────
