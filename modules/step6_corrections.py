@@ -11,6 +11,7 @@ from modules.utils.cost_tracker import CostTracker
 from modules.utils.prompt_helper import PromptHelper
 from modules.utils.xlsx_exporter import export_qcms_to_xlsx
 from modules.utils.output_naming import pdf_stem_for_context, result_xlsx_name
+from modules.utils.qcm_merge import qcm_key, merge_qcm_fields
 from modules.model_policy import get_model_pair
 
 class Step6Corrections:
@@ -123,23 +124,40 @@ class Step6Corrections:
         existing_path = output_dir / "corrected_qcms.json"
         already_corrected_count = 0
         force_overwrite = False
+        merged_field_count = 0
 
         if existing_path.exists():
             try:
                 with open(existing_path, 'r', encoding='utf-8') as f:
                     existing_data = json.load(f)
-                existing_map = {
-                    str(q.get('Num') or q.get('number', '')): q.get('Correct', '')
-                    for q in existing_data
-                    if q.get('Correct', '').strip()
-                }
+                # Key by uid/Num/number (mirrors the sync-from-sheets keying) so
+                # entries match whether they came from a Step 6 run or a
+                # Step 2 Google-Sheets sync.
+                existing_map = {}
+                for q in existing_data:
+                    key = qcm_key(q)
+                    if key:
+                        existing_map[key] = q
+                already_corrected_count = sum(
+                    1 for q in existing_data if str(q.get('Correct', '')).strip()
+                )
+                # ── Full-field merge (not just Correct): corrected_qcms.json also
+                # receives the user's Google-Sheets edits propagated by
+                # sync-from-sheets (question text, propositions, etc.). Re-apply
+                # them all so a Step 6 re-run builds on the edited data instead
+                # of the stale merged_qcms.json snapshot. Sheet-safe: empty
+                # values never overwrite, structured values are protected.
                 for qcm in qcms:
-                    key = str(qcm.get('Num') or qcm.get('number', ''))
-                    if existing_map.get(key):
-                        qcm['Correct'] = existing_map[key]
-                        already_corrected_count += 1
+                    key = qcm_key(qcm)
+                    prev = existing_map.get(key)
+                    if prev:
+                        merged_field_count += merge_qcm_fields(qcm, prev)
 
-                print(f"\n♻️  Loaded {already_corrected_count}/{len(qcms)} existing corrections from previous run.")
+                if merged_field_count > 0:
+                    print(f"\n♻️  Loaded {already_corrected_count}/{len(qcms)} existing corrections "
+                          f"from previous run (+{merged_field_count} synced edit(s) from Google Sheets).")
+                else:
+                    print(f"\n♻️  Loaded {already_corrected_count}/{len(qcms)} existing corrections from previous run.")
 
                 # In interactive mode: ask if user wants to force-overwrite
                 if not auto_mode and already_corrected_count > 0:
@@ -148,7 +166,9 @@ class Step6Corrections:
                     ).strip().lower()
                     force_overwrite = (fo_input == 'y')
                     if force_overwrite:
-                        # Clear existing corrections so they can be re-filled
+                        # Clear existing corrections so they can be re-filled.
+                        # User text edits merged above are kept — only the
+                        # Correct column is re-extracted.
                         for qcm in qcms:
                             qcm.pop('Correct', None)
                         print("   ⚠️  Force-overwrite ON — all existing corrections cleared.")

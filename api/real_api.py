@@ -3160,6 +3160,7 @@ def sync_from_sheets(name: str, step_id: str, user: dict = Depends(get_current_u
     """
     from modules.utils.xlsx_exporter import export_qcms_to_xlsx
     from modules.utils.output_naming import result_xlsx_name
+    from modules.utils.qcm_merge import qcm_key as _qcm_key, merge_qcm_fields
 
     cfg = _SYNC_STEP_CONFIG.get(step_id)
     if not cfg:
@@ -3240,9 +3241,6 @@ def sync_from_sheets(name: str, step_id: str, user: dict = Depends(get_current_u
             old_qcms = json.loads(local_json_path.read_text(encoding="utf-8"))
         except Exception:
             old_qcms = []
-
-    def _qcm_key(q):
-        return str(q.get("uid") or q.get("Num") or q.get("number") or "")
 
     if step_id == "6":
         # Step 6: count rows where the Correct field changed
@@ -3347,11 +3345,11 @@ def sync_from_sheets(name: str, step_id: str, user: dict = Depends(get_current_u
                 sib_q = sib_map.get(key)
                 if not sib_q:
                     continue  # QCM not present in sibling — skip (don't append, could be a different stage)
-                for field, val in edited_q.items():
-                    old_val = sib_q.get(field)
-                    if str(old_val) != str(val):
-                        sib_q[field] = val
-                        changed_in_sibling += 1
+                # Sheet-safe field-level merge: only update fields present in the
+                # sheet, preserve the sibling's extra fields (e.g. Correct,
+                # categoryName) that the sheet may lack, and never flatten
+                # structured values (lists/dicts) with raw sheet strings.
+                changed_in_sibling += merge_qcm_fields(sib_q, edited_q)
 
             if changed_in_sibling > 0:
                 try:
@@ -3365,14 +3363,38 @@ def sync_from_sheets(name: str, step_id: str, user: dict = Depends(get_current_u
                 except Exception as e:
                     print(f"[SYNC{step_id}] sibling JSON write failed: {e}")
 
+    # 10. Keep the Step 2 → 3 → 5 build chain in sync. Step 6 reads
+    #     step5_json/merged_qcms.json (NOT all_qcms.json), and a later Step 2
+    #     re-run rebuilds it from step3_metadata/accepted/. Propagate the
+    #     sheet edits into every file downstream steps consume so the user
+    #     never has to redo manual edits after cloud_sync.
+    chain_propagated = 0
+    chain_files: list = []
+    try:
+        from modules.utils.qcm_merge import propagate_sheet_edits
+        project_root = Path(f"/app/output/{user_id}/{name}")
+        chain = propagate_sheet_edits(project_root, new_qcms)
+        chain_files = chain.get("changed", [])
+        chain_propagated = len(chain_files)
+        for rel in chain_files:
+            try:
+                write_bytes_file(f"{user_id}/{name}/{rel}",
+                                 (project_root / rel).read_bytes())
+            except Exception as e:
+                print(f"[SYNC{step_id}] chain file storage upload failed ({rel}): {e}")
+    except Exception as e:
+        print(f"[SYNC{step_id}] build-chain propagation failed: {e}")
+
     print(f"[SYNC{step_id}] Synced {newly_corrected} changed row(s) out of {len(new_qcms)} total"
-          + (f", propagated {propagated} field(s) to step {sibling_id}." if propagated else "."))
+          + (f", propagated {propagated} field(s) to step {sibling_id}." if propagated else ".")
+          + (f", build-chain files updated: {chain_files}." if chain_propagated else ""))
 
     return {
         "total": len(new_qcms),
         "corrected_count": corrected_count,
         "newly_corrected": newly_corrected,
         "propagated": propagated,
+        "chain_files": chain_files,
         "file": json_name,
         "xlsx_file": xlsx_path.name,
     }
