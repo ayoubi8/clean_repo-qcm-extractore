@@ -1,5 +1,7 @@
 import { usePipelineStore } from '../../../store/pipelineStore'
+import { useAppStore } from '../../../store/appStore'
 import { useStepModels } from '../../../hooks/useStepModels'
+import { fetchPdfPages } from '../../../lib/api'
 import { useState, useEffect } from 'react'
 import { CorrectionSource, SearchMode } from '../../../types'
 
@@ -12,7 +14,23 @@ export function Step6Config() {
   const config = usePipelineStore(s => s.step6Config)
   const setConfig = usePipelineStore(s => s.setStep6Config)
   const { models, loading } = useStepModels()
+  const activeProject = useAppStore(s => s.activeProject)
   const [isCustom, setIsCustom] = useState(false)
+  const [pdfPages, setPdfPages] = useState<number | null>(null)
+
+  // Detect the project's PDF page count and pre-fill 'Page Reference' with
+  // the last page number (e.g. a 30-page PDF → pages = "30") when empty.
+  useEffect(() => {
+    let cancelled = false
+    if (!activeProject?.name) return
+    fetchPdfPages(activeProject.name).then((pages) => {
+      if (cancelled || pages == null) return
+      setPdfPages(pages)
+      const current = usePipelineStore.getState().step6Config.pages?.trim()
+      if (!current) setConfig({ pages: String(pages) })
+    }).catch(() => {})
+    return () => { cancelled = true }
+  }, [activeProject?.name])
 
   // Seed models from .env on first load
   useEffect(() => {
@@ -43,6 +61,18 @@ export function Step6Config() {
   };
 
   const activeModels = getModelOptions();
+
+  // Small helper row shown under page inputs: detected page count + click-to-fill
+  const pagesHint = pdfPages == null ? null : (
+    <button
+      type="button"
+      onClick={() => setConfig({ pages: String(pdfPages) })}
+      className="text-[10px] text-outline hover:text-primary transition-colors inline-flex items-center gap-1 mt-1"
+    >
+      <span className="material-symbols-outlined text-[13px]">description</span>
+      PDF has {pdfPages} pages — click to use the last page ({pdfPages})
+    </button>
+  );
 
   return (
     <div className="space-y-8 animate-in fade-in slide-in-from-bottom-2 duration-300">
@@ -125,6 +155,7 @@ export function Step6Config() {
               placeholder="e.g. 11 or path/to/page.txt"
               className="w-full bg-surface-container-lowest border border-outline-variant/20 rounded-xl px-4 py-3 text-sm focus:border-primary outline-none transition-all"
             />
+            {pagesHint}
           </div>
         )}
 
@@ -176,6 +207,7 @@ export function Step6Config() {
               placeholder="4,5,6,7"
               className="w-full bg-surface-container-lowest border border-outline-variant/20 rounded-xl px-4 py-3 text-sm focus:border-primary outline-none transition-all"
             />
+            {pagesHint}
           </div>
         )}
 

@@ -725,6 +725,83 @@ def serve_project_pdf(name: str, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="PDF not found")
     return FileResponse(str(pdf_path), media_type="application/pdf")
 
+
+@app.get("/projects/{name}/pdf-pages")
+def project_pdf_pages(name: str, user: dict = Depends(get_current_user)):
+    """Number of pages in the project's source PDF.
+
+    Used by the frontend to pre-fill 'Page Reference' fields (e.g. Step 6
+    Corrections) with the last page number. Resolution order:
+      1. local source.pdf (pypdfium2 page count)
+      2. Supabase Storage source.pdf (pypdfium2 page count, cached locally)
+      3. fallback: highest page_N.txt produced by Step 1 (local, then Storage)
+    Returns {"pages": int} — {"pages": null} when undetectable.
+    """
+    import io
+    import pypdfium2 as pdfium
+
+    def _count_pdf_bytes(data: bytes):
+        pdf = pdfium.PdfDocument(io.BytesIO(data))
+        try:
+            return len(pdf)
+        finally:
+            try:
+                pdf.close()
+            except Exception:
+                pass
+
+    uid = user["id"]
+    pdf_local = Path(f"/app/output/{uid}/{name}/source.pdf")
+    pages = None
+
+    # 1. Local PDF
+    try:
+        if pdf_local.exists():
+            pages = _count_pdf_bytes(pdf_local.read_bytes())
+    except Exception as e:
+        print(f"[PDF-PAGES] local count failed: {e}")
+
+    # 2. Storage PDF (cached locally for next time)
+    if not pages:
+        try:
+            data = read_bytes_file(f"{uid}/{name}/source.pdf")
+            pages = _count_pdf_bytes(data)
+            try:
+                pdf_local.parent.mkdir(parents=True, exist_ok=True)
+                pdf_local.write_bytes(data)
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[PDF-PAGES] storage count failed: {e}")
+
+    # 3. Fallback — highest page_N.txt extracted by Step 1
+    if not pages:
+        try:
+            accepted = Path(f"/app/output/{uid}/{name}/step1_extraction/accepted")
+            if accepted.is_dir():
+                nums = []
+                for p in accepted.glob("page_*.txt"):
+                    m = re.search(r"page_(\d+)\.txt$", p.name, re.I)
+                    if m:
+                        nums.append(int(m.group(1)))
+                if nums:
+                    pages = max(nums)
+        except Exception as e:
+            print(f"[PDF-PAGES] local step1 fallback failed: {e}")
+    if not pages:
+        try:
+            nums = []
+            for it in list_files_recursive(f"{uid}/{name}/step1_extraction/accepted"):
+                m = re.search(r"page_(\d+)\.txt$", it.get("name", ""), re.I)
+                if m:
+                    nums.append(int(m.group(1)))
+            if nums:
+                pages = max(nums)
+        except Exception as e:
+            print(f"[PDF-PAGES] storage step1 fallback failed: {e}")
+
+    return {"pages": pages}
+
 @app.get("/auth/google")
 def start_google_auth(
     project: str = "", step: str = "", filename: str = "",

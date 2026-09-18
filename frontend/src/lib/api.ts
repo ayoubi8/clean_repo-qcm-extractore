@@ -611,3 +611,19 @@ export async function syncFromSheets(projectName: string, stepId: string): Promi
   }
   return res.json()
 }
+
+// GET /projects/{name}/pdf-pages
+// Page count of the project's source PDF — used to pre-fill
+// 'Page Reference' fields (e.g. Step 6 Corrections) with the last page.
+export async function fetchPdfPages(projectName: string): Promise<number | null> {
+  try {
+    const res = await fetchWithRefresh(`${BASE}/projects/${encodeURIComponent(projectName)}/pdf-pages`, {
+      headers: { ...getAuthHeaders() }
+    })
+    if (!res.ok) return null
+    const data = await res.json()
+    return typeof data.pages === 'number' && data.pages > 0 ? data.pages : null
+  } catch {
+    return null
+  }
+}
