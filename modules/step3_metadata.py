@@ -1187,7 +1187,17 @@ that genuinely appear on THIS page.
 
         prompt = f"""You are analyzing one page of a French medical exam (OCR text) to find any
 clinical-case ("Cas Clinique") narratives on it, and to determine exactly
-which QCM number each one belongs to. Think it through before answering.
+which QCM number each one belongs to.
+THINKING (use it if your model exposes reasoning/thinking abilities — ignore
+this section otherwise): before answering, silently reason step by step:
+(a) locate every block of this page that reads as a patient-situation
+description by the definition below; (b) for each candidate, check the
+not-a-narrative list (question stems, OCR noise fragments, proposition
+lists) and discard anything failing it; (c) decide the owning QCM by
+reading order, applying the trailing rule for narratives nothing follows;
+(d) prepare anchor_text_clean for fused blocks; (e) only then emit the
+JSON array. Never print the reasoning itself — the JSON array alone is
+the answer.
 {carry_block}{pending_block}
 ## Trailing cases
 {trailing_hint_lines.strip()}
