@@ -113,6 +113,28 @@ export async function createProject(payload: {
   return res.json()
 }
 
+// POST /projects/{name}/pdf-from-drive
+// Import a project PDF from a PUBLIC Google Drive link (server-side download,
+// anonymous). Same ingest tail as file upload — same response shape.
+export async function importPdfFromDrive(
+  projectName: string,
+  link: string
+): Promise<{ pdf_path: string; size_bytes: number }> {
+  const res = await fetchWithRefresh(
+    `${BASE}/projects/${encodeURIComponent(projectName)}/pdf-from-drive`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+      body: JSON.stringify({ link }),
+    }
+  )
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}))
+    throw new Error(errData.detail || 'Drive import failed')
+  }
+  return res.json()
+}
+
 // POST /projects/{name}/pdf  (XHR for progress tracking — with 401 retry on token expiry)
 export async function uploadProjectPdf(
   projectName: string,

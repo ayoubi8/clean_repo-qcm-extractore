@@ -894,13 +894,13 @@ def google_oauth_callback(code: str, state: str = ""):
 
 
 
-@app.post("/projects/{name}/pdf")
-async def upload_project_pdf(name: str, file: UploadFile = File(...), user: dict = Depends(get_current_user)):
-    """Upload a PDF — dual-write to Supabase Storage and local FS for pipeline compatibility."""
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are accepted")
+def _store_pdf_bytes(user: dict, name: str, content: bytes, pdf_filename: str) -> dict:
+    """Shared PDF ingest tail — identical for file upload and Drive import.
 
-    content = await file.read()
+    Writes the fixed-name local source.pdf, dual-writes to Supabase Storage,
+    writes project.json (local + Storage), updates the projects.pdf_storage_path
+    DB column and invalidates the projects cache.
+    """
     storage_pdf_path = f"{user['id']}/{name}/source.pdf"
 
     # Upload to Supabase Storage (cloud-persistent)
@@ -917,14 +917,14 @@ async def upload_project_pdf(name: str, file: UploadFile = File(...), user: dict
         # ✅ Store the LOCAL absolute path so restored project.json is correct
         write_file(
             f"{user['id']}/{name}/project.json",
-            json.dumps({"name": name, "pdf_path": internal_path, "pdf_filename": file.filename})
+            json.dumps({"name": name, "pdf_path": internal_path, "pdf_filename": pdf_filename})
         )
     except Exception as e:
         print(f"[STORAGE] PDF upload to Supabase failed: {e}")
 
     # Write the same project.json locally
     (project_dir / "project.json").write_text(
-        json.dumps({"name": name, "pdf_path": internal_path, "pdf_filename": file.filename})
+        json.dumps({"name": name, "pdf_path": internal_path, "pdf_filename": pdf_filename})
     )
 
     # Keep the projects.pdf_storage_path DB column fresh so GET /projects
@@ -938,6 +938,81 @@ async def upload_project_pdf(name: str, file: UploadFile = File(...), user: dict
     invalidate_projects_cache(user["id"])
 
     return {"pdf_path": internal_path, "size_bytes": len(content)}
+
+
+@app.post("/projects/{name}/pdf")
+async def upload_project_pdf(name: str, file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+    """Upload a PDF — dual-write to Supabase Storage and local FS for pipeline compatibility."""
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted")
+
+    content = await file.read()
+    return _store_pdf_bytes(user, name, content, file.filename)
+
+
+# --- Google Drive link import (additive, feature-flagged) -----------------
+
+_user_rate_lock = threading.Lock()
+_user_rate_store: dict = {}
+
+
+def _check_user_rate_limit(user_id: str, action: str, limit: int,
+                           window_seconds: int = 60) -> None:
+    """Per-user sliding window rate limiter (same pattern as auth.check_rate_limit)."""
+    import time as _time
+    key = f"{action}:{user_id}"
+    now = _time.monotonic()
+    with _user_rate_lock:
+        prev = [t for t in _user_rate_store.get(key, [])
+                if now - t < window_seconds]
+        if len(prev) >= limit:
+            retry_after = int(window_seconds - (now - prev[0])) + 1
+            raise HTTPException(status_code=429,
+                                detail=f"Too many import attempts. Try again in {retry_after} seconds.",
+                                headers={"Retry-After": str(retry_after)})
+        _user_rate_store[key] = prev + [now]
+
+
+@app.post("/projects/{name}/pdf-from-drive")
+def import_pdf_from_drive(name: str, body: dict,
+                          user: dict = Depends(get_current_user)):
+    """Import a project PDF from a PUBLIC Google Drive link.
+
+    Downloads anonymously (no OAuth), validates the result as a real PDF,
+    then feeds it into the exact same ingest tail as file uploads
+    (_store_pdf_bytes: local source.pdf + Storage + project.json + DB).
+    """
+    from gdrive_import import (GoogleDriveImportError, download_drive_pdf,
+                               extract_drive_file_id, is_enabled)
+
+    if not is_enabled():
+        raise HTTPException(status_code=404, detail="Drive import is not enabled on this server.")
+
+    link = (body.get("link") or "").strip() if body else ""
+    _check_user_rate_limit(user["id"], "gdrive_import", limit=10, window_seconds=60)
+
+    user_id = user["id"]
+
+    # Same hygiene the upload route relies on: the project name is part of
+    # filesystem paths — keep it in the same charset as the rest of the app.
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", name or ""):
+        raise HTTPException(status_code=400, detail=
+            "Invalid project name — use letters, numbers, dots, dashes or underscores.")
+
+    try:
+        file_id = extract_drive_file_id(link)
+        print(f"[GDRIVE] import start ({len(file_id)}-char id) for {user_id}/{name}")
+        content, display_name = download_drive_pdf(
+            link, max_bytes=int(os.environ.get("MAX_DRIVE_PDF_BYTES", 200 * 1024 * 1024)))
+        # pdf_filename drives result-xlsx naming via pdf_stem_for_context();
+        # the fixed project name keeps project.json a single-writer doc, the
+        # Drive display name (if any) is kept only as metadata below.
+        result = _store_pdf_bytes(user, name, content, name)
+        print(f"[GDRIVE] import ok ({len(file_id)}-char id, "
+              f"{result['size_bytes']} bytes, disp_name={display_name})")
+        return result
+    except GoogleDriveImportError as e:
+        raise HTTPException(status_code=422, detail=e.message)
 
 
 # --- Reference Database Management Endpoints ---
