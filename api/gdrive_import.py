@@ -367,7 +367,7 @@ def download_drive_pdf(link: str,
 
 
 def is_enabled() -> bool:
-    """Feature flag — the route 404s when off. Default: disabled."""
+    """Feature flag — enabled by default; set GDRIVE_IMPORT_ENABLED=false to turn off."""
     import os
-    return str(os.environ.get("GDRIVE_IMPORT_ENABLED", "false")).strip().lower() in (
+    return str(os.environ.get("GDRIVE_IMPORT_ENABLED", "true")).strip().lower() in (
         "1", "true", "yes", "on")

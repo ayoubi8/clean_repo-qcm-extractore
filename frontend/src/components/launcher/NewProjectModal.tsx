@@ -61,30 +61,39 @@ export function NewProjectModal({ onSuccess }: NewProjectModalProps) {
 
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault()
-    if (!projectName) return
-    if (mode === 'file' && !file) return
+    if (mode === 'file' && (!file || !projectName)) return
 
-    setStage(mode === 'file' ? 'uploading' : 'importing')
+    if (mode === 'file') {
+      setStage('uploading')
+    } else {
+      setStage('importing')
+    }
     setErrorMsg(null)
     setUploadPct(0)
 
     try {
-      // Step 1 — create project folder (no pdf_path yet)
-      const project = await createProject({ name: projectName, pdf_path: '' })
-
       if (mode === 'file') {
-        // Step 2 — upload PDF into container volume
+        // File flow (unchanged): create project (name auto-derived from the
+        // file name in the field below) → upload → run pipeline as always.
+        const project = await createProject({ name: projectName, pdf_path: '' })
         const uploaded = await uploadProjectPdf(projectName, file!, (pct) => {
           setUploadPct(pct)
         })
-        // Return updated project with the internal pdf_path
         setStage('done')
         onSuccess({ ...project, pdf_path: uploaded.pdf_path })
       } else {
-        // Step 2 — download from Google Drive (same ingest tail server-side)
-        const imported = await importPdfFromDrive(projectName, driveLink.trim())
+        // Drive flow: ONE call — the project is created server-side and named
+        // after the Drive PDF's own filename. No name input needed.
+        setStage('importing')
+        const imported = await importPdfFromDrive(driveLink.trim())
         setStage('done')
-        onSuccess({ ...project, pdf_path: imported.pdf_path })
+        onSuccess({
+          name: imported.name,
+          pdf_path: imported.pdf_path,
+          last_step: 0,
+          last_modified: '',
+          total_tokens: 0,
+        } as Project)
       }
     } catch (err: any) {
       setStage('error')
@@ -92,8 +101,8 @@ export function NewProjectModal({ onSuccess }: NewProjectModalProps) {
     }
   }
 
-  const isReady = stage === 'pick' && projectName.length > 0 &&
-    (mode === 'link' ? driveLink.trim().length > 0 : file !== null)
+  const isReady = stage === 'pick' &&
+    (mode === 'link' ? driveLink.trim().length > 0 : (file !== null && projectName.length > 0))
 
   const busy = stage === 'uploading' || stage === 'importing'
 
@@ -201,26 +210,27 @@ export function NewProjectModal({ onSuccess }: NewProjectModalProps) {
         <div className="flex-1 h-px bg-outline-variant/20" />
       </div>
 
-      {/* Project Name */}
-      <div className="space-y-2 animate-in fade-in slide-in-from-bottom-2 duration-300">
-        <label className="text-xs font-bold uppercase tracking-widest text-outline">
-          Project Name
-        </label>
-        <input
-          id="input-project-name"
-          type="text"
-          value={projectName}
-          onChange={(e) => setProjectName(e.target.value.replace(/[^A-Za-z0-9._-]+/g, '_'))}
-          className="w-full bg-surface-container-lowest border border-outline-variant/30 rounded-xl px-4 py-3 text-sm focus:border-primary focus:ring-1 focus:ring-primary outline-none transition-all"
-          placeholder="my_extraction_project"
-          required
-        />
-        <p className="text-[10px] text-outline opacity-60">
-          {mode === 'file' && file
-            ? 'Auto-derived from filename. You can edit it.'
-            : 'Letters, numbers, dots, dashes or underscores.'}
-        </p>
-      </div>
+      {/* Project Name — file mode only; Drive import names the project
+          automatically from the PDF's own filename */}
+      {mode === 'file' && file && (
+        <div className="space-y-2 animate-in fade-in slide-in-from-bottom-2 duration-300">
+          <label className="text-xs font-bold uppercase tracking-widest text-outline">
+            Project Name
+          </label>
+          <input
+            id="input-project-name"
+            type="text"
+            value={projectName}
+            onChange={(e) => setProjectName(e.target.value.replace(/[^A-Za-z0-9._-]+/g, '_'))}
+            className="w-full bg-surface-container-lowest border border-outline-variant/30 rounded-xl px-4 py-3 text-sm focus:border-primary focus:ring-1 focus:ring-primary outline-none transition-all"
+            placeholder="my_extraction_project"
+            required
+          />
+          <p className="text-[10px] text-outline opacity-60">
+            Auto-derived from filename. You can edit it.
+          </p>
+        </div>
+      )}
 
       {/* Upload Progress (file mode) */}
       {stage === 'uploading' && (

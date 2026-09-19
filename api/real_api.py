@@ -973,44 +973,68 @@ def _check_user_rate_limit(user_id: str, action: str, limit: int,
         _user_rate_store[key] = prev + [now]
 
 
-@app.post("/projects/{name}/pdf-from-drive")
-def import_pdf_from_drive(name: str, body: dict,
-                          user: dict = Depends(get_current_user)):
-    """Import a project PDF from a PUBLIC Google Drive link.
+def _derive_project_name(display_name: str, file_id: str) -> str:
+    """Project name = Drive PDF's own filename, sanitized for filesystem paths.
 
-    Downloads anonymously (no OAuth), validates the result as a real PDF,
-    then feeds it into the exact same ingest tail as file uploads
-    (_store_pdf_bytes: local source.pdf + Storage + project.json + DB).
+    Falls back to a short form of the file ID when Drive does not expose a
+    filename (no Content-Disposition). Mirrors the upload flow, where the
+    name bar auto-derives from the file's name.
     """
-    from gdrive_import import (GoogleDriveImportError, download_drive_pdf,
-                               extract_drive_file_id, is_enabled)
+    raw = display_name or f"drive_{file_id[:12]}"
+    raw = re.sub(r"\.pdf$", "", raw.strip(), flags=re.IGNORECASE)
+    clean = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._-")
+    clean = clean[:60].strip("._-")
+    return clean or f"drive_{file_id[:12]}"
+
+
+@app.post("/pdf-from-drive")
+def import_pdf_from_drive(body: dict, user: dict = Depends(get_current_user)):
+    """Import a project PDF from a PUBLIC Google Drive link — one-shot.
+
+    No project needs to exist first and NO name is sent by the frontend: the
+    project is created and named after the Drive PDF's own filename.
+
+    Flow: strict link parse → SSRF-guarded anonymous download → %PDF- magic
+    validation → POST /projects logic (create_project) → _store_pdf_bytes
+    (local source.pdf + Storage + project.json + DB), the exact ingest tail
+    file uploads use.
+    """
+    from gdrive_import import GoogleDriveImportError, download_drive_pdf, is_enabled
 
     if not is_enabled():
         raise HTTPException(status_code=404, detail="Drive import is not enabled on this server.")
 
     link = (body.get("link") or "").strip() if body else ""
     _check_user_rate_limit(user["id"], "gdrive_import", limit=10, window_seconds=60)
-
-    user_id = user["id"]
-
-    # Same hygiene the upload route relies on: the project name is part of
-    # filesystem paths — keep it in the same charset as the rest of the app.
-    if not re.fullmatch(r"[A-Za-z0-9._-]+", name or ""):
-        raise HTTPException(status_code=400, detail=
-            "Invalid project name — use letters, numbers, dots, dashes or underscores.")
+    if not link:
+        raise HTTPException(status_code=400, detail="Paste a Drive link first.")
 
     try:
-        file_id = extract_drive_file_id(link)
-        print(f"[GDRIVE] import start ({len(file_id)}-char id) for {user_id}/{name}")
+        print(f"[GDRIVE] import start for {user['id']}")
         content, display_name = download_drive_pdf(
             link, max_bytes=int(os.environ.get("MAX_DRIVE_PDF_BYTES", 200 * 1024 * 1024)))
-        # pdf_filename drives result-xlsx naming via pdf_stem_for_context();
-        # the fixed project name keeps project.json a single-writer doc, the
-        # Drive display name (if any) is kept only as metadata below.
-        result = _store_pdf_bytes(user, name, content, name)
-        print(f"[GDRIVE] import ok ({len(file_id)}-char id, "
-              f"{result['size_bytes']} bytes, disp_name={display_name})")
-        return result
+        project_name = _derive_project_name(display_name or "", "")
+        file_id_len = 0
+        # Re-derive with the ID for the fallback name when no display name came back
+        if not display_name:
+            from gdrive_import import extract_drive_file_id
+            file_id = extract_drive_file_id(link)
+            file_id_len = len(file_id)
+            project_name = _derive_project_name("", file_id)
+        print(f"[GDRIVE] downloaded ({project_name}: "
+              f"{'display-name' if display_name else 'file-id'}, "
+              f"{len(content)} bytes)")
+
+        # Same project-creation logic as POST /projects (route function reused;
+        # body shape is identical to what the frontend sends for a manual create)
+        project = create_project({"name": project_name, "pdf_path": ""}, user)
+        stored = _store_pdf_bytes(user, project_name, content, display_name or project_name)
+        print(f"[GDRIVE] import ok → project '{project_name}'")
+        return {
+            "name": project_name,
+            "pdf_path": stored["pdf_path"],
+            "size_bytes": stored["size_bytes"],
+        }
     except GoogleDriveImportError as e:
         raise HTTPException(status_code=422, detail=e.message)
 
