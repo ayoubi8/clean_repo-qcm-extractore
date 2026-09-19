@@ -28,7 +28,10 @@ sys.stdout.reconfigure(encoding="utf-8")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from modules.utils.qcm_merge import qcm_key, merge_qcm_fields, propagate_sheet_edits
+from modules.utils.qcm_merge import (
+    qcm_key, merge_qcm_fields, propagate_sheet_edits,
+    build_uid_bridge, attach_bridge_uids,
+)
 
 
 def _write_json(path: Path, data):
@@ -215,6 +218,111 @@ def _test_s3_step6_full_field_merge():
     print("OK S3b — force_overwrite clears only Correct, edits kept.")
 
 
+def _test_s5_real_shape_rows_reach_chain():
+    print("\n--- S5: REAL-shape Num-keyed sheet rows propagate (F3 regression) ---")
+    tmp = Path(tempfile.mkdtemp())
+    root = tmp
+
+    # step5 merged: Num-keyed, order used to build the workbook
+    _write_json(root / "step5_json" / "merged_qcms.json", [
+        {"Num": 1, "uid": "1_1_0", "Text": "old text 1", "A": "pa1", "B": "pb1"},
+        {"Num": 2, "uid": "1_2_0", "Text": "old text 2", "A": "pa2", "B": "pb2"},
+    ])
+    # step3 raw page (uid-keyed, lowercase fields) — what a Step 2 re-run rebuilds from
+    _write_json(root / "step3_metadata" / "accepted" / "page_1.json", [
+        {"uid": "1_1_0", "page": 1, "number": 1, "text": "old text 1",
+         "propositions": {"a": "pa1", "b": "pb1"}},
+        {"uid": "1_2_0", "page": 1, "number": 2, "text": "old text 2",
+         "propositions": {"a": "pa2", "b": "pb2"}},
+    ])
+
+    # Real sheet rows: Template schema, NO uid column (all values strings)
+    rows = [
+        {"Num": "1", "Text": "edited text 1", "A": "edited pa1", "B": "pb1"},
+        {"Num": "2", "Text": "old text 2", "A": "pa2", "B": "pb2"},
+    ]
+    uid_by_num = {"1": "1_1_0", "2": "1_2_0"}
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        result = propagate_sheet_edits(root, rows, uid_by_num=uid_by_num)
+
+    s3 = [q for q in _read_json(root / "step3_metadata" / "accepted" / "page_1.json")
+          if q["uid"] == "1_1_0"]
+    assert s3, "uid 1_1_0 row must still exist in step3"
+    assert s3[0]["text"] == "edited text 1", s3                      # Text→text
+    assert s3[0]["propositions"]["a"] == "edited pa1", s3            # A→propositions.a
+    assert s3[0]["propositions"]["b"] == "pb1", s3                   # empty cells never wipe
+    assert s3[0]["page"] == 1 and s3[0]["number"] == 1, s3           # untouched fields intact
+
+    s5 = _read_json(root / "step5_json" / "merged_qcms.json")
+    assert s5[0]["Text"] == "edited text 1", s5
+    assert s5[0]["uid"] == "1_1_0", s5
+    print(f"OK S5 — real-shape rows propagate: {sorted(result['changed'])}")
+
+
+def _test_s6_deletions_prune_chain():
+    print("\n--- S6: deletion propagation prunes the whole chain (F1 regression) ---")
+    tmp = Path(tempfile.mkdtemp())
+    root = tmp
+
+    _write_json(root / "step5_json" / "merged_qcms.json", [
+        {"Num": 1, "uid": "1_1_0", "Text": "keep me"},
+        {"Num": 2, "uid": "1_2_0", "Text": "delete me"},
+    ])
+    _write_json(root / "step2_qcm" / "accepted" / "merged_qcms.json", [
+        {"Num": 1, "uid": "1_1_0", "Text": "keep me"},
+        {"Num": 2, "uid": "1_2_0", "Text": "delete me"},
+    ])
+    _write_json(root / "step3_metadata" / "accepted" / "page_1.json", [
+        {"uid": "1_1_0", "page": 1, "number": 1, "text": "keep me"},
+        {"uid": "1_2_0", "page": 1, "number": 2, "text": "delete me"},
+    ])
+
+    # Sheet after user deleted row 2: only row 1 remains
+    rows = [{"Num": "1", "Text": "keep me"}]
+    deleted = [{"Num": 2, "uid": "1_2_0", "Text": "delete me"}]
+    uid_by_num = {"1": "1_1_0"}
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        result = propagate_sheet_edits(root, rows, deleted_rows=deleted,
+                                       uid_by_num=uid_by_num)
+
+    assert len(_read_json(root / "step5_json" / "merged_qcms.json")) == 1
+    assert len(_read_json(root / "step2_qcm" / "accepted" / "merged_qcms.json")) == 1
+    # step3 pruned via the uid bridge
+    assert len(_read_json(root / "step3_metadata" / "accepted" / "page_1.json")) == 1
+    assert "step3_metadata/accepted/page_1.json" in result["pruned"], result
+    print(f"OK S6 — deletions pruned everywhere: pruned={result['pruned']}")
+
+
+def _test_s7_uid_bridge_and_stamping():
+    print("\n--- S7: uid bridge (legacy Num-only sheets) + attach_bridge_uids ---")
+    tmp = Path(tempfile.mkdtemp())
+    root = tmp
+    _write_json(root / "step5_json" / "merged_qcms.json", [
+        {"Num": 1, "uid": "9_9_0", "Text": "x"},
+        {"Num": 2, "Text": "no uid here"},
+    ])
+    bridge = build_uid_bridge(root)
+    assert bridge == {"1": "9_9_0"}, bridge
+
+    rows = [{"Num": "1", "Text": "y"}, {"Num": "2", "Text": "y"}]
+    attach_bridge_uids(rows, bridge)
+    assert rows[0]["uid"] == "9_9_0", rows       # bridged
+    assert "uid" not in rows[1], rows            # no bridge → untouched
+    print("OK S7 — bridge resolves legacy Num-only rows.")
+
+
+def _test_s8_dict_cell_never_wipes():
+    print("\n--- S8: dict-to-dict merge never wipes existing keys with empties ---")
+    target = {"propositions": {"a": "pa", "b": "pb"}}
+    source = {"propositions": {"a": "new pa", "b": "", "c": "pc"}}
+    changed = merge_qcm_fields(target, source)
+    assert target["propositions"] == {"a": "new pa", "b": "pb", "c": "pc"}, target
+    assert changed == 2, changed
+    print("OK S8 — empty sheet cells never wipe dict keys.")
+
+
 def _test_s4_key_compat():
     print("\n--- S4: qcm_key covers uid / Num / number variants ---")
     assert qcm_key({"uid": "1_1_0"}) == "1_1_0"
@@ -230,4 +338,8 @@ if __name__ == "__main__":
     _test_s2_propagate_sheet_edits()
     _test_s3_step6_full_field_merge()
     _test_s4_key_compat()
+    _test_s5_real_shape_rows_reach_chain()
+    _test_s6_deletions_prune_chain()
+    _test_s7_uid_bridge_and_stamping()
+    _test_s8_dict_cell_never_wipes()
     print("\nALL SHEET-EDIT SYNC TESTS PASSED ✅")

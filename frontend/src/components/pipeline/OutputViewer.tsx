@@ -40,12 +40,37 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
   const [selectedRun, setSelectedRun] = useState<string | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
 
-  // Step 6 auto-sync state
-  const [syncing, setSyncing] = useState(false);
-  const [syncToast, setSyncToast] = useState<string | null>(null);
+  // Step 6/2 auto-sync state
   const [deletingFile, setDeletingFile] = useState<string | null>(null);
   const hasOpenedSheetRef = useRef(false);
   const syncingRef = useRef(false);  // guard against overlapping sync calls
+
+  // Shared post-sync bookkeeping: refresh file list + toast whenever ANYTHING
+  // changed (edits, corrections, deletions — CLOUD_SYNC F8).
+  const [syncing, setSyncing] = useState(false);
+  const [syncToast, setSyncToast] = useState<string | null>(null);
+  const syncFromSheetsResult = async (force: boolean = false) => {
+    const result = await syncFromSheets(projectName, stepId, force);
+    try {
+      const data = await fetchStepOutput(projectName, stepId);
+      setFiles(sortOutputFiles(data.files));
+    } catch {}
+    const parts: string[] = [];
+    if (result.newly_corrected > 0) {
+      parts.push(`${result.newly_corrected} change${result.newly_corrected === 1 ? '' : 's'}`);
+    }
+    if (result.deleted_count > 0) {
+      parts.push(`${result.deleted_count} deleted row${result.deleted_count === 1 ? '' : 's'}`);
+    }
+    const propMsg = result.propagated > 0 ? ` (${result.propagated} propagated to ${stepId === '6' ? 'Step 2' : 'Step 6'})` : '';
+    setSyncToast(
+      parts.length > 0
+        ? `Synced ${parts.join(', ')} from Google Sheets${propMsg}`
+        : `Sheet is up to date (${result.total} rows)`
+    );
+    setTimeout(() => setSyncToast(null), 5000);
+    return result;
+  };
 
   // Auto-sync from Google Sheets when the user returns to our tab (Steps 2 & 6)
   useEffect(() => {
@@ -58,19 +83,9 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
       syncingRef.current = true;
       setSyncing(true);
       try {
-        const result = await syncFromSheets(projectName, stepId);
-        if (result.newly_corrected > 0) {
-          // Refresh file list so the new timestamped xlsx appears
-          try {
-            const data = await fetchStepOutput(projectName, stepId);
-            setFiles(sortOutputFiles(data.files));
-          } catch {}
-          const propMsg = result.propagated > 0 ? ` (${result.propagated} propagated to ${stepId === '6' ? 'Step 2' : 'Step 6'})` : '';
-          setSyncToast(`Synced ${result.newly_corrected} change${result.newly_corrected === 1 ? '' : 's'} from Google Sheets${propMsg}`);
-          setTimeout(() => setSyncToast(null), 5000);
-        }
+        await syncFromSheetsResult();
       } catch (e: any) {
-        // 409 = no sheet opened yet, 401 = need re-auth — silent in auto-mode
+        // 409 = no sheet opened yet, 401 = need re-auth, 422 = deletion safety valve — silent in auto-mode
         console.error("Auto-sync from Sheets failed:", e?.message || e);
       } finally {
         syncingRef.current = false;
@@ -82,25 +97,24 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
     return () => document.removeEventListener("visibilitychange", onVisibility);
   }, [stepId, projectName]);
 
-  const handleManualSync = async () => {
+  const handleManualSync = async (force: boolean = false) => {
     if (syncingRef.current) return;
     syncingRef.current = true;
     setSyncing(true);
     try {
-      const result = await syncFromSheets(projectName, stepId);
-      if (result.newly_corrected > 0) {
-        try {
-          const data = await fetchStepOutput(projectName, stepId);
-          setFiles(sortOutputFiles(data.files));
-        } catch {}
-        const propMsg = result.propagated > 0 ? ` (${result.propagated} propagated to ${stepId === '6' ? 'Step 2' : 'Step 6'})` : '';
-        setSyncToast(`Synced ${result.newly_corrected} change${result.newly_corrected === 1 ? '' : 's'} from Google Sheets${propMsg}`);
-      } else {
-        setSyncToast(`Sheet is up to date (${result.total} rows)`);
-      }
-      setTimeout(() => setSyncToast(null), 5000);
+      await syncFromSheetsResult(force);
     } catch (e: any) {
-      alert(e?.message || 'Sync from Sheets failed');
+      const msg = String(e?.message || e);
+      if (msg.startsWith('DELETION_SAFETY') &&
+          window.confirm(`${msg.replace('DELETION_SAFETY: ', '')}\n\nApply the deletion anyway?`)) {
+        try {
+          await syncFromSheetsResult(true);
+        } catch (retryErr: any) {
+          alert(retryErr?.message || 'Sync from Sheets failed');
+        }
+      } else {
+        alert(msg);
+      }
     } finally {
       syncingRef.current = false;
       setSyncing(false);
@@ -374,6 +388,14 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
       )}
 
       <div className="space-y-2 max-h-80 overflow-y-auto custom-scrollbar pr-2">
+        {syncing && !syncToast && (
+          <div className="fixed bottom-6 right-6 z-50 animate-in slide-in-from-bottom-2 fade-in duration-300">
+            <div className="bg-surface-container-high/90 border border-outline-variant/20 text-outline-variant text-xs font-bold px-4 py-3 rounded-xl shadow-lg backdrop-blur flex items-center gap-2">
+              <span className="material-symbols-outlined text-[16px] animate-spin">sync</span>
+              Syncing from Google Sheets…
+            </div>
+          </div>
+        )}
         {syncToast && (
           <div className="fixed bottom-6 right-6 z-50 animate-in slide-in-from-bottom-2 fade-in duration-300">
             <div className="bg-primary/10 border border-primary/30 text-primary text-xs font-bold px-4 py-3 rounded-xl shadow-lg backdrop-blur flex items-center gap-2">
@@ -485,7 +507,7 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
 
                 {["2", "6"].includes(stepId) && file.name.endsWith('.xlsx') && !showHistory && (
                   <button
-                    onClick={handleManualSync}
+                    onClick={() => handleManualSync()}
                     title="Pull the latest edits back from Google Sheets"
                     disabled={syncing}
                     className="w-7 h-7 rounded-lg flex items-center justify-center text-outline hover:text-primary hover:bg-primary/10 transition-colors disabled:opacity-50"

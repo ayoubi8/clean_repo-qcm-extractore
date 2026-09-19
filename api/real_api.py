@@ -1865,9 +1865,15 @@ STEP_INPUT_DEPENDENCIES = {
     # logic. If local FS is empty, the auto-build will fail with "no QCMs"
     # which is fine because Step 3 itself wouldn't have produced anything.
     "6":         [("step5_json", None), ("step6_corrections", None)],  # Step 6 reads merged_qcms.json + its own prior corrections
-    "7":         [("step6_corrections", "accepted"), ("step5_json", None)],  # Step 7 reads corrected QCMs
-    "8":         [("step5_json", None), ("step7_categories", "accepted")],  # Step 8 reads merged_qcms + categorized
+    "7":         [("step6_corrections", None), ("step5_json", None)],  # Step 7 reads ROOT corrected_qcms.json (CLOUD_SYNC F10)
+    "8":         [("step5_json", None), ("step7_categories", None),    # ROOT final_qcms.json (CLOUD_SYNC F10)
+                  ("step6_corrections", None)],
 }
+
+# Steps whose runs must first consume the user's latest Google-Sheet edits
+# (CLOUD_SYNC P4/Q5-a). Step 2 re-runs merge into all_qcms.json; steps 6/7/8
+# consume step5/corrected data which both registered sheets feed.
+_RUN_SYNC_CONSUMER_STEPS = {"2", "6", "7", "8"}
 
 
 def _restore_step_input_from_storage(user_id: str, project: str, step_id: str) -> None:
@@ -1914,6 +1920,158 @@ def _restore_step_input_from_storage(user_id: str, project: str, step_id: str) -
                 print(f"[RESTORE] ✅ Restored {restored} file(s) from Supabase → {local_dir}")
         except Exception as e:
             print(f"[RESTORE] ⚠️ Could not restore {folder}/{subdir or ''} for step {step_id}: {e}")
+
+
+# --- CLOUD_SYNC_RELIABILITY_PLAN helpers ---
+
+def _read_sheets_meta(user_id: str, name: str, folder: str) -> dict:
+    """Read _sheets_meta.json for a step folder (local FS, then Storage)."""
+    local = Path(f"/app/output/{user_id}/{name}/{folder}/_sheets_meta.json")
+    if local.exists():
+        try:
+            return json.loads(local.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    try:
+        return json.loads(read_file(f"{user_id}/{name}/{folder}/_sheets_meta.json"))
+    except Exception:
+        return {}
+
+
+def _warm_local_from_storage(root: Path, rel: str, storage_path: str) -> bool:
+    """Ensure one chain/meta file exists locally, pulling it from Supabase
+    Storage on a miss (CLOUD_SYNC F7 — restart-safe sync)."""
+    local = root / rel
+    if local.exists():
+        return False
+    try:
+        data = read_bytes_file(storage_path)
+    except Exception:
+        return False
+    try:
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_bytes(data)
+        return True
+    except Exception as e:
+        print(f"[WARM] local write failed for {rel}: {e}")
+        return False
+
+
+def _archive_superseded_xlsx(user_id: str, name: str, folder_rel: str,
+                             kind: str, stem: str, keep_name: str,
+                             step_id: str = "") -> list:
+    """Archive superseded `{count}_(qcms|corrections)_{stem}.xlsx` workbooks out
+    of the current step folder (local FS + Supabase Storage + SQL manifest)
+    into _history/step{N}/sync_archive/ — exactly one current workbook per
+    folder so the user can never re-open/download a stale one (CLOUD_SYNC F5/Q4).
+    Returns the archived relative paths.
+    """
+    import re as _re2
+    if not step_id:
+        step_id = "2" if kind == "qcms" else "6"
+    pattern = _re2.compile(
+        rf"^\d+_{_re2.escape(kind)}_{_re2.escape(stem)}\.xlsx$")
+    project_root = Path(f"/app/output/{user_id}/{name}")
+    local_dir = project_root / folder_rel
+    archive_dir = project_root / f"_history/step{step_id}" / "sync_archive"
+    keep_rel = f"{folder_rel}/{keep_name}".replace("\\", "/")
+    archived: list = []
+
+    if local_dir.is_dir():
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        for f in sorted(local_dir.iterdir()):
+            if not f.is_file() or not pattern.match(f.name) or f.name == keep_name:
+                continue
+            stale_rel = f"{folder_rel}/{f.name}".replace("\\", "/")
+            try:
+                shutil.move(str(f), str(archive_dir / f.name))
+                try:
+                    delete_prefix(f"{user_id}/{name}/{stale_rel}")
+                except Exception:
+                    pass
+                try:
+                    write_bytes_file(
+                        f"{user_id}/{name}/_history/step{step_id}/sync_archive/{f.name}",
+                        (archive_dir / f.name).read_bytes())
+                except Exception:
+                    pass
+                archived.append(stale_rel)
+            except Exception as e:
+                print(f"[SYNC-ARCHIVE] could not archive {stale_rel}: {e}")
+
+    if archived:
+        try:
+            row = _latest_step_result_row(user_id, name, str(step_id))
+            if row and row.get("file_manifest") and row.get("id"):
+                manifest = [
+                    e for e in row["file_manifest"]
+                    if not any(str(e.get("path", "")).endswith("/" + a)
+                               or str(e.get("path", "")) == a for a in archived)
+                ]
+                current_size = None
+                try:
+                    current_size = (project_root / keep_rel).stat().st_size
+                except Exception:
+                    pass
+                already = any(
+                    str(e.get("path", "")).endswith("/" + keep_name)
+                    or str(e.get("path", "")) == keep_name
+                    or str(e.get("path", "")) == keep_rel
+                    for e in manifest)
+                if not already:
+                    manifest.append({"path": keep_rel,
+                                     "size_bytes": current_size or 0})
+                get_supabase().table("step_results").update(
+                    {"file_manifest": manifest}).eq("id", row["id"]).execute()
+        except Exception as e:
+            print(f"[SYNC-ARCHIVE] manifest update failed: {e}")
+    return archived
+
+
+def _pre_run_sheets_sync(user_id: str, project: str, step_id: str) -> None:
+    """Server-side sync-before-run (CLOUD_SYNC P4/Q5-a): before a step runs,
+    sync every registered sheet whose step feeds it — even when no frontend
+    sync fired (page reload, other panel, other device). Soft-fail: Google
+    errors never block the run; a DELETION_SAFETY abort leaves data as-is."""
+    step_id = str(step_id)
+    if step_id not in _RUN_SYNC_CONSUMER_STEPS:
+        return
+    for sync_step in ("2", "6"):
+        cfg = _SYNC_STEP_CONFIG.get(sync_step)
+        if not cfg:
+            continue
+        meta = None
+        meta_local = Path(
+            f"/app/output/{user_id}/{project}/{cfg['meta_folder']}/_sheets_meta.json")
+        if meta_local.exists():
+            try:
+                meta = json.loads(meta_local.read_text(encoding="utf-8"))
+            except Exception:
+                meta = None
+        if not meta:
+            try:
+                meta = json.loads(read_file(
+                    f"{user_id}/{project}/{cfg['meta_folder']}/_sheets_meta.json"))
+            except Exception:
+                meta = None
+        if not meta or not meta.get("sheet_id"):
+            continue  # no sheet opened for this step — nothing to sync
+        try:
+            result = _sync_step_from_sheets_svc(project, sync_step, user_id)
+            print(f"[PRE-RUN-SYNC] step {sync_step} sheet synced: "
+                  f"{result.get('newly_corrected')} changed, "
+                  f"{result.get('deleted_count')} deleted "
+                  f"(before running step {step_id}).")
+        except HTTPException as he:
+            if "DELETION_SAFETY" in str(he.detail):
+                print(f"[PRE-RUN-SYNC] ⚠️ step {sync_step} sheet lost >30% of rows — "
+                      f"sync aborted for safety, run proceeds on stored data.")
+            else:
+                print(f"[PRE-RUN-SYNC] ⚠️ step {sync_step} sync unavailable "
+                      f"({he.status_code}) — run proceeds on stored data.")
+        except Exception as e:
+            print(f"[PRE-RUN-SYNC] ⚠️ step {sync_step} sync failed: {e} — run proceeds.")
+
 
 @app.post(
     "/projects/{name}/steps/{step_id}/run",
@@ -2081,6 +2239,16 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
             _restore_step_input_from_storage(user_id, project, step_id)
         except Exception as _rie:
             print(f"[RESTORE] ⚠️ step-input restore failed for step {step_id}: {_rie}")
+
+        # CLOUD_SYNC P4/Q5-a — server-side sync-before-run: pull the user's
+        # latest Google-Sheet edits (steps 2 & 6) into local + Storage BEFORE
+        # anything consumes them. Soft-fail (see _pre_run_sheets_sync).
+        try:
+            loop2 = asyncio.get_event_loop()
+            await loop2.run_in_executor(
+                None, _pre_run_sheets_sync, user_id, project, str(step_id))
+        except Exception as _prs:
+            print(f"[PRE-RUN-SYNC] ⚠️ hook failed: {_prs} — run proceeds.")
 
         # Ensure Step 8 selected reference database is downloaded locally
         if step_id == "8" and config.get("ref_db_path"):
@@ -3261,8 +3429,56 @@ def open_in_google_sheets(name: str, step_id: str, body: dict, user: dict = Depe
     if not creds:
         print(f"[SHEETS] No Google creds for user {user['id']} (db_id={user_db_id}) — returning 401 NOT_AUTHORIZED")
         raise HTTPException(status_code=401, detail="NOT_AUTHORIZED")
+
+    # Reuse the existing Google Sheet for the SAME workbook (CLOUD_SYNC Q3 —
+    # one Sheet per file): rewrite its grid from the latest xlsx so edits and
+    # row deletions show up, instead of spawning a fresh Sheet each open.
+    reuse_meta = None
     try:
-        from googleapiclient.http import MediaFileUpload
+        reuse_meta = _read_sheets_meta(user["id"], name, folder)
+    except Exception:
+        reuse_meta = None
+    if reuse_meta and reuse_meta.get("sheet_id") and \
+            str(reuse_meta.get("filename", "")) == str(filename):
+        try:
+            from openpyxl import load_workbook as _load_wb
+            _wb = _load_wb(str(file_path), data_only=True)
+            _rows_out = []
+            for _cells in _wb.active.iter_rows(values_only=True):
+                _rows_out.append([
+                    "" if v is None else
+                    (v.isoformat() if hasattr(v, "isoformat") else v)
+                    for v in _cells
+                ])
+            _sheets_service = build("sheets", "v4", credentials=creds)
+            _sheets_service.spreadsheets().values().clear(
+                spreadsheetId=reuse_meta["sheet_id"], range="A:Z").execute()
+            if _rows_out:
+                _sheets_service.spreadsheets().values().update(
+                    spreadsheetId=reuse_meta["sheet_id"], range="A1",
+                    valueInputOption="RAW",
+                    body={"values": _rows_out}).execute()
+            try:
+                _meta_path_local = Path(
+                    f"/app/output/{user['id']}/{name}/{folder}/_sheets_meta.json")
+                _meta_path_local.parent.mkdir(parents=True, exist_ok=True)
+                reuse_meta["opened_at"] = datetime.now().isoformat()
+                _meta_path_local.write_text(json.dumps(reuse_meta), encoding="utf-8")
+                try:
+                    write_file(
+                        f"{user['id']}/{name}/{folder}/_sheets_meta.json",
+                        _meta_path_local.read_text())
+                except Exception as _me:
+                    print(f"[SHEETS] meta refresh skipped: {_me}")
+            except Exception as _me:
+                print(f"[SHEETS] meta write failed (reuse kept): {_me}")
+            sheets_url = f"https://docs.google.com/spreadsheets/d/{reuse_meta['sheet_id']}/edit"
+            print(f"[SHEETS] Reused existing sheet {reuse_meta['sheet_id']}: {sheets_url}")
+            return {"url": sheets_url, "id": reuse_meta["sheet_id"], "reused": True}
+        except Exception as _re:
+            print(f"[SHEETS] Sheet reuse failed — creating a new Sheet instead: {_re}")
+
+    try:
         print(f"[SHEETS] Uploading to Google Drive...")
         drive_service = build("drive", "v3", credentials=creds)
         file_metadata = {"name": file_path.stem, "mimeType": "application/vnd.google-apps.spreadsheet"}
@@ -3325,7 +3541,7 @@ _SYNC_STEP_CONFIG = {
 
 
 @app.post("/projects/{name}/steps/{step_id}/sync-from-sheets")
-def sync_from_sheets(name: str, step_id: str, user: dict = Depends(get_current_user)):
+def sync_from_sheets(name: str, step_id: str, body: dict = None, user: dict = Depends(get_current_user)):
     """Pull the edited Google Sheet back into the canonical JSON for this step
     (local + Supabase Storage) so downstream steps read the user's manual edits.
 
@@ -3333,16 +3549,32 @@ def sync_from_sheets(name: str, step_id: str, user: dict = Depends(get_current_u
     (all_qcms.json → Step 3). Triggered automatically by the frontend when the
     user returns to our tab after editing in Google Sheets, or manually via
     the 'Sync from Sheets' fallback button.
+
+    Body: {"force": true} — confirms mass deletion when the sheet lost >30% of
+    the stored rows (safety valve; see CLOUD_SYNC_RELIABILITY_PLAN.md Q1).
+    """
+    force = bool((body or {}).get("force", False))
+    return _sync_step_from_sheets_svc(name, str(step_id), user["id"], force=force)
+
+
+def _sync_step_from_sheets_svc(name: str, step_id: str, user_id: str,
+                               force: bool = False) -> dict:
+    """Sync one registered Google Sheet into the pipeline (used by both the
+    HTTP endpoint above and the pre-run hook in _run_step_task — CLOUD_SYNC Q5).
+
+    Raises HTTPException on the usual failure paths (409/401/422/502).
     """
     from modules.utils.xlsx_exporter import export_qcms_to_xlsx
     from modules.utils.output_naming import result_xlsx_name
-    from modules.utils.qcm_merge import qcm_key as _qcm_key, merge_qcm_fields
+    from modules.utils.qcm_merge import (
+        qcm_key as _qcm_key, merge_qcm_fields, propagate_sheet_edits,
+        build_uid_bridge, attach_bridge_uids, expand_keys_with_bridge,
+    )
 
     cfg = _SYNC_STEP_CONFIG.get(step_id)
     if not cfg:
         raise HTTPException(status_code=404, detail=f"Sync not supported for step {step_id}.")
 
-    user_id = user["id"]
     meta_folder = cfg["meta_folder"]
     json_folder = cfg["json_folder"]
     json_name = cfg["json_name"]
@@ -3367,8 +3599,7 @@ def sync_from_sheets(name: str, step_id: str, user: dict = Depends(get_current_u
     sheet_id = meta["sheet_id"]
 
     # 2. Load Google credentials
-    user_db_id = get_db_user_id(user)
-    creds = _get_google_creds(user_db_id)
+    creds = _get_google_creds(user_id)
     if not creds:
         raise HTTPException(status_code=401, detail="NOT_AUTHORIZED")
 
@@ -3408,7 +3639,16 @@ def sync_from_sheets(name: str, step_id: str, user: dict = Depends(get_current_u
     if not new_qcms:
         raise HTTPException(status_code=422, detail="No data rows found in sheet.")
 
-    # 5. Diff vs existing canonical JSON
+    # 4.5 Identity bridge — stamp the stable uid onto Num-keyed sheet rows so
+    #     every artifact (all_qcms.json, step3 pages, merged, corrected) can be
+    #     matched by ONE key. Legacy sheets without a uid column are bridged
+    #     via the Num→uid map built from the current merged_qcms.json.
+    project_root = Path(f"/app/output/{user_id}/{name}")
+    uid_by_num = build_uid_bridge(project_root)
+    attach_bridge_uids(new_qcms, uid_by_num)
+
+    # 5. Load the old canonical JSON (local FS first, Storage fallback — the
+    #    local tree is wiped after a container restart; CLOUD_SYNC F7).
     local_json_dir = Path(f"/app/output/{user_id}/{name}/{json_folder}")
     local_json_path = local_json_dir / json_name
     old_qcms = []
@@ -3417,16 +3657,94 @@ def sync_from_sheets(name: str, step_id: str, user: dict = Depends(get_current_u
             old_qcms = json.loads(local_json_path.read_text(encoding="utf-8"))
         except Exception:
             old_qcms = []
+    if not old_qcms:
+        try:
+            old_qcms = json.loads(
+                read_file(f"{user_id}/{name}/{json_folder}/{json_name}"))
+        except Exception:
+            old_qcms = []
+    if not isinstance(old_qcms, list):
+        old_qcms = []
+
+    # 5.5 Deletion detection — the sheet is the source of truth for which rows
+    #     exist. A stored row whose identity is absent from the sheet is deleted
+    #     by the user (CLOUD_SYNC F1/Q2: deletion wins, no Correct-protection).
+    sheet_keys = expand_keys_with_bridge(
+        {_qcm_key(r) for r in new_qcms if _qcm_key(r)}, uid_by_num)
+    deleted_qcms = [q for q in old_qcms
+                    if isinstance(q, dict) and _qcm_key(q) not in sheet_keys]
+    deleted_count = len(deleted_qcms)
+    old_count = len(old_qcms)
+    # Deletion key-set, re-bridged so both uid-keyed and Num-keyed files prune.
+    deleted_keys = {_qcm_key(d) for d in deleted_qcms if _qcm_key(d)}
+    prune_idset = expand_keys_with_bridge(deleted_keys, uid_by_num)
+    if old_count and deleted_count and (deleted_count / old_count) > 0.30 and not force:
+        raise HTTPException(
+            status_code=422,
+            detail=(f"DELETION_SAFETY: The sheet is missing {deleted_count} of "
+                    f"{old_count} stored rows ({round(100 * deleted_count / old_count)}%). "
+                    f"Sync aborted to protect against a half-loaded sheet. Click 'Sync' again "
+                    f"and confirm to apply the deletion anyway."))
+
+    # 6. Build the new canonical JSON (merge, NOT blind overwrite).
+    #    - Step 6: canonical schema already matches the sheet → re-type values
+    #      against the old canonical (Tag lists, ints survive the round-trip;
+    #      CLOUD_SYNC F9) and merge edited rows over them.
+    #    - Step 2: the canonical is the uid-keyed RAW record — merge the sheet
+    #      fields INTO it (Text→text, A..E→propositions) and drop deleted rows
+    #      so uid/page/propositions are never destroyed (CLOUD_SYNC F2/F3).
+    if deleted_count:
+        old_qcms = [q for q in old_qcms
+                    if not (isinstance(q, dict) and _qcm_key(q) in sheet_keys)]
 
     if step_id == "6":
-        # Step 6: count rows where the Correct field changed
+        old_map = {_qcm_key(q): dict(q) for q in old_qcms if isinstance(q, dict)}
+        new_qcms_final = []
+        for row in new_qcms:
+            base = dict(old_map.get(_qcm_key(row), {}))
+            merge_qcm_fields(base, row)
+            new_qcms_final.append(base)
+    else:
+        from modules.utils.qcm_merge import translate_row_for_raw
+        canonical: list = [dict(q) for q in old_qcms if isinstance(q, dict)]
+        canonical_map: dict = {}
+        for q in canonical:
+            k = _qcm_key(q)
+            if k:
+                canonical_map.setdefault(k, q)
+        for row in new_qcms:
+            k = _qcm_key(row)
+            if not k:
+                continue
+            cands = {k}
+            bridged = uid_by_num.get(k)
+            if bridged:
+                cands.add(bridged)
+            target = None
+            for j in canonical:
+                jk = _qcm_key(j)
+                if jk and jk in cands:
+                    target = j
+                    break
+            if target is None:
+                target = dict(row)
+                canonical.append(target)
+                canonical_map[k] = target
+            else:
+                merge_qcm_fields(target, translate_row_for_raw(row))
+        new_qcms_final = canonical
+    new_qcms = new_qcms_final
+
+    # 6.5 Diff counts — field-diff rows still present + deletions (UI feedback;
+    #     CLOUD_SYNC F8).
+    newly_corrected = 0
+    corrected_count = 0
+    if step_id == "6":
         old_correct_map = {
             _qcm_key(q): str(q.get("Correct", "")).strip()
             for q in old_qcms
             if str(q.get("Correct", "")).strip()
         }
-        newly_corrected = 0
-        corrected_count = 0
         for q in new_qcms:
             correct_val = str(q.get("Correct", "")).strip()
             if correct_val:
@@ -3434,10 +3752,7 @@ def sync_from_sheets(name: str, step_id: str, user: dict = Depends(get_current_u
                 if correct_val != old_correct_map.get(_qcm_key(q), ""):
                     newly_corrected += 1
     else:
-        # Generic: count rows where ANY field differs from the old version
         old_map = {_qcm_key(q): q for q in old_qcms}
-        newly_corrected = 0
-        corrected_count = 0
         for q in new_qcms:
             key = _qcm_key(q)
             old_q = old_map.get(key)
@@ -3450,7 +3765,7 @@ def sync_from_sheets(name: str, step_id: str, user: dict = Depends(get_current_u
                     newly_corrected += 1
                     break
 
-    # 6. Overwrite canonical JSON locally
+    # 6.7 Overwrite canonical JSON locally (merged version)
     local_json_dir.mkdir(parents=True, exist_ok=True)
     local_json_path.write_text(json.dumps(new_qcms, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -3489,6 +3804,34 @@ def sync_from_sheets(name: str, step_id: str, user: dict = Depends(get_current_u
     except Exception as e:
         print(f"[SYNC{step_id}] xlsx rebuild failed: {e}")
 
+    # 8.5 Stale-workbook hygiene — exactly ONE current workbook per step folder
+    #     (CLOUD_SYNC F5/Q4): archive superseded count-named copies of the same
+    #     kind into _history/step{N}/sync_archive/ (local + Storage) and update
+    #     the SQL file_manifest.
+    try:
+        _archive_superseded_xlsx(
+            user_id, name, json_folder, xlsx_kind, pdf_stem, xlsx_path.name,
+            step_id=step_id)
+    except Exception as e:
+        print(f"[SYNC{step_id}] workbook archive failed: {e}")
+
+    # 8.6 Keep duplicate workbook copies (step5_json/ + step3 accepted) in sync
+    #     with the canonical one (CLOUD_SYNC Q4 decision).
+    if str(step_id) == "2" and xlsx_path.exists():
+        for copy_rel in ("step5_json", "step3_metadata/accepted"):
+            copy_dir = project_root / copy_rel
+            try:
+                copy_dir.mkdir(parents=True, exist_ok=True)
+                dst = copy_dir / xlsx_path.name
+                shutil.copy2(str(xlsx_path), str(dst))
+                write_bytes_file(f"{user_id}/{name}/{copy_rel}/{xlsx_path.name}",
+                                 dst.read_bytes())
+                _archive_superseded_xlsx(
+                    user_id, name, copy_rel, xlsx_kind, pdf_stem,
+                    xlsx_path.name)
+            except Exception as e:
+                print(f"[SYNC{step_id}] workbook copy update skipped ({copy_rel}): {e}")
+
     # 9. Cross-step propagation: apply the edited fields to the sibling step's JSON.
     # The same QCMs exist at Step 2 (all_qcms.json) and Step 6 (corrected_qcms.json),
     # identified by uid/Num. When the user edits one, propagate to the other so both
@@ -3511,6 +3854,20 @@ def sync_from_sheets(name: str, step_id: str, user: dict = Depends(get_current_u
                 print(f"[SYNC{step_id}] sibling JSON unreadable: {e}")
 
         if sib_qcms:
+            # Restart-safety: warm the sibling JSON from Storage when the local
+            # copy is missing (CLOUD_SYNC F7) so edits/deletions always land on
+            # the latest Storage version, never an empty local tree.
+            if not sib_json_path.exists():
+                try:
+                    sib_bytes = read_bytes_file(
+                        f"{user_id}/{name}/{sib_json_folder}/{sib_json_name}")
+                    sib_json_dir.mkdir(parents=True, exist_ok=True)
+                    sib_json_path.write_bytes(sib_bytes)
+                    sib_qcms = json.loads(sib_bytes)
+                except Exception as e:
+                    print(f"[SYNC{step_id}] sibling JSON storage warm-up failed: {e}")
+
+        if sib_qcms:
             # Build map of sibling QCMs by uid/Num
             sib_map = {_qcm_key(q): q for q in sib_qcms}
             # Build map of edited sheet rows by uid/Num
@@ -3527,7 +3884,15 @@ def sync_from_sheets(name: str, step_id: str, user: dict = Depends(get_current_u
                 # structured values (lists/dicts) with raw sheet strings.
                 changed_in_sibling += merge_qcm_fields(sib_q, edited_q)
 
-            if changed_in_sibling > 0:
+            # Deletion propagation to the sibling too (CLOUD_SYNC F1/Q2).
+            sibling_pruned = 0
+            if deleted_count:
+                kept = [q for q in sib_qcms
+                        if not (isinstance(q, dict) and _qcm_key(q) in prune_idset)]
+                sibling_pruned = len(sib_qcms) - len(kept)
+                sib_qcms = kept
+
+            if changed_in_sibling > 0 or sibling_pruned > 0:
                 try:
                     sib_json_path.write_text(json.dumps(sib_qcms, indent=2, ensure_ascii=False), encoding="utf-8")
                     try:
@@ -3535,22 +3900,48 @@ def sync_from_sheets(name: str, step_id: str, user: dict = Depends(get_current_u
                     except Exception as e:
                         print(f"[SYNC{step_id}] sibling JSON storage upload failed: {e}")
                     propagated = changed_in_sibling
-                    print(f"[SYNC{step_id}] Propagated {propagated} field change(s) to sibling step {sibling_id} ({sib_json_name}).")
+                    print(f"[SYNC{step_id}] Propagated {propagated} field change(s)"
+                          + (f", pruned {sibling_pruned} deleted row(s)" if sibling_pruned else "")
+                          + f" to sibling step {sibling_id} ({sib_json_name}).")
                 except Exception as e:
                     print(f"[SYNC{step_id}] sibling JSON write failed: {e}")
 
     # 10. Keep the Step 2 → 3 → 5 build chain in sync. Step 6 reads
     #     step5_json/merged_qcms.json (NOT all_qcms.json), and a later Step 2
     #     re-run rebuilds it from step3_metadata/accepted/. Propagate the
-    #     sheet edits into every file downstream steps consume so the user
-    #     never has to redo manual edits after cloud_sync.
+    #     sheet edits INTO and the deletions OUT of every file downstream
+    #     steps consume so the user never has to redo manual edits after
+    #     cloud_sync (CLOUD_SYNC F1/F3/F7).
     chain_propagated = 0
     chain_files: list = []
+    project_root = Path(f"/app/output/{user_id}/{name}")
     try:
-        from modules.utils.qcm_merge import propagate_sheet_edits
-        project_root = Path(f"/app/output/{user_id}/{name}")
-        chain = propagate_sheet_edits(project_root, new_qcms)
+        # Restart-safety: the local tree may be wiped — warm every chain
+        # candidate from Storage before merging, else edits land nowhere.
+        chain_base_rels = [
+            "step5_json/merged_qcms.json",
+            "step2_qcm/accepted/merged_qcms.json",
+        ]
+        for rel in chain_base_rels:
+            _warm_local_from_storage(project_root, rel, f"{user_id}/{name}/{rel}")
+        step3_local = project_root / "step3_metadata" / "accepted"
+        if not (step3_local.is_dir() and any(step3_local.glob("*.json"))):
+            try:
+                items = list_files_recursive(f"{user_id}/{name}/step3_metadata/accepted")
+                for it in items:
+                    rel = it.get("name", "")
+                    if rel and not rel.startswith("merged_"):
+                        _warm_local_from_storage(
+                            project_root, f"step3_metadata/accepted/{rel}",
+                            f"{user_id}/{name}/step3_metadata/accepted/{rel}")
+            except Exception as e:
+                print(f"[SYNC{step_id}] step3 chain warm-up failed: {e}")
+
+        from modules.utils.qcm_merge import propagate_sheet_edits as _prop
+        chain = _prop(project_root, new_qcms, deleted_rows=deleted_qcms,
+                      uid_by_num=uid_by_num)
         chain_files = chain.get("changed", [])
+        pruned_files = chain.get("pruned", []) or []
         chain_propagated = len(chain_files)
         for rel in chain_files:
             try:
@@ -3558,10 +3949,13 @@ def sync_from_sheets(name: str, step_id: str, user: dict = Depends(get_current_u
                                  (project_root / rel).read_bytes())
             except Exception as e:
                 print(f"[SYNC{step_id}] chain file storage upload failed ({rel}): {e}")
+        if pruned_files:
+            print(f"[SYNC{step_id}] Pruned deleted row(s) from build-chain files: {pruned_files}")
     except Exception as e:
         print(f"[SYNC{step_id}] build-chain propagation failed: {e}")
 
     print(f"[SYNC{step_id}] Synced {newly_corrected} changed row(s) out of {len(new_qcms)} total"
+          + (f", {deleted_count} row(s) deleted" if deleted_count else "")
           + (f", propagated {propagated} field(s) to step {sibling_id}." if propagated else ".")
           + (f", build-chain files updated: {chain_files}." if chain_propagated else ""))
 
@@ -3569,6 +3963,7 @@ def sync_from_sheets(name: str, step_id: str, user: dict = Depends(get_current_u
         "total": len(new_qcms),
         "corrected_count": corrected_count,
         "newly_corrected": newly_corrected,
+        "deleted_count": deleted_count,
         "propagated": propagated,
         "chain_files": chain_files,
         "file": json_name,

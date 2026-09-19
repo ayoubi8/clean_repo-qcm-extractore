@@ -612,17 +612,20 @@ export async function deleteRefDb(id: string): Promise<void> {
 // POST /projects/{name}/steps/{stepId}/sync-from-sheets
 // Pull the edited Google Sheet back into the canonical JSON (local + Supabase Storage).
 // Works for Step 6 (corrected_qcms.json) and Step 2 (all_qcms.json).
-export async function syncFromSheets(projectName: string, stepId: string): Promise<{
+// `force` confirms mass deletion when the sheet lost >30% of stored rows.
+export async function syncFromSheets(projectName: string, stepId: string, force: boolean = false): Promise<{
   total: number
   corrected_count: number
   newly_corrected: number
+  deleted_count: number
   propagated: number
   file: string
   xlsx_file: string
 }> {
   const res = await fetchWithRefresh(`${BASE}/projects/${encodeURIComponent(projectName)}/steps/${encodeURIComponent(stepId)}/sync-from-sheets`, {
     method: 'POST',
-    headers: { ...getAuthHeaders() }
+    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+    body: JSON.stringify({ force })
   })
   if (!res.ok) {
     const errData = await res.json().catch(() => ({}))

@@ -36,12 +36,14 @@ BORDER_THIN   = Border(
 # Cas is included here so it appears right after Num when present.
 # Hint sits immediately after proposition E (Phase 3).
 # Any extra fields found in the QCM data are appended dynamically at the end.
+# "uid" is the stable identity column — sync-from-sheets matches rows by it.
 _PREFERRED_COLUMNS = [
     "Num", "Cas", "case_belonging_check", "Text", "A", "B", "C", "D", "E",
     "Hint",
     "Correct", "Exp",
     "categoryName", "tagSuggere", "subcategoryName",
-    "Year", "Tag", "Type"
+    "Year", "Tag", "Type",
+    "uid",
 ]
 
 # Approximate column widths (characters)

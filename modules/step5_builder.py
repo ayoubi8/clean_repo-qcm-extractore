@@ -162,4 +162,12 @@ class Step5Builder:
             if new_qcm.get("case_belonging_check") in [None, "", 0]:
                 new_qcm["case_belonging_check"] = cbc_value
 
+        # Identity bridge: carry the Step-3 uid onto the merged row so the
+        # xlsx/Google Sheet round-trips it (sync-from-sheets then matches
+        # every artifact — all_qcms.json, step3 pages, merged, corrected —
+        # by one stable key instead of order-fragile Num).
+        uid_value = qcm.get("uid")
+        if uid_value is not None and str(uid_value).strip():
+            new_qcm["uid"] = str(uid_value)
+
         return new_qcm
