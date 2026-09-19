@@ -3479,6 +3479,7 @@ def open_in_google_sheets(name: str, step_id: str, body: dict, user: dict = Depe
             print(f"[SHEETS] Sheet reuse failed — creating a new Sheet instead: {_re}")
 
     try:
+        from googleapiclient.http import MediaFileUpload
         print(f"[SHEETS] Uploading to Google Drive...")
         drive_service = build("drive", "v3", credentials=creds)
         file_metadata = {"name": file_path.stem, "mimeType": "application/vnd.google-apps.spreadsheet"}
