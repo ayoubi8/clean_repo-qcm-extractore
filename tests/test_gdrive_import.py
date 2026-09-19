@@ -42,9 +42,11 @@ class _FakeResp:
         self.headers = headers or {}
         self.content = content
         self._chunks = chunks
-        self.next_request = None
         if next_url:
-            self.next_request = type("NR", (), {"url": next_url})()
+            # driven via Location header (like a real 30x response)
+            self.headers = dict(self.headers)
+            self.headers["location"] = next_url
+        self.next_request = None
         self.text = text
 
     def iter_bytes(self, chunk_size=1024 * 1024):
@@ -54,18 +56,28 @@ class _FakeResp:
         else:
             yield self.content
 
+
+class _StreamCtx:
+    """Context-manager wrapper mimicking httpx client.stream(...)."""
+
+    def __init__(self, resp):
+        self._resp = resp
+
     def __enter__(self):
-        return self
+        return self._resp
 
     def __exit__(self, *a):
         return False
 
 
 class _FakeClient:
-    """Minimal httpx.Client stand-in with scripted responses per URL."""
+    """Minimal httpx.Client stand-in with scripted responses per URL.
+
+    Implements client.stream(...) — the interface the production code uses.
+    """
 
     def __init__(self, script):
-        self._script = script  # list of callables: (url) -> _FakeResp
+        self._script = script  # list of callables: (client, url) -> _FakeResp | Exception
         self.urls = []
 
     def __enter__(self):
@@ -74,12 +86,15 @@ class _FakeClient:
     def __exit__(self, *a):
         return False
 
-    def get(self, url, headers=None):
+    def stream(self, method, url, headers=None):
         self.urls.append(url)
         if not self._script:
             raise AssertionError("unexpected extra request: " + url)
         action = self._script.pop(0)
-        return action(self, url)
+        result = action(self, url)
+        if isinstance(result, Exception):
+            raise result
+        return _StreamCtx(result)
 
 
 def _public_dns():

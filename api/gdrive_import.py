@@ -20,6 +20,7 @@ import re
 import socket
 import tempfile
 from typing import Callable, Optional, Tuple
+from urllib.parse import urljoin
 
 import httpx
 
@@ -270,7 +271,10 @@ def download_drive_pdf(link: str,
         while True:
             assert_public_url(url)
             try:
-                resp = client.get(url, headers={
+                # NOTE: httpx Response supports the context-manager protocol
+                # only via client.stream() — a plain .get() response raises
+                # TypeError inside `with`, which surfaced as a 500.
+                stream_cm = client.stream("GET", url, headers={
                     "User-Agent": "Mozilla/5.0 (QCM-Extractor importer)",
                     "Accept": "application/pdf,text/html;q=0.9,*/*;q=0.5",
                 })
@@ -282,88 +286,109 @@ def download_drive_pdf(link: str,
                     "NETWORK",
                     f"Could not reach Google Drive ({type(e).__name__}). Try again.")
 
-            hops += 1
-            if hops > _MAX_REDIRECTS:
-                raise GoogleDriveImportError("TOO_MANY_HOPS", MSG_TOO_MANY_HOPS)
-
-            # Login redirect → file is not public.
-            if resp.next_request is not None:
-                next_host = str(resp.next_request.url).lower()
-                if "accounts.google.com" in next_host or not next_host.startswith("https://"):
-                    raise GoogleDriveImportError("NOT_PUBLIC", MSG_NOT_PUBLIC)
-                url = str(resp.next_request.url)
-                continue
-
-            if resp.status_code == 403:
-                raise GoogleDriveImportError("NOT_PUBLIC", MSG_NOT_PUBLIC)
-            if resp.status_code == 404:
-                raise GoogleDriveImportError("NOT_FOUND", MSG_NOT_FOUND)
-            if resp.status_code == 429:
-                raise GoogleDriveImportError("QUOTA", MSG_QUOTA)
-            if resp.status_code >= 400:
-                raise GoogleDriveImportError(
-                    "DRIVE_ERROR", f"Google Drive returned HTTP {resp.status_code}.")
-
-            ctype = (resp.headers.get("content-type") or "").lower()
-            disp_name = _content_disposition_filename(resp.headers)
-            if disp_name:
-                display_name = disp_name
-
-            # Confirm page (large files): retry once with confirm=t + uuid.
-            if ctype.startswith("text/html"):
-                head = resp.content[:65536]
-                if not _looks_like_confirm_page(ctype, head):
-                    head_text = head[:2000].lower()
-                    if b"accounts.google" in head_text or b"sign in" in head_text:
-                        raise GoogleDriveImportError("NOT_PUBLIC", MSG_NOT_PUBLIC)
-                    raise GoogleDriveImportError("NOT_PDF", MSG_NOT_PDF)
-                if confirm_retried:
-                    raise GoogleDriveImportError(
-                        "CONFIRM_LOOP", "Could not get past Google Drive's "
-                        "virus-scan confirmation for this file. Try a smaller file.")
-                confirm_retried = True
-                token, cuuid = _extract_confirm_params(head)
-                url = build_confirm_url(file_id, token, cuuid)
-                continue
-
-            # Stream with hard byte cap.
-            total = 0
-            spool = tempfile.SpooledTemporaryFile(max_size=32 * 1024 * 1024)
             try:
-                with resp:
-                    for chunk in resp.iter_bytes(chunk_size=1024 * 1024):
-                        total += len(chunk)
-                        if total > max_bytes:
+                with stream_cm as resp:
+                    hops += 1
+                    if hops > _MAX_REDIRECTS:
+                        raise GoogleDriveImportError("TOO_MANY_HOPS", MSG_TOO_MANY_HOPS)
+
+                    status = resp.status_code
+                    location = resp.headers.get("location") or ""
+
+                    # Redirect hop — relative or absolute, re-checked next loop.
+                    # Login redirects → file is NOT public (never fetch it).
+                    if 300 <= status < 400:
+                        nxt = urljoin(url, location or "").strip()
+                        if not nxt.startswith("https://"):
+                            raise GoogleDriveImportError("NOT_PUBLIC", MSG_NOT_PUBLIC)
+                        if "accounts.google.com" in nxt.lower()[:40]:
+                            raise GoogleDriveImportError("NOT_PUBLIC", MSG_NOT_PUBLIC)
+                        url = nxt
+                        continue
+
+                    if status == 403:
+                        raise GoogleDriveImportError("NOT_PUBLIC", MSG_NOT_PUBLIC)
+                    if status == 404:
+                        raise GoogleDriveImportError("NOT_FOUND", MSG_NOT_FOUND)
+                    if status == 429:
+                        raise GoogleDriveImportError("QUOTA", MSG_QUOTA)
+                    if status >= 400:
+                        raise GoogleDriveImportError(
+                            "DRIVE_ERROR", f"Google Drive returned HTTP {status}.")
+
+                    ctype = (resp.headers.get("content-type") or "").lower()
+                    disp_name = _content_disposition_filename(resp.headers)
+                    if disp_name:
+                        display_name = disp_name
+
+                    # Confirm page (large files) or any HTML body: probe the head.
+                    if ctype.startswith("text/html"):
+                        head = b""
+                        for chunk in resp.iter_bytes(chunk_size=65536):
+                            head += chunk
+                            if len(head) >= 65536:
+                                break
+                        if not _looks_like_confirm_page(ctype, head):
+                            head_text = head[:2000].lower()
+                            if (b"accounts.google" in head_text
+                                    or b"sign in" in head_text):
+                                raise GoogleDriveImportError("NOT_PUBLIC", MSG_NOT_PUBLIC)
+                            raise GoogleDriveImportError("NOT_PDF", MSG_NOT_PDF)
+                        if confirm_retried:
                             raise GoogleDriveImportError(
-                                "TOO_LARGE",
-                                f"File is over the {max_bytes // (1024 * 1024)} MB limit "
-                                "for Drive import.")
-                        spool.write(chunk)
-                        if on_chunk:
-                            on_chunk(total)
+                                "CONFIRM_LOOP", "Could not get past Google Drive's "
+                                "virus-scan confirmation for this file. Try a smaller file.")
+                        confirm_retried = True
+                        token, cuuid = _extract_confirm_params(head)
+                        url = build_confirm_url(file_id, token, cuuid)
+                        continue  # stream closed on with-exit
+
+                    # PDF body — stream with a hard byte cap.
+                    total = 0
+                    spool = tempfile.SpooledTemporaryFile(max_size=32 * 1024 * 1024)
+                    try:
+                        for chunk in resp.iter_bytes(chunk_size=1024 * 1024):
+                            total += len(chunk)
+                            if total > max_bytes:
+                                raise GoogleDriveImportError(
+                                    "TOO_LARGE",
+                                    f"File is over the {max_bytes // (1024 * 1024)} MB limit "
+                                    "for Drive import.")
+                            spool.write(chunk)
+                            if on_chunk:
+                                on_chunk(total)
+                    except GoogleDriveImportError:
+                        spool.close()
+                        raise
+                    except httpx.HTTPError as e:
+                        spool.close()
+                        raise GoogleDriveImportError(
+                            "NETWORK", f"Download interrupted ({type(e).__name__}). Try again.")
+
+                    # PDF magic validation (primary), HTML-masquerade check.
+                    spool.seek(0)
+                    magic = spool.read(999)
+                    spool.seek(0)
+                    if not magic.startswith(b"%PDF-"):
+                        spool.close()
+                        if b"<html" in magic.lower():
+                            raise GoogleDriveImportError(
+                                "NOT_PUBLIC",
+                                "Drive returned a web page instead of the PDF. "
+                                + MSG_NOT_PUBLIC)
+                        raise GoogleDriveImportError("NOT_PDF", MSG_NOT_PDF)
+
+                    data = spool.read()
+                    spool.close()
+                    return data, display_name
             except GoogleDriveImportError:
-                spool.close()
                 raise
-            except httpx.HTTPError as e:
-                spool.close()
+            except httpx.TimeoutException:
                 raise GoogleDriveImportError(
-                    "NETWORK", f"Download interrupted ({type(e).__name__}). Try again.")
-
-            # PDF magic validation (primary), content-type (secondary).
-            spool.seek(0)
-            magic = spool.read(999)
-            spool.seek(0)
-            if not magic.startswith(b"%PDF-"):
-                # Content-Disposition/HTML masquerade check for clearer errors.
-                if b"<html" in magic.lower():
-                    raise GoogleDriveImportError(
-                        "NOT_PUBLIC",
-                        "Drive returned a web page instead of the PDF. " + MSG_NOT_PUBLIC)
-                raise GoogleDriveImportError("NOT_PDF", MSG_NOT_PDF)
-
-            data = spool.read()
-            spool.close()
-            return data, display_name
+                    "TIMEOUT", "Download timed out — try again or use a smaller file.")
+            except httpx.HTTPError as e:
+                raise GoogleDriveImportError(
+                    "NETWORK", f"Could not reach Google Drive ({type(e).__name__}). Try again.")
 
 
 def is_enabled() -> bool:
