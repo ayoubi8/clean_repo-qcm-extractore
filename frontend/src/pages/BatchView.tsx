@@ -1,18 +1,19 @@
-﻿import { useEffect, useRef } from 'react'
-import { useParams } from 'react-router-dom'
+﻿import { useEffect, useReducer } from 'react'
+import { useNavigate, useParams } from 'react-router-dom'
 import { useBatchStore, batchActive } from '../store/batchStore'
 import { BatchFolderCard } from '../components/batch/BatchFolderCard'
 import { BatchDetailPanel } from '../components/batch/BatchDetailPanel'
 
 /**
- * Auto Run batch cockpit (plan docs/plans/autorun-batch-plan.md Â§3.3):
+ * Auto Run batch cockpit (plan docs/plans/autorun-batch-plan.md §3.3):
  * a folder card per PDF in a responsive grid with live per-step progress;
  * clicking a card expands the detail panel IN PLACE (col-span-full inside the
  * same grid) so finished folders are inspectable while others still run.
- * Polls GET /autorun/batches/{id} every ~3s while anything is active.
+ *
+ * Phase 2: polling lives in batchStore (self-scheduling chain that cannot die
+ * on a failed poll — backoff + "reconnecting…" hint); this view only owns its
+ * lifecycle (mount → start, unmount → stop) and a 1s "updated Ns ago" ticker.
  */
-
-const POLL_INTERVAL_MS = 3000
 
 const STATE_CHIP: Record<string, { label: string; cls: string }> = {
   pending:   { label: 'Queued',          cls: 'bg-surface-container-high text-outline border-outline/10' },
@@ -22,36 +23,37 @@ const STATE_CHIP: Record<string, { label: string; cls: string }> = {
   error:     { label: 'Failed',          cls: 'bg-error-container/10 text-error border-error/30' },
 }
 
+function UpdatedAgo({ ts }: { ts: number | null }) {
+  const [, force] = useReducer((x: number) => x + 1, 0)
+  useEffect(() => {
+    const timer = window.setInterval(force, 1000)
+    return () => window.clearInterval(timer)
+  }, [])
+  if (!ts) return null
+  const s = Math.max(0, Math.round((Date.now() - ts) / 1000))
+  const label = s < 60 ? `${s}s` : `${Math.floor(s / 60)}m`
+  return <span> · updated {label} ago</span>
+}
+
 export function BatchView() {
   const { batchId } = useParams<{ batchId: string }>()
+  const navigate = useNavigate()
   const manifest = useBatchStore(s => s.manifest)
-  const liveStatus = useBatchStore(s => s.liveStatus)
   const loading = useBatchStore(s => s.loading)
   const error = useBatchStore(s => s.error)
+  const lastUpdated = useBatchStore(s => s.lastUpdated)
   const expandedProject = useBatchStore(s => s.expandedProject)
   const setExpandedProject = useBatchStore(s => s.setExpandedProject)
-  const loadProgress = useBatchStore(s => s.loadProgress)
-  const pollRef = useRef<number | null>(null)
 
   useEffect(() => {
     if (!batchId) return
-    let fresh = true
-    const tick = () => { useBatchStore.getState().loadProgress(batchId) }
-    tick()
-    const timer = window.setInterval(tick, POLL_INTERVAL_MS)
-    pollRef.current = timer
-    return () => { window.clearInterval(timer); pollRef.current = null }
+    useBatchStore.getState().startPolling(batchId)
+    return () => useBatchStore.getState().stopPolling()
   }, [batchId])
 
-  const active = batchActive(manifest) && !error
-
-  // Stop polling when the batch settles (interval no-ops fast when active=false)
-  useEffect(() => {
-    if (!active && pollRef.current) {
-      window.clearInterval(pollRef.current)
-      pollRef.current = null
-    }
-  }, [active])
+  const active = batchActive(manifest)
+  const reconnecting = !!error && !!manifest
+  const expandedAll = expandedProject === 'ALL'
 
   const chip = manifest ? (STATE_CHIP[manifest.state] ?? { label: manifest.state, cls: 'bg-surface-container-high text-outline border-outline/10' }) : null
 
@@ -59,15 +61,34 @@ export function BatchView() {
     <div className="p-10 max-w-[1600px] mx-auto space-y-8 animate-in fade-in duration-500">
       {/* Header */}
       <div className="flex items-center gap-4">
+        <button
+          id="btn-back-batch"
+          onClick={() => navigate(-1)}
+          title="Back"
+          className="w-9 h-9 rounded-full hover:bg-surface-container-highest flex items-center justify-center text-outline hover:text-on-surface transition-colors shrink-0"
+        >
+          <span className="material-symbols-outlined text-[20px]">arrow_back</span>
+        </button>
         <div className="w-10 h-10 rounded-full bg-primary/10 flex items-center justify-center shrink-0">
           <span className="material-symbols-outlined text-primary">rocket_launch</span>
         </div>
         <div className="flex-1 min-w-0">
           <h1 className="text-xl font-black text-on-surface tracking-tighter">Auto Run Batch</h1>
           <p className="text-[11px] text-outline font-mono truncate mt-0.5">
-            {batchId}{manifest?.created_at ? ` Â· started ${new Date(manifest.created_at).toLocaleString()}` : ''}
+            {batchId}{manifest?.created_at ? ` · started ${new Date(manifest.created_at).toLocaleString()}` : ''}
+            <UpdatedAgo ts={lastUpdated} />
           </p>
         </div>
+        {manifest && manifest.projects.length > 1 && (
+          <button
+            id="btn-expand-all"
+            onClick={() => setExpandedProject(expandedAll ? null : 'ALL')}
+            title={expandedAll ? 'Collapse all folders' : 'Expand all folders'}
+            className="w-10 h-10 rounded-full hover:bg-surface-container-highest flex items-center justify-center text-outline hover:text-primary transition-colors shrink-0"
+          >
+            <span className="material-symbols-outlined text-[20px]">{expandedAll ? 'collapse_all' : 'expand_all'}</span>
+          </button>
+        )}
         {chip && (
           <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest border ${chip.cls}`}>
             {active && <span className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />}
@@ -83,7 +104,7 @@ export function BatchView() {
         </div>
       )}
 
-      {!loading && error && (
+      {!loading && error && !manifest && (
         <div className="p-4 rounded-xl bg-error-container/10 border border-error/20 text-center max-w-lg mx-auto">
           <span className="material-symbols-outlined text-error text-3xl block mb-2">wifi_off</span>
           <p className="text-error text-sm font-bold">{error}</p>
@@ -105,11 +126,11 @@ export function BatchView() {
             <div key={p.name} className="contents">
               <BatchFolderCard
                 project={p}
-                live={liveStatus[p.name]}
-                selected={expandedProject === p.name}
+                steps={p.steps}
+                selected={expandedAll || expandedProject === p.name}
                 onClick={() => setExpandedProject(expandedProject === p.name ? null : p.name)}
               />
-              {expandedProject === p.name && (
+              {(expandedAll || expandedProject === p.name) && (
                 <div className="md:col-span-2 xl:col-span-3 col-span-full">
                   <BatchDetailPanel
                     batchId={batchId ?? ''}
@@ -124,14 +145,19 @@ export function BatchView() {
           ))}
         </div>
       )}
-      {active && (
+
+      {/* Status footer: never freezes — polling keeps running through errors */}
+      {active && !error && (
         <p className="text-[10px] text-outline text-center animate-pulse font-bold tracking-widest uppercase">
-          Refreshing every 3 s â€” finished folders are inspectable while the rest still run
+          Refreshing every 3 s — finished folders are inspectable while the rest still run
+        </p>
+      )}
+      {reconnecting && (
+        <p className="text-[10px] text-secondary text-center font-bold tracking-widest uppercase flex items-center justify-center gap-1.5">
+          <span className="material-symbols-outlined text-[14px] animate-spin">progress_activity</span>
+          Reconnecting — showing the last received update
         </p>
       )}
     </div>
   )
 }
-
-
-

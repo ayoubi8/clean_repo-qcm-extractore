@@ -1,14 +1,22 @@
 ﻿import { useState, useEffect } from 'react'
-import { fetchStepOutput, retryBatchPdf, fetchAuthenticatedBlobUrl } from '../../lib/api'
+import { retryBatchPdf, fetchAuthenticatedBlobUrl } from '../../lib/api'
+import { useBatchStore } from '../../store/batchStore'
+import { useOutputsCache, ensureStepOutput, reloadAfterSync, removeCachedFile } from '../../store/outputsCache'
 import { StepFileRow, StepFileMeta } from './StepFileRow'
 
 /**
- * Auto Run batch â€” expand-in-place detail (resolved Q5).
+ * Auto Run batch — expand-in-place detail (resolved Q5).
  * A small surface-container rendered INSIDE the grid flow (col-span-full,
- * directly below the clicked folder card â€” no overlay, no portal). Body shows
+ * directly below the clicked folder card — no overlay, no portal). Body shows
  * one section per step with the OutputViewer-style space-y-2 rows, the
  * "Open source PDF" button, the per-PDF RETRY button (resolved Q9) and the
  * small close icon (resolved close: material-symbols-outlined text-[20px]).
+ *
+ * Phase 6 (Q-C1): step outputs come from the client outputsCache — a fresh
+ * entry is served FREE (no request); after a sync the affected step (and its
+ * sibling) is refetched and the cached entries REPLACED; deletes update the
+ * cached entry locally. Steps whose every file predates the batch get a
+ * "cached results" note (output computed by an earlier run, not this batch).
  */
 
 const BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
@@ -19,9 +27,9 @@ function getAuthHeaders(): Record<string, string> {
 }
 
 const BATCH_STEPS: { id: string; label: string; icon: string }[] = [
-  { id: '1', label: 'Step 1 Â· Text Extraction', icon: 'text_fields' },
-  { id: '2', label: 'Step 2 Â· QCM Extraction + Metadata', icon: 'question_answer' },
-  { id: '6', label: 'Step 6 Â· Corrections', icon: 'fact_check' },
+  { id: '1', label: 'Step 1 · Text Extraction', icon: 'text_fields' },
+  { id: '2', label: 'Step 2 · QCM Extraction + Metadata', icon: 'question_answer' },
+  { id: '6', label: 'Step 6 · Corrections', icon: 'fact_check' },
 ]
 
 interface BatchDetailPanelProps {
@@ -33,26 +41,29 @@ interface BatchDetailPanelProps {
 }
 
 export function BatchDetailPanel({ batchId, projectName, projectState, errorStep, onClose }: BatchDetailPanelProps) {
-  const [files, setFiles] = useState<Record<string, StepFileMeta[]>>({})
-  const [loading, setLoading] = useState(true)
+  const entries = useOutputsCache()
+  const batchCreatedAt = useBatchStore(s => s.manifest?.created_at)
   const [retrying, setRetrying] = useState(false)
   const [pdfLoading, setPdfLoading] = useState(false)
   const canRetry = projectState === 'error' || projectState === 'cancelled'
 
-  async function load() {
-    setLoading(true)
-    for (const step of BATCH_STEPS) {
-      try {
-        const data = await fetchStepOutput(projectName, step.id)
-        setFiles((prev) => ({ ...prev, [step.id]: data.files ?? [] }))
-      } catch {
-        setFiles((prev) => ({ ...prev, [step.id]: [] }))
-      }
-    }
-    setLoading(false)
+  const filesFor = (stepId: string): StepFileMeta[] =>
+    entries[`${projectName}|${stepId}`]?.files ?? []
+
+  const predates = (stepId: string): boolean => {
+    const files = filesFor(stepId)
+    const batchStart = batchCreatedAt ? Date.parse(batchCreatedAt) : 0
+    if (!batchStart || files.length === 0) return false
+    return files.every(f => !f.created_at || Date.parse(f.created_at) < batchStart)
   }
 
-  useEffect(() => { load() }, [projectName])
+  useEffect(() => {
+    for (const step of BATCH_STEPS) {
+      void ensureStepOutput(projectName, step.id)
+    }
+    // project switch → fresh panel scope; the cache entries are keyed so old
+    // projects stay cached for their TTL window.
+  }, [projectName])
 
   const openSourcePdf = async () => {
     setPdfLoading(true)
@@ -75,18 +86,17 @@ export function BatchDetailPanel({ batchId, projectName, projectState, errorStep
     setRetrying(true)
     try {
       await retryBatchPdf(batchId, projectName)
-      // Give the retry a beat to re-mark state, then visually refresh the panel.
-      await new Promise(r => setTimeout(r, 600))
-      await load()
+      // Phase 2: a retry re-activates the batch — polling stops on terminal
+      // manifests, so restart it explicitly (idempotent in the store).
+      useBatchStore.getState().startPolling(batchId)
+      // The retry may re-run steps → drop this project's cached outputs so the
+      // fresh pass is rendered.
+      BATCH_STEPS.forEach(step => void reloadAfterSync(projectName, step.id))
     } catch (e: any) {
       alert(e?.message || 'Retry failed')
     } finally {
       setRetrying(false)
     }
-  }
-
-  const removeFile = (stepId: string, filename: string) => {
-    setFiles(prev => ({ ...prev, [stepId]: (prev[stepId] ?? []).filter(f => f.name !== filename) }))
   }
 
   return (
@@ -109,7 +119,7 @@ export function BatchDetailPanel({ batchId, projectName, projectState, errorStep
             title="Re-run this PDF from its first not-done step"
           >
             <span className="material-symbols-outlined text-[14px]">{retrying ? 'progress_activity' : 'refresh'}</span>
-            {retrying ? 'Retryingâ€¦' : 'Retry'}
+            {retrying ? 'Retrying…' : 'Retry'}
             {errorStep ? ` (step ${errorStep})` : ''}
           </button>
         )}
@@ -136,39 +146,45 @@ export function BatchDetailPanel({ batchId, projectName, projectState, errorStep
 
       {/* Per-step output sections */}
       <div className="space-y-6">
-        {BATCH_STEPS.map(step => (
-          <div key={step.id} className="space-y-3">
-            <div className="flex items-center gap-2">
-              <span className="material-symbols-outlined text-outline text-[18px]">{step.icon}</span>
-              <span className="text-xs font-black text-on-surface-variant uppercase tracking-widest">{step.label}</span>
-              <span className="text-[10px] text-outline-variant font-bold ml-auto">{(files[step.id] ?? []).length} files</span>
-            </div>
-
-            {loading ? (
-              <div className="text-[10px] text-outline animate-pulse font-bold tracking-widest">SCANNINGâ€¦</div>
-            ) : (files[step.id] ?? []).length === 0 ? (
-              <div className="text-[10px] text-outline-variant italic px-1">No output files yet for this step.</div>
-            ) : (
-              <div className="space-y-2">
-                {files[step.id].map(f => (
-                  <StepFileRow
-                    key={`${step.id}/${f.name}`}
-                    projectName={projectName}
-                    stepId={step.id}
-                    file={f}
-                    onDeleted={(name) => removeFile(step.id, name)}
-                    onSynced={() => load()}
-                  />
-                ))}
+        {BATCH_STEPS.map(step => {
+          const files = filesFor(step.id)
+          const scanning = entries[`${projectName}|${step.id}`] === undefined
+          return (
+            <div key={step.id} className="space-y-3">
+              <div className="flex items-center gap-2">
+                <span className="material-symbols-outlined text-outline text-[18px]">{step.icon}</span>
+                <span className="text-xs font-black text-on-surface-variant uppercase tracking-widest">{step.label}</span>
+                {predates(step.id) ? (
+                  <span className="text-[9px] font-black uppercase tracking-widest text-secondary inline-flex items-center gap-0.5 ml-1">
+                    <span className="material-symbols-outlined text-[12px]">cached</span>
+                    previous run
+                  </span>
+                ) : null}
+                <span className="text-[10px] text-outline-variant font-bold ml-auto">{files.length} files</span>
               </div>
-            )}
-          </div>
-        ))}
+
+              {scanning ? (
+                <div className="text-[10px] text-outline animate-pulse font-bold tracking-widest">SCANNING…</div>
+              ) : files.length === 0 ? (
+                <div className="text-[10px] text-outline-variant italic px-1">No output files yet for this step.</div>
+              ) : (
+                <div className="space-y-2">
+                  {files.map(f => (
+                    <StepFileRow
+                      key={`${step.id}/${f.name}`}
+                      projectName={projectName}
+                      stepId={step.id}
+                      file={f}
+                      onDeleted={() => removeCachedFile(projectName, step.id, f.name)}
+                      onSynced={() => reloadAfterSync(projectName, step.id)}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+          )
+        })}
       </div>
     </div>
   )
 }
-
-
-
-

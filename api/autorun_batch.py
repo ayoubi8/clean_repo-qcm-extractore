@@ -5,6 +5,10 @@ Phase 3 backend:
   - per-PDF sequential steps ["1","1.5","1.6","2","6"] — Steps 7/8 excluded (Q6)
   - failure isolation: one PDF's step error marks only that project
   - batch manifest `{uid}/_batches/{batch_id}/batch.json` (local + Supabase Storage)
+  - Phase 1 (history-progress-cache plan): durable per-step `steps` map in the
+    manifest (running → done / error / cancelled, plus `skipped` cache-hit flags),
+    `write_errors` counter on failed writes, and `merge_live_status()` for the
+    GET route (live job_manager over manifest steps)
   - `AR_` project-name prefix, numeric suffix on remaining collisions (resolved Q3)
   - Step 6 per-PDF source mapping (last_page / first_page / auto_search; Q6)
   - per-PDF retry (resolved Q9) and startup auto-resume (resolved Q12)
@@ -82,20 +86,44 @@ def new_batch_id() -> str:
 
 
 def write_manifest(uid: str, manifest: dict) -> None:
-    """Dual-write the manifest: local FS + Supabase Storage (same as project.json)."""
-    raw = json.dumps(manifest, ensure_ascii=False)
+    """Dual-write the manifest: local FS + Supabase Storage (same as project.json).
+
+    Phase 1 (plan §Phase1-B3): a failed write is recorded IN the manifest
+    (`write_errors` counter + `last_write_error`) and best-effort re-persisted,
+    so a degrading feed is visible to the batch view instead of silently
+    freezing on a stale snapshot.
+    """
     batch_id = manifest.get("batch_id") or ""
-    try:
-        local = _bdir(uid, batch_id) / MANIFEST_NAME
-        local.parent.mkdir(parents=True, exist_ok=True)
-        local.write_text(raw, encoding="utf-8")
-    except Exception as e:
-        print(f"[AUTORUN-BATCH] local manifest write failed ({batch_id}): {e}")
-    try:
-        from storage_client import write_file
-        write_file(f"{uid}/_batches/{batch_id}/{MANIFEST_NAME}", raw)
-    except Exception as e:
-        print(f"[AUTORUN-BATCH] Storage manifest write failed ({batch_id}): {e}")
+
+    def _persist(raw: str):
+        errors = []
+        try:
+            local = _bdir(uid, batch_id) / MANIFEST_NAME
+            local.parent.mkdir(parents=True, exist_ok=True)
+            local.write_text(raw, encoding="utf-8")
+        except Exception as e:
+            errors.append(f"local: {e}")
+            print(f"[AUTORUN-BATCH] local manifest write failed ({batch_id}): {e}")
+        try:
+            from storage_client import write_file
+            write_file(f"{uid}/_batches/{batch_id}/{MANIFEST_NAME}", raw)
+        except Exception as e:
+            errors.append(f"storage: {e}")
+            print(f"[AUTORUN-BATCH] Storage manifest write failed ({batch_id}): {e}")
+        return errors
+
+    errors = _persist(json.dumps(manifest, ensure_ascii=False))
+    if errors:
+        manifest["write_errors"] = int(manifest.get("write_errors") or 0) + 1
+        manifest["last_write_error"] = f"{_now_iso()} · {'; '.join(errors)[:150]}"
+        try:
+            _persist(json.dumps(manifest, ensure_ascii=False))
+        except Exception:
+            pass
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def read_manifest(uid: str, batch_id: str) -> Optional[dict]:
@@ -128,7 +156,8 @@ def _set_batch_state(uid: str, batch_id: str, state: str) -> None:
 
 
 def _mutate_project(uid: str, batch_id: str, project_name: str, state: str,
-                    error_step: Optional[str] = None, current_step: Optional[str] = None) -> None:
+                    error_step: Optional[str] = None, current_step: Optional[str] = None,
+                    error_message: Optional[str] = None) -> None:
     def _apply(m):
         for p in m.get("projects", []):
             if p.get("name") == project_name:
@@ -141,8 +170,77 @@ def _mutate_project(uid: str, batch_id: str, project_name: str, state: str,
                     p["current_step"] = current_step
                 else:
                     p.pop("current_step", None)
+                if error_message is not None:
+                    p["error_message"] = error_message
+                else:
+                    p.pop("error_message", None)
                 break
     _mutate_manifest(uid, batch_id, _apply)
+
+
+def _record_step(uid: str, batch_id: str, project_name: str, sid: str, state: str,
+                 error_message: Optional[str] = None) -> None:
+    """Phase 1: durable per-step state in the manifest — {"state", "updated_at",
+    "error_message"?} — survives container restarts; live job_manager overlays it."""
+    def _apply(m):
+        for p in m.get("projects", []):
+            if p.get("name") == project_name:
+                entry = {"state": state, "updated_at": _now_iso()}
+                if error_message:
+                    entry["error_message"] = error_message
+                p.setdefault("steps", {})[sid] = entry
+                break
+    _mutate_manifest(uid, batch_id, _apply)
+
+
+def _record_skipped_steps(uid: str, batch_id: str, project_name: str, sids: list) -> None:
+    """Pre-entry steps (already done by an earlier run/retry pass) → "skipped".
+
+    Only marks steps with NO recorded state yet, so a "done" from an earlier
+    pass of this same batch survives into a retry.
+    """
+    if not sids:
+        return
+
+    def _apply(m):
+        for p in m.get("projects", []):
+            if p.get("name") == project_name:
+                steps = p.setdefault("steps", {})
+                for sid in sids:
+                    if sid not in steps:
+                        steps[sid] = {"state": "skipped", "updated_at": _now_iso()}
+                break
+    _mutate_manifest(uid, batch_id, _apply)
+
+
+def merge_live_status(m: dict, status_lookup=None) -> dict:
+    """Phase 1 merge: in-memory job_manager states OVER the manifest's durable
+    `steps` map — response-only (the manifest is never written here).
+
+    A live status ≠ "idle" wins (the process that ran the step is the freshest
+    source while it is alive); otherwise the recorded manifest state stands,
+    which is what keeps per-step progress true after a container restart.
+    """
+    if status_lookup is None:
+        status_lookup = job_manager.get_status
+    for p in m.get("projects", []):
+        name = p.get("name", "")
+        steps = dict(p.get("steps") or {})
+        for sid in BATCH_SEQUENCE:
+            try:
+                status = status_lookup(name, sid)
+            except Exception:
+                status = "idle"
+            if status != "idle":
+                cur = steps.get(sid)
+                if not isinstance(cur, dict) or cur.get("state") != status:
+                    steps[sid] = {"state": status, "updated_at": _now_iso()}
+            elif not isinstance(steps.get(sid), dict):
+                # Uniform shape: every batch step gets an entry, so the UI can
+                # render chips without worrying about missing keys.
+                steps[sid] = {"state": "idle"}
+        p["steps"] = steps
+    return m
 
 
 def _finalise_batch(uid: str, batch_id: str) -> None:
@@ -301,16 +399,26 @@ def _step_done_local(uid: str, project: str, step_id: str) -> bool:
 def first_not_done_step(uid: str, project: str) -> Optional[str]:
     """First step in BATCH_SEQUENCE that is not a completed run.
 
-    SQL step_results rows are authoritative (badge=success); the container-local
-    output check is the fallback (same priority as GET /steps/{id}/status).
-    Returns None when every batch step is already done.
+    PHASE 5: warm per-step done-ness goes through step_cache (one dict hit per
+    step); a miss computes the durable view (SQL step_results rows authoritative
+    with badge=success → local FS fallback, same priority as GET /steps/{id}/status)
+    and fills the cache. Returns None when every batch step is already done.
     """
+    try:
+        from step_cache import get as _cache_get, put as _cache_put
+    except Exception:
+        _cache_get = _cache_put = None
+
     try:
         from real_api import _latest_step_result_row
     except Exception:
         _latest_step_result_row = None
 
-    for sid in BATCH_SEQUENCE:
+    def _is_done(sid: str) -> bool:
+        if _cache_get is not None:
+            cached = _cache_get(uid, project, sid)
+            if cached and cached.get("status") is not None:
+                return cached["status"] == "done"
         done = False
         if _latest_step_result_row is not None:
             try:
@@ -321,7 +429,15 @@ def first_not_done_step(uid: str, project: str) -> Optional[str]:
                 done = False
         if not done:
             done = _step_done_local(uid, project, sid)
-        if not done:
+        if _cache_put is not None:
+            try:
+                _cache_put(uid, project, sid, status="done" if done else "idle")
+            except Exception:
+                pass
+        return done
+
+    for sid in BATCH_SEQUENCE:
+        if not _is_done(sid):
             return sid
     return None
 
@@ -397,19 +513,30 @@ def _spawn_runtime_task(project: str, uid: str, step_id: str, cfg: dict):
 
 async def _run_one_project(uid: str, project_name: str, config: dict, batch_id: str,
                            sem: asyncio.Semaphore, drive_file_id: Optional[str] = None) -> None:
-    """One PDF through the batch sequence (queued by the batch semaphore)."""
+    """One PDF through the batch sequence (queued by the batch semaphore).
+
+    Phase 1: every step transition (running → done / error / cancelled) is
+    recorded durably in the manifest's `steps` map; steps already done before
+    this run are recorded once as "skipped" (cache hit — visible in the UI).
+    """
     try:
         async with sem:
+            cur_sid: Optional[str] = None
             try:
                 if drive_file_id:
                     _ingest_drive_project(uid, project_name, drive_file_id)
                 _mark_project_autorun(uid, project_name, batch_id)
                 entry = first_not_done_step(uid, project_name)
                 if entry is None:
+                    _record_skipped_steps(uid, batch_id, project_name, list(BATCH_SEQUENCE))
                     _mutate_project(uid, batch_id, project_name, "done")
                     return
+                _record_skipped_steps(uid, batch_id, project_name,
+                                      BATCH_SEQUENCE[:BATCH_SEQUENCE.index(entry)])
                 for sid in BATCH_SEQUENCE[BATCH_SEQUENCE.index(entry):]:
+                    cur_sid = sid
                     _mutate_project(uid, batch_id, project_name, "running", current_step=sid)
+                    _record_step(uid, batch_id, project_name, sid, "running")
                     cfg = resolve_step_config(sid, config, uid, project_name)
                     task = asyncio.ensure_future(
                         _spawn_runtime_task(project_name, uid, sid, cfg))
@@ -417,18 +544,25 @@ async def _run_one_project(uid: str, project_name: str, config: dict, batch_id: 
                     try:
                         await task
                     except asyncio.CancelledError:
+                        _record_step(uid, batch_id, project_name, sid, "cancelled")
                         _mutate_project(uid, batch_id, project_name, "cancelled")
                         raise
                     status = job_manager.get_status(project_name, sid)
                     if status in ("error", "stopped", "cancelled"):
+                        _record_step(uid, batch_id, project_name, sid, status)
                         _mutate_project(uid, batch_id, project_name, "error", error_step=sid)
                         return
+                    _record_step(uid, batch_id, project_name, sid, "done")
                 _mutate_project(uid, batch_id, project_name, "done")
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 print(f"[AUTORUN-BATCH] project {project_name} failed: {e}")
-                _mutate_project(uid, batch_id, project_name, "error", error_message=str(e)[:200])
+                if cur_sid:
+                    _record_step(uid, batch_id, project_name, cur_sid, "error",
+                                 error_message=str(e)[:200])
+                _mutate_project(uid, batch_id, project_name, "error",
+                                error_message=str(e)[:200])
     except asyncio.CancelledError:
         raise
 
@@ -494,6 +628,14 @@ def retry_project(uid: str, batch_id: str, project: str):
     proj.pop("error_step", None)
     proj.pop("current_step", None)
     write_manifest(uid, m)
+
+    # PHASE 5 (step_cache): the retry may re-run steps — drop this project's
+    # cached step views so the new pass is judged on fresh data only.
+    try:
+        from step_cache import invalidate as _invalidate
+        _invalidate(uid, project)
+    except Exception:
+        pass
 
     config = m.get("config_snapshot") or {}
     # Parent batch task still running → its queue doesn't know this project;
@@ -567,8 +709,140 @@ def resume_interrupted_batches() -> int:
         for p in manifest.get("projects", []):
             if p.get("state") == "running":
                 p["state"] = "pending"    # fresh process — nothing is actually running
+                # Phase 1: a "running" step entry is stale in a fresh process —
+                # the step re-runs and re-records itself.
+                steps = p.get("steps") or {}
+                for stale in [s for s, e in steps.items() if e.get("state") == "running"]:
+                    steps.pop(stale, None)
         write_manifest(uid, manifest)
         if run_batch_task(uid, batch_id):
             started += 1
     print(f"[AUTORUN-BATCH] auto-resume re-launched {started} interrupted batch(es)")
     return started
+
+
+# ---------------------------------------------------------------------------
+# Batch history (Phase 3 — history-progress-cache plan)
+# ---------------------------------------------------------------------------
+
+def _batch_is_live(batch_id: str, projects: list) -> bool:
+    """True while the engine actually knows this batch: the parent batch task is
+    running, or any of its projects has a live step (covers per-PDF retries of
+    a batch whose parent task already exited)."""
+    task = _BATCH_TASKS.get(batch_id)
+    if task and not task.done():
+        return True
+    return any(_project_busy(p.get("name", "")) for p in (projects or []))
+
+
+def _batch_summary(uid: str, batch_id: str, m: dict) -> dict:
+    """One history-row summary (NO full manifest, NO config_snapshot)."""
+    projects = m.get("projects", [])
+    counts = {"total": len(projects), "done": 0, "error": 0, "pending": 0}
+    for p in projects:
+        s = p.get("state")
+        if s == "done":
+            counts["done"] += 1
+        elif s in ("error", "cancelled"):
+            counts["error"] += 1
+        else:
+            counts["pending"] += 1
+    state = m.get("state") or "unknown"
+    if state in ("running", "pending") and not _batch_is_live(batch_id, projects):
+        state = "interrupted"            # crashed where startup resume couldn't relaunch
+    names = [p.get("name", "") for p in projects if p.get("name")]
+    if len(names) > 3:
+        names = names[:3] + [f"+{len(names) - 3} more"]
+    return {
+        "batch_id": batch_id,
+        "created_at": m.get("created_at") or "",
+        "updated_at": m.get("updated_at") or m.get("created_at") or "",
+        "source": m.get("source") or "drive",
+        "state": state,
+        "counts": counts,
+        "preview_names": names,
+        "write_errors": int(m.get("write_errors") or 0),
+    }
+
+
+def list_user_batches(uid: str, limit: int = 20) -> list:
+    """Past batches for one user as summary rows, newest first (Phase 3).
+
+    Local `{uid}/_batches/*` first, Storage fallback for local-FS-wiped batches
+    (same merge pattern as `_iterate_manifests`). Summaries only — the full
+    manifest stays a `/autorun/batches/{id}` job.
+    """
+    seen: set = set()
+    rows: list = []
+    try:
+        bdir = OUTPUT_ROOT / uid / "_batches"
+        if bdir.is_dir():
+            for bd in bdir.iterdir():
+                if bd.is_dir() and not bd.name.startswith((".", "_")):
+                    m = read_manifest(uid, bd.name)
+                    if m:
+                        seen.add(bd.name)
+                        rows.append(_batch_summary(uid, bd.name, m))
+    except OSError as e:
+        print(f"[AUTORUN-BATCH] local batch listing failed ({uid}): {e}")
+    # Storage-only manifests
+    try:
+        from storage_client import list_files
+        for it in list_files(""):
+            name = str(it.get("name", ""))
+            parts = name.split("/")
+            if len(parts) == 3 and parts[0] == uid and parts[1] == "_batches" \
+                    and parts[2] not in seen:
+                m = read_manifest(uid, parts[2])
+                if m:
+                    seen.add(parts[2])
+                    rows.append(_batch_summary(uid, parts[2], m))
+    except Exception as e:
+        print(f"[AUTORUN-BATCH] Storage batch listing failed ({uid}): {e}")
+    rows.sort(key=lambda r: r.get("created_at") or "", reverse=True)
+    try:
+        limit = max(1, min(int(limit), 50))
+    except (TypeError, ValueError):
+        limit = 20
+    return rows[:limit]
+
+
+def resume_batch(uid: str, batch_id: str) -> tuple:
+    """Relaunch an interrupted batch (Phase 3) → (started, reason).
+
+    Thin wrapper over run_batch_task (double-start safe): only batches with
+    pending/running projects can actually resume — terminal batches are 409'd
+    by the route (per-PDF retry remains the tool for error recovery).
+    """
+    m = read_manifest(uid, batch_id)
+    if not m:
+        return (False, "batch-not-found")
+    if _batch_is_live(batch_id, m.get("projects", [])):
+        return (False, "already-running")
+    # Same pre-flight as startup auto-resume: a fresh engine cannot have a
+    # project actually running — flip + drop stale step records.
+    changed = False
+    for p in m.get("projects", []):
+        if p.get("state") == "running":
+            p["state"] = "pending"
+            steps = p.get("steps") or {}
+            for stale in [s for s, e in steps.items() if e.get("state") == "running"]:
+                steps.pop(stale, None)
+            changed = True
+    if changed:
+        write_manifest(uid, m)
+    pending = [p for p in m.get("projects", []) if p.get("state") in ("pending", "running")]
+    if not pending:
+        return (False, "nothing-to-resume")
+    # PHASE 5 (step_cache): resuming may re-run steps of these projects.
+    try:
+        from step_cache import invalidate as _invalidate
+        for p in pending:
+            _invalidate(uid, p.get("name", ""))
+    except Exception:
+        pass
+    if not run_batch_task(uid, batch_id):
+        return (False, "nothing-to-resume")
+    print(f"[AUTORUN-BATCH] batch {batch_id} resumed for {uid} "
+          f"({len(pending)} PDF(s) remaining)")
+    return (True, "queued")

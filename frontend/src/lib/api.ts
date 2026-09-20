@@ -1,4 +1,4 @@
-import { Project, DriveFileEntry, AutoRunBatchConfig, BatchManifest, BatchSource } from "../types"
+import { Project, DriveFileEntry, AutoRunBatchConfig, BatchManifest, BatchSource, BatchSummary } from "../types"
 import { useAuthStore } from "../store/authStore"
 
 const BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
@@ -364,6 +364,32 @@ export async function getBatchProgress(batchId: string): Promise<BatchProgress> 
     throw new Error(errData.detail || 'Failed to load the batch')
   }
   return res.json()
+}
+
+// GET /autorun/batches?limit= — batch history summaries, newest first (Phase 3/4)
+export async function fetchBatches(limit: number = 20): Promise<BatchSummary[]> {
+  const res = await fetchWithRefresh(`${BASE}/autorun/batches?limit=${encodeURIComponent(limit)}`, {
+    headers: { ...getAuthHeaders() },
+  })
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}))
+    throw new Error(errData.detail || 'Failed to load batch history')
+  }
+  const data = await res.json()
+  return data.batches ?? []
+}
+
+// POST /autorun/batches/{batch_id}/resume — relaunch an interrupted batch
+export async function resumeBatch(batchId: string): Promise<{ started: boolean }> {
+  const res = await fetchWithRefresh(`${BASE}/autorun/batches/${encodeURIComponent(batchId)}/resume`, {
+    method: 'POST',
+    headers: { ...getAuthHeaders() },
+  })
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}))
+    throw new Error(errData.detail || 'Could not resume this batch')
+  }
+  return { started: true }
 }
 
 // POST /autorun/batches/{batch_id}/retry — re-run one PDF from its first not-done step

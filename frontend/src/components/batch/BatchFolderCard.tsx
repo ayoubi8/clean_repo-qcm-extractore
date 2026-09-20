@@ -1,12 +1,14 @@
-import { BatchProjectEntry } from '../../types'
+import { BatchProjectEntry, BatchSteps } from '../../types'
 import { stepChipStatus } from '../../store/batchStore'
 
 /**
  * Auto Run batch — one folder card per PDF (plan §3.3).
  *
- * Live per-step chips (1 / 2 / 6) — idle outline, running primary + pulse,
- * done check, error red. Done cards become inspectable (expand-in-place)
- * while the rest of the batch still runs.
+ * Live per-step chips (1 / 2 / 6) rendered from the MERGED step map (durable
+ * manifest progress + live overlay): idle outline, running primary + pulse,
+ * done check, `cached` (skipped — output already existed) secondary,
+ * error red. Done cards become inspectable (expand-in-place) while the rest
+ * of the batch still runs.
  */
 
 const CHIP_BASE = 'inline-flex items-center gap-1 px-2 py-0.5 rounded border text-[9px] font-black uppercase tracking-wider'
@@ -15,6 +17,7 @@ const STEP_CHIP_STYLES: Record<string, string> = {
   idle: 'bg-surface-container-highest text-outline border-outline-variant/20',
   running: 'bg-primary/10 text-primary border-primary/30',
   done: 'bg-primary/10 text-primary border-primary/30',
+  cached: 'bg-secondary-container/20 text-secondary border-secondary/30',
   error: 'bg-error-container/10 text-error border-error/30',
 }
 
@@ -22,6 +25,7 @@ function StepChip({ step, status }: { step: number; status: string }) {
   const icon = status === 'done' ? 'check_circle'
     : status === 'running' ? 'progress_activity'
     : status === 'error' ? 'error'
+    : status === 'cached' ? 'cached'
     : 'circle'
   return (
     <span className={`${CHIP_BASE} ${style_for(status)}`} title={`Step ${step}: ${status}`}>
@@ -58,12 +62,12 @@ function stateChip(p: BatchProjectEntry): { label: string; cls: string } {
 
 interface BatchFolderCardProps {
   project: BatchProjectEntry
-  live?: Record<string, string>
+  steps?: BatchSteps
   selected: boolean
   onClick: () => void
 }
 
-export function BatchFolderCard({ project, live, selected, onClick }: BatchFolderCardProps) {
+export function BatchFolderCard({ project, steps, selected, onClick }: BatchFolderCardProps) {
   const { name, state } = project
   const chip = stateChip(project)
   const isRunning = state === 'running'
@@ -94,7 +98,7 @@ export function BatchFolderCard({ project, live, selected, onClick }: BatchFolde
 
       <div className="flex items-center gap-1.5 flex-wrap">
         {[1, 2, 6].map(step => (
-          <StepChip key={step} step={step} status={stepChipStatus(live, step as 1 | 2 | 6)} />
+          <StepChip key={step} step={step} status={stepChipStatus(steps, step as 1 | 2 | 6)} />
         ))}
       </div>
 

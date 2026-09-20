@@ -44,6 +44,17 @@ export interface AutoRunBatchConfig {
 
 export type BatchProjectState = 'pending' | 'running' | 'done' | 'error' | 'cancelled'
 
+// Phase 1 merged per-step record (durable manifest steps + live overlay):
+// key = step id ("1", "1.5", "1.6", "2", "6"); states: idle | running | done |
+// error | stopped | cancelled | skipped (skipped = cache hit — pre-existing output)
+export interface BatchStepState {
+  state: string
+  updated_at?: string
+  error_message?: string
+}
+
+export type BatchSteps = Record<string, BatchStepState>
+
 export interface BatchProjectEntry {
   name: string
   state: BatchProjectState
@@ -51,6 +62,7 @@ export interface BatchProjectEntry {
   current_step?: string
   drive_file_id?: string
   pdf_display_name?: string
+  steps?: BatchSteps
 }
 
 export interface BatchManifest {
@@ -60,6 +72,20 @@ export interface BatchManifest {
   state: string
   config_snapshot: AutoRunBatchConfig
   projects: BatchProjectEntry[]
+}
+
+// Phase 3/4 — batch history row (GET /autorun/batches)
+export interface BatchSummaryCounts { total: number; done: number; error: number; pending: number }
+
+export interface BatchSummary {
+  batch_id: string
+  created_at: string
+  updated_at?: string
+  source?: string
+  state: string                  // done | done_with_errors | running | interrupted | ...
+  counts: BatchSummaryCounts
+  preview_names: string[]
+  write_errors?: number
 }
 
 // Wizard-stage entry (local folder file or Drive scan result + assigned AR_ name)

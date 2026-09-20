@@ -31,6 +31,7 @@ sys.path.insert(0, "/app")
 
 from job_manager import job_manager
 from log_capture import LogCapture
+import step_cache
 from autorun_batch import (batch_enabled as autorun_batch_enabled,
                            max_batch_files as autorun_max_batch_files,
                            new_batch_id as autorun_new_batch_id,
@@ -40,6 +41,8 @@ from autorun_batch import (batch_enabled as autorun_batch_enabled,
                            validate_batch_config as autorun_validate_config,
                            assign_ar_names as autorun_assign_ar_names,
                            existing_project_names as autorun_existing_names,
+                           list_user_batches as autorun_list_batches,
+                           resume_batch as autorun_resume_batch,
                            _project_busy as autorun_project_busy)
 from project_manager import (get_or_create, list_projects, step_output_exists,
                               get_weekly_costs, invalidate_projects_cache,
@@ -2146,6 +2149,11 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
     context = ctx_data["context"]
     tracker = ctx_data["tracker"]
 
+    # PHASE 5 (step_cache): the run is about to overwrite this step's outputs
+    # (and Sheets sync-before-run may already have) — drop the cached view now;
+    # the terminal branches below re-cache fresh results.
+    step_cache.invalidate(user_id, project, step_id)
+
     # Shared cooperative-stop check for this step (used by both the worker
     # thread inside _run_with_capture and the auto-enrich cascade).
     def cancel_check():
@@ -2493,11 +2501,23 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
             except Exception as be:
                 print(f"[POST-STEP] Badge recording failed for step {step_id}: {be}")
 
+            # PHASE 5 (step_cache): re-cache the terminal view so the next
+            # /status + /output calls are hits instead of SQL/Storage walks.
+            try:
+                _terminal = "done" if step_succeeded else (
+                    step_outcome if step_outcome in ("error", "stopped", "cancelled")
+                    else "error")
+                step_cache.put(user_id, project, step_id, status=terminal,
+                               output_exists=step_output_exists(project, step_id, user_id))
+            except Exception:
+                pass
+
     except asyncio.CancelledError:
         # A hard-cancel during setup (archive/PDF restore awaits) must also
         # land in a terminal state — otherwise the UI stays stuck at
         # "stopping" forever.
         job_manager.set_stopped(project, step_id, "cancelled")
+        step_cache.invalidate(user_id, project, step_id)
         _tele_status("cancelled", error_message="cancelled during setup")
         log_callback({
             "ts": datetime.now().strftime("%H:%M:%S"),
@@ -2511,6 +2531,7 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
         import traceback
         traceback.print_exc()
         job_manager.set_error(project, step_id)
+        step_cache.invalidate(user_id, project, step_id)
         step_outcome = "error"
         _tele_status("error", error_message=f"setup: {outer_e}")
         log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "error", "text": f"❌ Step {step_id} setup failed: {str(outer_e)}"})
@@ -2803,34 +2824,50 @@ def _check_step_done_in_storage(user_id: str, project: str, step_id: str) -> boo
 
 @app.get("/projects/{name}/steps/{step_id}/status")
 def get_step_status(name: str, step_id: str, user: dict = Depends(get_current_user)):
+    uid = user["id"]
     mem_status = job_manager.get_status(name, step_id)
-    mem_output = step_output_exists(name, step_id, user["id"])
 
     # If the job is actively tracked in memory (running or finished this session),
     # trust the in-memory state — it's the most up-to-date.
     if mem_status in ("running", "stopping", "done", "error", "stopped", "cancelled"):
+        mem_output = step_output_exists(name, step_id, uid)
+        step_cache.put(uid, name, step_id, status=mem_status, output_exists=mem_output)
         return {"status": mem_status, "output_exists": mem_output}
+
+    # PHASE 5 (step_cache): fresh entry in front of the SQL/Storage probes —
+    # explicit invalidation on every mutation path keeps a ~180s TTL correct.
+    cached = step_cache.get(uid, name, step_id)
+    if cached and cached.get("status") is not None:
+        out_exists = cached.get("output_exists")
+        if out_exists is None:
+            out_exists = step_output_exists(name, step_id, uid)
+            step_cache.put(uid, name, step_id, output_exists=out_exists)
+        return {"status": cached["status"], "output_exists": out_exists}
 
     # PERSISTENCE_FIX_PLAN PR-2: SQL-first check. After a container restart
     # the in-memory JobManager is empty, but a step_results SQL row (written
     # by _record_step_result on every successful run) survives. One round-trip
     # instead of 8 recursive Storage walks per step.
-    sql_row = _latest_step_result_row(user["id"], name, step_id)
+    sql_row = _latest_step_result_row(uid, name, step_id)
     if sql_row:
         badge = sql_row.get("badge")
         if badge == "success":
+            step_cache.put(uid, name, step_id, status="done", output_exists=True)
             return {"status": "done", "output_exists": True}
         if badge in ("error", "stopped", "cancelled"):
-            return {"status": badge, "output_exists": bool(sql_row.get("file_manifest"))}
+            result = {"status": badge, "output_exists": bool(sql_row.get("file_manifest"))}
+            step_cache.put(uid, name, step_id, status=badge,
+                           output_exists=result["output_exists"])
+            return result
 
     # mem_status == "idle" and no SQL row: fall back to Supabase Storage
     # (handles pre-fix projects that have outputs in Storage but no SQL row yet).
-    storage_done = _check_step_done_in_storage(user["id"], name, step_id)
-    if storage_done:
-        return {"status": "done", "output_exists": True}
-
-    # Nothing in memory or storage — step has genuinely not been run yet.
-    return {"status": "idle", "output_exists": False}
+    storage_done = _check_step_done_in_storage(uid, name, step_id)
+    result = ({"status": "done", "output_exists": True} if storage_done
+              else {"status": "idle", "output_exists": False})
+    step_cache.put(uid, name, step_id, status=result["status"],
+                   output_exists=result["output_exists"])
+    return result
 
 @app.websocket("/ws/log/{project}/{step_id}")
 async def ws_log(websocket: WebSocket, project: str, step_id: str, token: str = ""):
@@ -3033,6 +3070,7 @@ def get_step_models(user: dict = Depends(get_current_user)):
         "step8":   {},
         "features": {
             "autorun_batch": autorun_batch_enabled(),
+            "step_cache_ttl": step_cache.ttl_seconds(),
         },
     }
 
@@ -3076,13 +3114,21 @@ def _sort_output_file_items(files: list) -> list:
 
 @app.get("/projects/{name}/steps/{step_id}/output")
 def get_step_output_files(name: str, step_id: str, user: dict = Depends(get_current_user)):
+    uid = user["id"]
     _SFMAP = {
         "1": "step1_extraction", "1.5": "step1_extraction", "1.6": "step1_extraction",
         "2": "step2_qcm", "3": "step3_metadata", "4": "step4_format",
         "5": "step5_json", "6": "step6_corrections", "7": "step7_categories", "8": "step8_matches",
     }
     folder_name = _SFMAP.get(step_id, f"step{step_id}")
-    step_dir = Path(f"/app/output/{user['id']}/{name}/{folder_name}")
+
+    # PHASE 5 (step_cache): cached file manifest in front of the local/SQL/Storage
+    # probes; runs/deletes/syncs invalidate explicitly (Q-C1).
+    cached = step_cache.get(uid, name, step_id)
+    if cached and cached.get("files"):
+        return {"files": _sort_output_file_items(cached["files"])}
+
+    step_dir = Path(f"/app/output/{uid}/{name}/{folder_name}")
 
     # Local filesystem (during active container session)
     if step_dir.exists():
@@ -3099,14 +3145,16 @@ def get_step_output_files(name: str, step_id: str, user: dict = Depends(get_curr
                     "created_at": datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
                 })
         if files:
+            step_cache.put(uid, name, step_id, files=files, output_exists=True,
+                           status=job_manager.get_status(name, step_id))
             return {"files": _sort_output_file_items(files)}
 
     # PERSISTENCE_FIX_PLAN PR-2: SQL-first manifest. After a container restart
     # the local FS is empty. If a step_results row exists, its file_manifest
     # lists every file with its size_bytes — no Storage recursive walk needed.
-    sql_row = _latest_step_result_row(user["id"], name, step_id)
+    sql_row = _latest_step_result_row(uid, name, step_id)
     if sql_row and sql_row.get("file_manifest"):
-        storage_prefix = sql_row.get("storage_prefix") or f"{user['id']}/{name}/{folder_name}"
+        storage_prefix = sql_row.get("storage_prefix") or f"{uid}/{name}/{folder_name}"
         created_at = (sql_row.get("created_at") or "")
         # ISO timestamp "2026-08-05T14:28:31+00:00" → "2026-08-05 14:28"
         try:
@@ -3124,11 +3172,13 @@ def get_step_output_files(name: str, step_id: str, user: dict = Depends(get_curr
             if e.get("path") and not e.get("path", "").split("/")[-1].startswith("_")
         ]
         if files:
+            step_cache.put(uid, name, step_id, files=files, output_exists=True,
+                           status=badge_from_row(sql_row))
             return {"files": _sort_output_file_items(files)}
 
     # Fallback: list from Supabase Storage (recursive — step outputs live in
     # sub-folders like step1_extraction/accepted/page_*.txt)
-    storage_prefix = f"{user['id']}/{name}/{folder_name}"
+    storage_prefix = f"{uid}/{name}/{folder_name}"
     try:
         items = list_files_recursive(storage_prefix)
         files = [
@@ -3137,9 +3187,16 @@ def get_step_output_files(name: str, step_id: str, user: dict = Depends(get_curr
             for it in items
             if not it.get("name", "").split("/")[-1].startswith("_")
         ]
+        step_cache.put(uid, name, step_id, files=files, output_exists=bool(files))
         return {"files": _sort_output_file_items(files)}
     except Exception:
         return {"files": []}
+
+
+def badge_from_row(sql_row: dict) -> str:
+    """step_results badge → step-status string (used when caching /output rows)."""
+    badge = (sql_row or {}).get("badge") or "done"
+    return badge if badge in ("error", "stopped", "cancelled") else "done"
 
 
 @app.delete("/projects/{name}/steps/{step_id}/output/{filename:path}")
@@ -3199,6 +3256,9 @@ def delete_step_output_file(name: str, step_id: str, filename: str, user: dict =
             ).execute()
     except Exception as e:
         print(f"[DELETE] Manifest update failed: {e}")
+
+    # PHASE 5 (step_cache): the step's cached manifest is now wrong — drop it.
+    step_cache.invalidate(user["id"], name, step_id)
 
     return {"status": "deleted", "filename": relative.as_posix()}
 
@@ -3984,6 +4044,15 @@ def _sync_step_from_sheets_svc(name: str, step_id: str, user_id: str,
           + (f", propagated {propagated} field(s) to step {sibling_id}." if propagated else ".")
           + (f", build-chain files updated: {chain_files}." if chain_propagated else ""))
 
+    # PHASE 5 (step_cache): the sync rewrote this step's (and possibly its
+    # sibling's) canonical outputs — a cached /output file list is stale now.
+    try:
+        step_cache.invalidate(user_id, name, step_id)
+        if sibling_id:
+            step_cache.invalidate(user_id, name, sibling_id)
+    except Exception:
+        pass
+
     return {
         "total": len(new_qcms),
         "corrected_count": corrected_count,
@@ -4267,10 +4336,34 @@ async def autorun_batch_start(body: dict, user: dict = Depends(get_current_user)
     return {"batch_id": batch_id, "projects": [{"name": p["name"]} for p in projects]}
 
 
+@app.get("/autorun/batches")
+def autorun_batch_list(limit: int = 20, user: dict = Depends(get_current_user)):
+    """Batch history (Phase 3): summary rows for the user's past auto-run
+    sessions, newest first — local manifests + Storage fallback. An
+    `interrupted` state means the manifest says running/pending but no engine
+    knows about it; POST /resume relaunches those."""
+    if not autorun_batch_enabled():
+        raise HTTPException(status_code=404, detail="Auto Run batch is not enabled on this server.")
+    try:
+        lim = int(limit)
+    except (TypeError, ValueError):
+        lim = 20
+    _check_user_rate_limit(user["id"], "autorun_list", limit=60, window_seconds=60)
+    return {"batches": autorun_list_batches(user["id"], lim)}
+
+
 @app.get("/autorun/batches/{batch_id}")
 def autorun_batch_progress(batch_id: str, user: dict = Depends(get_current_user)):
-    """Batch manifest enriched with live states when the API knows better."""
-    from autorun_batch import read_manifest
+    """Batch manifest enriched with live states when the API knows better.
+
+    Phase 1: each project entry carries a durable `steps` map recorded by the
+    engine (autorun_batch). In-memory job_manager statuses are merged OVER it —
+    a live status (“running”/“done”/“error”/…) overrides the recorded entry;
+    the recorded manifest states survive container restarts. Response-only:
+    the manifest is never written here. `write_errors` (failed manifest writes)
+    rides along in the batch payload when persistence degrades.
+    """
+    from autorun_batch import merge_live_status, read_manifest
     uid = user["id"]
     m = read_manifest(uid, batch_id)
     if not m:
@@ -4279,6 +4372,7 @@ def autorun_batch_progress(batch_id: str, user: dict = Depends(get_current_user)
     for p in m.get("projects", []):
         name = p.get("name", "")
         live[name] = {sid: job_manager.get_status(name, sid) for sid in ("1", "1.5", "1.6", "2", "6")}
+    merge_live_status(m)
     return {"batch": m, "live_status": live}
 
 
@@ -4295,3 +4389,20 @@ async def autorun_batch_retry(batch_id: str, body: dict, user: dict = Depends(ge
         status_code = 404 if reason in ("batch-not-found", "project-not-in-batch") else 409
         raise HTTPException(status_code=status_code, detail=reason)
     return {"queued": True, "project": project}
+
+
+@app.post("/autorun/batches/{batch_id}/resume")
+async def autorun_batch_resume(batch_id: str, user: dict = Depends(get_current_user)):
+    """Resume an interrupted batch (Phase 3) — re-runs every pending/running
+    PDF from its first not-done step. Terminal batches are 409 (per-PDF retry
+    remains the tool for error recovery; nothing to resume)."""
+    if not autorun_batch_enabled():
+        raise HTTPException(status_code=404, detail="Auto Run batch is not enabled on this server.")
+    uid = user["id"]
+    _apply_user_env(user)
+    _check_user_rate_limit(uid, "autorun_resume", limit=10, window_seconds=60)
+    started, reason = autorun_resume_batch(uid, batch_id)
+    if not started:
+        status_code = 404 if reason == "batch-not-found" else 409
+        raise HTTPException(status_code=status_code, detail=reason)
+    return {"started": True, "batch_id": batch_id}

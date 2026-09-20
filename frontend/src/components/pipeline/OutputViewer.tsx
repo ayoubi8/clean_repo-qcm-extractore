@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { fetchStepOutput, fetchAuthenticatedBlobUrl, downloadAuthenticatedFile, syncFromSheets, deleteStepOutput } from '../../lib/api';
+import { fetchAuthenticatedBlobUrl, downloadAuthenticatedFile, syncFromSheets, deleteStepOutput } from '../../lib/api';
+import { ensureStepOutput, reloadStepOutput, removeCachedFile } from '../../store/outputsCache';
 import { usePipelineStore } from '../../store/pipelineStore';
 import type { StepStatus } from '../../types';
 
@@ -52,7 +53,9 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
   const syncFromSheetsResult = async (force: boolean = false) => {
     const result = await syncFromSheets(projectName, stepId, force);
     try {
-      const data = await fetchStepOutput(projectName, stepId);
+      // Phase 6 (Q-C1): sync finished → refetch the updated version and REPLACE
+      // the cached entry (sees the synced data; the next expand is still instant).
+      const data = await reloadStepOutput(projectName, stepId);
       setFiles(sortOutputFiles(data.files));
     } catch {}
     const parts: string[] = [];
@@ -126,6 +129,7 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
     setDeletingFile(filename);
     try {
       await deleteStepOutput(projectName, stepId, filename);
+      removeCachedFile(projectName, stepId, filename);
       setFiles(prev => prev.filter(file => file.name !== filename));
       if (previewFile === filename) {
         setPreviewFile(null);
@@ -140,10 +144,11 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
 
   useEffect(() => {
     async function loadAll() {
-      // 1. Load current step files
+      // 1. Load current step files (Phase 6: cached-first — fresh entries
+      //    are served free; only expired ones send a request)
       setLoadingFiles(true);
       try {
-        const data = await fetchStepOutput(projectName, stepId);
+        const data = await ensureStepOutput(projectName, stepId);
         setFiles(sortOutputFiles(data.files));
       } catch (err) {
         console.error(err);
@@ -183,7 +188,7 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
     if (prev === 'running' && (stepStatus === 'done' || stepStatus === 'error')) {
       (async () => {
         try {
-          const data = await fetchStepOutput(projectName, stepId);
+          const data = await reloadStepOutput(projectName, stepId);
           setFiles(sortOutputFiles(data.files));
         } catch (err) {
           console.error('Auto-refresh after run failed:', err);

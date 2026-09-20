@@ -13,6 +13,19 @@ F7  manifest write/read round-trip
 F8  engine: queue, per-PDF sequential steps, failure isolation
 F9  retry guards (resolved Q9)
 F10 startup auto-resume (resolved Q12)
+
+Phase 1 (history-progress-cache plan):
+F11 durable per-step `steps` map in the manifest (done/error/skipped/not-reached)
+F12 merge_live_status: job_manager overlays manifest steps; response-only
+F15 write_manifest failure → write_errors counter recorded + re-persisted
+
+Batch history (Phase 3 of the history-progress-cache plan):
+F13 list_user_batches: summaries, newest-first, counts, interrupted state, limit
+F14 resume_batch guards (404 unknown / terminal ↔ nothing-to-resume / live) + relaunch
+
+Step-results caching (Phase 5):
+F16 step_cache: TTL band (122–300), /status + /output + first_not_done from cache,
+    put-merge + step/project/user invalidation map
 """
 import asyncio
 import json
@@ -395,8 +408,11 @@ def _test_f6_config_resolution():
     assert ab.validate_batch_config({"step1": {"method": "vision_ocr"},
                                      "step6": {"correction_source": "first_page"}}) == []
 
-    # first_not_done_step â€” SQL-authoritative; local FS fallback; none when all done
+    # first_not_done_step — SQL-authoritative; local FS fallback; none when all done
+    # (Phase 5: the step cache is wiped between mutations — in production the
+    # run-start/run-finally hooks invalidate the same way.)
     real_api = _import_real_api()
+    import step_cache as sc
     tmp3, _ = _make_tmp()
     rows = {"1": None, "1.5": None, "1.6": None, "2": None, "6": None}
     def fake_row(uid2, project, step_id, _rows=rows):
@@ -404,14 +420,18 @@ def _test_f6_config_resolution():
         return r if r else None
     with patch.object(ab, "OUTPUT_ROOT", tmp3), \
          patch.object(real_api, "_latest_step_result_row", side_effect=fake_row):
-        assert ab.first_not_done_step(uid, "p") == "1", "no progress â†’ step 1"
+        sc.clear()
+        assert ab.first_not_done_step(uid, "p") == "1", "no progress → step 1"
         rows["1"] = {"badge": "success"}
+        sc.clear()
         assert ab.first_not_done_step(uid, "p") == "1.5", rows
         rows["1.5"] = rows["1.6"] = rows["2"] = {"badge": "success"}
+        sc.clear()
         assert ab.first_not_done_step(uid, "p") == "6", rows
         rows["6"] = {"badge": "success"}
-        assert ab.first_not_done_step(uid, "p") is None, "all done â†’ None"
-    print("OK F6 â€” mapping, force_off, models passthrough, entry-point resolution.")
+        sc.clear()
+        assert ab.first_not_done_step(uid, "p") is None, "all done → None"
+    print("OK F6 — mapping, force_off, models passthrough, entry-point resolution.")
 
 
 def _make_tmp():
@@ -578,6 +598,273 @@ def _test_f10_resume():
     print("OK F10 â€” interrupted batches resume; clean batches stay untouched.")
 
 
+def _test_f11_step_progress():
+    print("\n--- F11: durable per-step progress in the manifest ---")
+    real_api = _import_real_api()
+    tmp = Path(tempfile.mkdtemp())
+    _make_manifest(tmp, [
+        {"name": "AR_fresh", "state": "pending"},
+        {"name": "AR_skip", "state": "pending"},
+        {"name": "AR_bad", "state": "pending"},
+    ], batch_id="batch-e11")
+    runner = _Runner(fail_projects={"AR_bad"})
+    with patch.object(ab, "OUTPUT_ROOT", tmp), \
+         patch.object(ab, "_spawn_runtime_task", new=lambda p, u, s, c: runner.run(p, u, s, c)), \
+         patch.object(real_api, "_latest_step_result_row", return_value=None, create=True):
+        # AR_skip already ran steps 1/1.5/1.6 in an earlier pass — their local
+        # outputs (shared step1_extraction folder) force entry at step "2".
+        step1_dir = tmp / UID / "AR_skip" / "step1_extraction"
+        step1_dir.mkdir(parents=True, exist_ok=True)
+        (step1_dir / "page_1.txt").write_text("already extracted")
+        _run_batch(tmp, "batch-e11")
+
+    with patch.object(ab, "OUTPUT_ROOT", tmp):
+        m = ab.read_manifest(UID, "batch-e11")
+    proj = {p["name"]: p for p in m["projects"]}
+
+    fresh = proj["AR_fresh"]["steps"]
+    assert [fresh[s]["state"] for s in ab.BATCH_SEQUENCE] == ["done"] * 5, fresh
+    assert all("updated_at" in e for e in fresh.values()), fresh
+
+    skip = proj["AR_skip"]["steps"]                       # cache-hit flags (plan Phase-1)
+    assert [skip[s]["state"] for s in ("1", "1.5", "1.6")] == ["skipped"] * 3, skip
+    assert skip["2"]["state"] == "done" and skip["6"]["state"] == "done", skip
+
+    bad = proj["AR_bad"]
+    assert bad["steps"]["1"]["state"] == "done" and bad["steps"]["2"]["state"] == "error", bad
+    assert "6" not in bad["steps"], bad                   # never reached
+    assert bad["error_step"] == "2" and bad["state"] == "error", bad
+    print("OK F11 — done / skipped / error / not-reached recorded with timestamps.")
+
+
+def _test_f12_merge_live():
+    print("\n--- F12: merge_live_status — live over manifest steps ---")
+    tmp = Path(tempfile.mkdtemp())
+    _make_manifest(tmp, [{
+        "name": "AR_m", "state": "running", "current_step": "2",
+        "steps": {"1": {"state": "done", "updated_at": "t0"},
+                  "2": {"state": "running", "updated_at": "t0"}},
+    }], batch_id="batch-e12")
+    with patch.object(ab, "OUTPUT_ROOT", tmp):
+        m = ab.read_manifest(UID, "batch-e12")
+
+    # Empty job_manager (fresh process) → recorded manifest steps stand
+    merged = ab.merge_live_status(m, status_lookup=lambda name, sid: "idle")
+    steps = merged["projects"][0]["steps"]
+    assert steps["1"]["state"] == "done" and steps["2"]["state"] == "running", steps
+
+    # Live process knows better → fresh statuses overlay ("6" stays idle — but
+    # present, uniform shape for the chip rendering)
+    statuses = {"1": "done", "1.5": "done", "1.6": "done", "2": "running", "6": "idle"}
+    merged2 = ab.merge_live_status(m, status_lookup=lambda name, sid: statuses[sid])
+    steps2 = merged2["projects"][0]["steps"]
+    assert steps2["1.5"]["state"] == "done" and "updated_at" in steps2["1.5"], steps2
+    assert steps2["6"]["state"] == "idle", steps2
+    assert steps2["1"]["updated_at"] == "t0", steps2["1"]    # same state → timestamp kept
+    assert merged2["projects"][0]["state"] == "running"      # project fields untouched
+
+    # Response-only: disk manifest sees no merge side-effects
+    with patch.object(ab, "OUTPUT_ROOT", tmp):
+        disk = ab.read_manifest(UID, "batch-e12")
+    assert "1.5" not in disk["projects"][0]["steps"], disk["projects"][0]
+    print("OK F12 — live wins in-process, manifest survives restarts, no write-back.")
+
+
+def _test_f15_write_errors():
+    print("\n--- F15: manifest write failures recorded in the manifest ---")
+    real_api = _import_real_api()
+    tmp = Path(tempfile.mkdtemp())
+    import storage_client as _sc
+    # Storage failure only → local write succeeds; the error record itself is
+    # re-persisted by write_manifest (B3 — a degrading feed must be visible).
+    with patch.object(ab, "OUTPUT_ROOT", tmp), \
+         patch.object(_sc, "write_file", side_effect=RuntimeError("storage down")):
+        m = {"batch_id": "batch-e15", "created_at": "2026-09-20T00:00:00+00:00",
+             "source": "drive", "state": "pending", "config_snapshot": {},
+             "projects": [{"name": "AR_w", "state": "pending"}]}
+        ab.write_manifest(UID, m)
+        assert m["write_errors"] == 1, m.get("write_errors")
+        assert "last_write_error" in m, m
+        back = ab.read_manifest(UID, "batch-e15")
+        assert back["write_errors"] == 1, back.get("write_errors")   # persisted
+
+        ab.write_manifest(UID, m)                                    # still failing → grows
+        assert m["write_errors"] == 2, m.get("write_errors")
+        back = ab.read_manifest(UID, "batch-e15")
+        assert back["write_errors"] == 2, back.get("write_errors")
+
+        # Healthy write → no increments, counter preserved as history
+        with patch.object(_sc, "write_file", return_value=None):
+            ab.write_manifest(UID, m)
+        assert m["write_errors"] == 2, m.get("write_errors")
+        back = ab.read_manifest(UID, "batch-e15")
+        assert back["write_errors"] == 2, back.get("write_errors")
+    print("OK F15 — write_errors counter increments on failure, persists, stays stable.")
+
+
+def _test_f13_batch_history():
+    print("\n--- F13: list_user_batches — summaries, order, interrupted state ---")
+    tmp = Path(tempfile.mkdtemp())
+
+    def _mf(bid, created, projects, state="pending"):
+        m = {"batch_id": bid, "created_at": created, "source": "drive",
+             "state": state, "config_snapshot": {}, "projects": projects}
+        with patch.object(ab, "OUTPUT_ROOT", tmp):
+            ab.write_manifest(UID, m)
+
+    _mf("batch-old", "2026-09-19T00:00:00+00:00", [
+        {"name": "AR_a", "state": "done"},
+        {"name": "AR_b", "state": "error", "error_step": "2"},
+    ], state="done_with_errors")
+    _mf("batch-live", "2026-09-18T00:00:00+00:00", [
+        {"name": "AR_z", "state": "running"},
+    ], state="running")
+    _mf("batch-new", "2026-09-20T00:00:00+00:00", [
+        {"name": f"AR_n{k}", "state": "done"} for k in range(1, 5)
+    ], state="done")
+
+    with patch.object(ab, "OUTPUT_ROOT", tmp):
+        rows = ab.list_user_batches(UID, 20)
+    assert [r["batch_id"] for r in rows] == ["batch-new", "batch-old", "batch-live"], rows
+
+    old = rows[1]
+    assert old["counts"] == {"total": 2, "done": 1, "error": 1, "pending": 0}, old
+    assert old["state"] == "done_with_errors", old
+
+    # interrupted = manifest says running but no engine knows about it
+    assert rows[2]["state"] == "interrupted", rows[2]
+    # preview names, capped at 3 + "+N more"
+    assert rows[0]["preview_names"] == ["AR_n1", "AR_n2", "AR_n3", "+1 more"], rows[0]
+    # summary must not leak the config snapshot
+    assert "config_snapshot" not in rows[0], rows[0]
+
+    # limit
+    with patch.object(ab, "OUTPUT_ROOT", tmp):
+        assert len(ab.list_user_batches(UID, 2)) == 2, "limit applied"
+
+    # A batch a live engine knows about stays "running"
+    class _FakeTask:
+        def done(self): return False
+    ab._BATCH_TASKS["batch-live"] = _FakeTask()
+    try:
+        with patch.object(ab, "OUTPUT_ROOT", tmp):
+            rows2 = ab.list_user_batches(UID, 20)
+        assert rows2[2]["state"] == "running", rows2[2]
+    finally:
+        ab._BATCH_TASKS.pop("batch-live", None)
+    print("OK F13 — ordering, counts, interrupted reconciliation, limit, preview caps.")
+
+
+def _test_f14_resume():
+    print("\n--- F14: resume_batch — guards + relaunch of an interrupted batch ---")
+    real_api = _import_real_api()
+    tmp = Path(tempfile.mkdtemp())
+    with patch.object(ab, "OUTPUT_ROOT", tmp):
+        _make_manifest(tmp, [{"name": "AR_p", "state": "pending"}], batch_id="batch-e14")
+        allowed, reason = ab.resume_batch(UID, "missing")
+        assert not allowed and reason == "batch-not-found", (allowed, reason)
+
+        _make_manifest(tmp, [{"name": "AR_d", "state": "done"}], batch_id="batch-e14t")
+        allowed, reason = ab.resume_batch(UID, "batch-e14t")
+        assert not allowed and reason == "nothing-to-resume", (allowed, reason)
+
+        class _FakeTask:
+            def done(self): return False
+        ab._BATCH_TASKS["batch-e14"] = _FakeTask()
+        try:
+            allowed, reason = ab.resume_batch(UID, "batch-e14")
+            assert not allowed and reason == "already-running", (allowed, reason)
+        finally:
+            ab._BATCH_TASKS.pop("batch-e14", None)
+        assert reason == "already-running"
+
+    # Real relaunch of batch-e14 (pending AR_p) through the engine
+    runner = _Runner()
+    with patch.object(ab, "OUTPUT_ROOT", tmp), \
+         patch.object(ab, "_spawn_runtime_task", new=lambda p, u, s, c: runner.run(p, u, s, c)), \
+         patch.object(real_api, "_latest_step_result_row", return_value=None, create=True):
+        _run_batch(tmp, "batch-e14", start_fn=lambda: ab.resume_batch(UID, "batch-e14"))
+    assert [(p, s) for (p, s) in runner.calls] == \
+        [("AR_p", s) for s in ab.BATCH_SEQUENCE], runner.calls
+    with patch.object(ab, "OUTPUT_ROOT", tmp):
+        m = ab.read_manifest(UID, "batch-e14")
+    assert m["projects"][0]["state"] == "done", m
+    assert all(v["state"] == "done" for v in m["projects"][0]["steps"].values()), m
+    print("OK F14 — unknown/terminal/live guards; interrupted batch resumes to completion.")
+
+
+def _test_f16_step_cache():
+    print("\n--- F16: step_cache — hits, TTL band, invalidation, first_not_done ---")
+    real_api = _import_real_api()
+    import step_cache as sc
+    sc.clear()
+
+    # Single TTL knob, clamped to the 120–300 band (Q-C1)
+    assert sc.ttl_seconds() == 180
+    with patch.dict(os.environ, {"STEP_CACHE_TTL": "10"}):
+        assert sc.ttl_seconds() == 120
+    with patch.dict(os.environ, {"STEP_CACHE_TTL": "999"}):
+        assert sc.ttl_seconds() == 300
+
+    # GET /status: SQL consulted once per TTL window, then served from cache
+    calls = {"sql": 0}
+    def fake_row(u2, p2, sid):
+        calls["sql"] += 1
+        return {"badge": "success"}
+    with patch.object(real_api, "_latest_step_result_row", side_effect=fake_row):
+        r1 = real_api.get_step_status("AR_c", "1", {"id": UID})
+        r1b = real_api.get_step_status("AR_c", "1", {"id": UID})
+        assert r1 == r1b == {"status": "done", "output_exists": True}, (r1, r1b)
+        assert calls["sql"] == 1, calls                 # second call = cache hit
+        sc.clear()
+        real_api.get_step_status("AR_c", "1", {"id": UID})
+        assert calls["sql"] == 2, calls                 # cleared → recompute
+
+    # put() merges fields; invalidate modes: step / project / user
+    sc.put(UID, "p", "6", status="done", output_exists=True)
+    sc.put(UID, "p", "6", files=[{"name": "file1.txt"}])
+    entry = sc.get(UID, "p", "6")
+    assert entry["status"] == "done" and entry["files"], entry
+    sc.invalidate(UID, "p", "6")
+    assert sc.get(UID, "p", "6") is None, "step-level invalidate"
+    sc.put(UID, "p", "6", status="done"); sc.put(UID, "p", "2", status="done")
+    sc.invalidate(UID, "p")
+    assert sc.get(UID, "p", "6") is None and sc.get(UID, "p", "2") is None, "project wipe"
+    sc.put(UID, "p", "6", status="done"); sc.put(UID, "q", "6", status="done")
+    sc.invalidate(UID)
+    assert sc.get(UID, "p", "6") is None and sc.get(UID, "q", "6") is None, "user wipe"
+
+    # /output served from its cached manifest — the Storage walk runs ONCE
+    tmp = Path(tempfile.mkdtemp())
+    storage_calls = {"n": 0}
+    def fake_list_recursive(prefix):
+        storage_calls["n"] += 1
+        return [{"name": f"{prefix}/accepted/page_1.txt", "metadata": {"size": 12}}]
+    with patch.object(ab, "OUTPUT_ROOT", tmp), \
+         patch.object(real_api, "_latest_step_result_row", return_value=None), \
+         patch.object(real_api, "list_files_recursive", side_effect=fake_list_recursive):
+        f1 = real_api.get_step_output_files("AR_c", "2", {"id": UID})
+        f2 = real_api.get_step_output_files("AR_c", "2", {"id": UID})
+        assert f1["files"] and f1["files"] == f2["files"], (f1, f2)
+        assert storage_calls["n"] == 1, storage_calls   # second call = cache hit
+
+    # first_not_done_step: second call fully cached (zero extra SQL)
+    n_sql = {"n": 0}
+    def fake_row2(u2, p2, sid):
+        n_sql["n"] += 1
+        return {"badge": "success"} if sid in ("1", "1.5", "1.6") else None
+    sc.clear()
+    with patch.object(ab, "OUTPUT_ROOT", tmp), \
+         patch.object(real_api, "_latest_step_result_row", side_effect=fake_row2):
+        assert ab.first_not_done_step(UID, "AR_fn") == "2", "SQL success on 1/1.5/1.6"
+        first_pass = n_sql["n"]
+        assert first_pass == 4, n_sql                    # steps 1/1.5/1.6 done + entry 2 probed
+        assert ab.first_not_done_step(UID, "AR_fn") == "2"
+        assert n_sql["n"] == first_pass, "second entry = pure cache hits"
+    sc.clear()
+    print("OK F16 — TTL knob, /status + /output + first_not_done cache hits, invalidation map.")
+
+
 def _test_f4_single_file_regressions():
     print("\n--- F4: single-file import regressions ---")
     try:
@@ -601,8 +888,14 @@ def _run_all():
     _test_f8_engine()
     _test_f9_retry()
     _test_f10_resume()
+    _test_f11_step_progress()
+    _test_f12_merge_live()
+    _test_f13_batch_history()
+    _test_f14_resume()
+    _test_f15_write_errors()
+    _test_f16_step_cache()
     print("\n" + "=" * 60)
-    print("ALL AUTORUN-BATCH TESTS PASSED âœ…  (Phase 2 + Phase 3)")
+    print("ALL AUTORUN-BATCH TESTS PASSED (Phases 0-5 coverage)")
     print("=" * 60)
 
 
