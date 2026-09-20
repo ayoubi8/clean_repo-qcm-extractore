@@ -1,4 +1,4 @@
-import { Project } from "../types"
+import { Project, DriveFileEntry, AutoRunBatchConfig, BatchManifest, BatchSource } from "../types"
 import { useAuthStore } from "../store/authStore"
 
 const BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
@@ -299,6 +299,84 @@ export async function startAutoRun(
     body: JSON.stringify(payload),
   })
   if (!res.ok) throw new Error('Failed to start auto run')
+  return res.json()
+}
+
+// ---------------------------------------------------------------------------
+// Auto Run Batch (multi-PDF) — plan docs/plans/autorun-batch-plan.md §4.1
+// ---------------------------------------------------------------------------
+
+export interface DriveFolderScan {
+  folder_name: string
+  files: DriveFileEntry[]
+  total_in_folder: number
+  non_pdf_skipped: number
+}
+
+// POST /autorun/batch/scan — list the PUBLIC folder's top-level PDFs (names only)
+export async function scanDriveFolder(folderLink: string): Promise<DriveFolderScan> {
+  const res = await fetchWithRefresh(`${BASE}/autorun/batch/scan`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+    body: JSON.stringify({ folder_link: folderLink }),
+  })
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}))
+    throw new Error(errData.detail || 'Folder scan failed')
+  }
+  return res.json()
+}
+
+// POST /autorun/batch/start — register the batch + start the 5-worker queue.
+// upload mode: project_names (frontend already created + uploaded each project).
+// drive mode: drive_files (backend creates + downloads inside the batch task).
+export async function runBatch(payload: {
+  source: BatchSource
+  drive_files?: DriveFileEntry[]
+  project_names?: string[]
+  config: AutoRunBatchConfig
+}): Promise<{ batch_id: string; projects: { name: string }[] }> {
+  const res = await fetchWithRefresh(`${BASE}/autorun/batch/start`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+    body: JSON.stringify(payload),
+  })
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}))
+    const detail = errData.detail
+    throw new Error(Array.isArray(detail) ? detail.join('\n') : (detail || 'Failed to start the batch'))
+  }
+  return res.json()
+}
+
+export interface BatchProgress {
+  batch: BatchManifest
+  live_status: Record<string, Record<string, string>>
+}
+
+// GET /autorun/batches/{batch_id} — manifest + live per-step statuses
+export async function getBatchProgress(batchId: string): Promise<BatchProgress> {
+  const res = await fetchWithRefresh(`${BASE}/autorun/batches/${encodeURIComponent(batchId)}`, {
+    headers: { ...getAuthHeaders() },
+  })
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}))
+    throw new Error(errData.detail || 'Failed to load the batch')
+  }
+  return res.json()
+}
+
+// POST /autorun/batches/{batch_id}/retry — re-run one PDF from its first not-done step
+export async function retryBatchPdf(batchId: string, project: string): Promise<{ queued: boolean }> {
+  const res = await fetchWithRefresh(`${BASE}/autorun/batches/${encodeURIComponent(batchId)}/retry`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+    body: JSON.stringify({ project }),
+  })
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}))
+    throw new Error(errData.detail || 'Retry failed')
+  }
   return res.json()
 }
 

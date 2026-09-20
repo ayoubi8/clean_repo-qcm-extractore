@@ -5,6 +5,7 @@ import { TopBar } from './components/shell/TopBar'
 import { ProjectLauncher } from './components/launcher/ProjectLauncher'
 import { Dashboard } from './pages/Dashboard'
 import { Pipeline } from './pages/Pipeline'
+import { BatchView } from './pages/BatchView'
 import { Settings } from './pages/Settings'
 import { Login } from './pages/Login'
 import { Register } from './pages/Register'
@@ -52,6 +53,7 @@ export default function App() {
                   <Routes>
                     <Route path="/" element={<Dashboard />} />
                     <Route path="/pipeline" element={<Pipeline />} />
+                    <Route path="/batch/:batchId" element={<BatchView />} />
                     <Route path="/settings" element={<Settings />} />
                     <Route path="*" element={<Navigate to="/" replace />} />
                   </Routes>

@@ -105,9 +105,20 @@ export function ResumeProjectModal({ onSuccess }: ResumeProjectModalProps) {
             >
               {/* Project info */}
               <div className="flex-1 min-w-0">
-                <p className="text-sm font-black text-on-surface tracking-tight truncate">
-                  {project.name}
-                </p>
+                <div className="flex items-center gap-2 min-w-0">
+                  <p className="text-sm font-black text-on-surface tracking-tight truncate">
+                    {project.name}
+                  </p>
+                  {project.origin === 'autorun' && (
+                    <span
+                      title="Created by Auto Run batch"
+                      className="shrink-0 inline-flex items-center gap-1 text-[9px] font-black uppercase tracking-wider text-on-secondary-container bg-secondary-container/60 px-1.5 py-0.5 rounded border border-secondary/30"
+                    >
+                      <span className="material-symbols-outlined text-[12px] leading-none">rocket_launch</span>
+                      AUTO
+                    </span>
+                  )}
+                </div>
                 <p className="text-[11px] text-outline mt-0.5 font-medium">
                   Step {(project.last_step === 4 || project.last_step === 5) ? 3 : project.last_step} / 8 · {formatRelative(project.last_modified)}
                 </p>

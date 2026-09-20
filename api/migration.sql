@@ -37,6 +37,14 @@ CREATE INDEX IF NOT EXISTS projects_user_activity_idx
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS total_tokens BIGINT DEFAULT 0;
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS tokens_synced BOOLEAN DEFAULT FALSE;
 
+-- AUTO-RUN BATCH (Phase 1): marks how a project was created.
+-- 'manual' = New Project / single-file Drive import (default);
+-- 'autorun' = created by an Auto Run batch (AR_ prefix + batch manifest).
+-- GET /projects returns it so Resume Project can render the AUTO badge.
+-- _select_project_rows degrades gracefully (drops the column) when this
+-- migration has not been applied yet.
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS origin VARCHAR(64) DEFAULT 'manual';
+
 
 -- STEP_HISTORY table
 CREATE TABLE IF NOT EXISTS step_history (

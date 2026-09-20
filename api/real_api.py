@@ -31,6 +31,16 @@ sys.path.insert(0, "/app")
 
 from job_manager import job_manager
 from log_capture import LogCapture
+from autorun_batch import (batch_enabled as autorun_batch_enabled,
+                           max_batch_files as autorun_max_batch_files,
+                           new_batch_id as autorun_new_batch_id,
+                           run_batch_task as autorun_run_batch_task,
+                           retry_project as autorun_retry_project,
+                           resume_interrupted_batches as autorun_resume_interrupted,
+                           validate_batch_config as autorun_validate_config,
+                           assign_ar_names as autorun_assign_ar_names,
+                           existing_project_names as autorun_existing_names,
+                           _project_busy as autorun_project_busy)
 from project_manager import (get_or_create, list_projects, step_output_exists,
                               get_weekly_costs, invalidate_projects_cache,
                               _is_missing_column_error)
@@ -106,6 +116,17 @@ async def _startup():
             print(f"[STARTUP] ⚠️ step_results table missing — run the new CREATE TABLE block in api/migration.sql via the Supabase SQL editor. Run metadata will stay in Storage/JSON until then. (probe error: {_e})")
     except Exception as _e2:
         print(f"[STARTUP] ⚠️ Supabase unreachable for step_results probe: {_e2}")
+
+    # AUTO-RUN BATCH (Phase 3, resolved Q12): auto-resume of interrupted batches.
+    # Scans {uid}/_batches for manifests holding pending/running projects and
+    # re-launches those batches (entry point = first not-done step per PDF).
+    try:
+        if autorun_batch_enabled():
+            autorun_resume_interrupted()
+        else:
+            print("[STARTUP] Auto Run batch flag off — auto-resume skipped")
+    except Exception as _ebx:
+        print(f"[STARTUP] ⚠️ Auto Run batch auto-resume failed: {_ebx}")
 
 
 def _migrate_legacy_projects():
@@ -3009,7 +3030,10 @@ def get_step_models(user: dict = Depends(get_current_user)):
             "ai_fallback":        env.get("STEP6_AI_FALLBACK_MODEL")
         },
         "step7":   {"primary": env.get("STEP7_MODEL"),   "fallback": env.get("STEP7_FALLBACK_MODEL")},
-        "step8":   {}
+        "step8":   {},
+        "features": {
+            "autorun_batch": autorun_batch_enabled(),
+        },
     }
 
 # --- Batch Config + Template Endpoints ---
@@ -4161,3 +4185,113 @@ async def _autorun_task(project: str, email: str, body: dict):
         # Stop the sequence if the step did not complete cleanly.
         if job_manager.get_status(project, step_id) in ("error", "stopped", "cancelled"):
             break
+
+
+# --- Auto Run Batch (multi-PDF) — docs/plans/autorun-batch-plan.md §4.1 ------
+
+@app.post("/autorun/batch/scan")
+def autorun_batch_scan(body: dict, user: dict = Depends(get_current_user)):
+    """Scan a PUBLIC Drive FOLDER → top-level PDF names. Nothing is downloaded."""
+    from gdrive_import import GoogleDriveImportError, scan_drive_folder
+    if not autorun_batch_enabled():
+        raise HTTPException(status_code=404, detail="Auto Run batch is not enabled on this server.")
+    link = (body.get("folder_link") or "").strip() if body else ""
+    _check_user_rate_limit(user["id"], "autorun_scan", limit=20, window_seconds=60)
+    try:
+        return scan_drive_folder(link, max_files=autorun_max_batch_files())
+    except GoogleDriveImportError as ge:
+        raise HTTPException(status_code=ge.status, detail=ge.message)
+
+
+@app.post("/autorun/batch/start")
+async def autorun_batch_start(body: dict, user: dict = Depends(get_current_user)):
+    """Register a batch and start it — one project per PDF, config shared.
+
+    source="drive":  drive_files [{file_id, name}] — projects are created and
+                     PDFs downloaded inside the batch task (5-worker queue).
+     source="upload": project_names — the frontend already created + uploaded
+                     every project via the existing per-project routes.
+    """
+    if not autorun_batch_enabled():
+        raise HTTPException(status_code=404, detail="Auto Run batch is not enabled on this server.")
+
+    uid = user["id"]
+    _apply_user_env(user)
+    _check_user_rate_limit(uid, "autorun_batch", limit=3, window_seconds=600)
+
+    source = (body or {}).get("source")
+    cfg = (body or {}).get("config") or {}
+    problems = autorun_validate_config(cfg)
+    if problems:
+        raise HTTPException(status_code=400, detail=problems[0])
+
+    if source == "drive":
+        drive_files = (body or {}).get("drive_files") or []
+        if not drive_files:
+            raise HTTPException(status_code=400, detail="drive_files is empty.")
+        if len(drive_files) > autorun_max_batch_files():
+            raise HTTPException(status_code=400,
+                                detail=f"A batch runs at most {autorun_max_batch_files()} PDFs "
+                                       f"(got {len(drive_files)}).")
+        mapping = autorun_assign_ar_names(drive_files, autorun_existing_names(uid))
+        projects = [{"name": mapping[df["file_id"]],
+                     "drive_file_id": df["file_id"],
+                     "pdf_display_name": df.get("name"),
+                     "state": "pending"} for df in drive_files]
+    elif source == "upload":
+        names = (body or {}).get("project_names") or []
+        if not names:
+            raise HTTPException(status_code=400, detail="project_names is empty.")
+        if len(names) > autorun_max_batch_files():
+            raise HTTPException(status_code=400,
+                                detail=f"A batch runs at most {autorun_max_batch_files()} PDFs "
+                                       f"(got {len(names)}).")
+        projects = [{"name": n, "state": "pending"} for n in names]
+    else:
+        raise HTTPException(status_code=400, detail="source must be 'drive' or 'upload'.")
+
+    batch_id = autorun_new_batch_id()
+    from autorun_batch import write_manifest
+    from datetime import datetime, timezone as _tz
+    manifest = {
+        "batch_id": batch_id,
+        "created_at": datetime.now(_tz.utc).isoformat(),
+        "source": source,
+        "state": "pending",
+        "config_snapshot": cfg,
+        "projects": projects,
+    }
+    write_manifest(uid, manifest)
+    if not autorun_run_batch_task(uid, batch_id):
+        raise HTTPException(status_code=500, detail="Failed to start the batch task.")
+    return {"batch_id": batch_id, "projects": [{"name": p["name"]} for p in projects]}
+
+
+@app.get("/autorun/batches/{batch_id}")
+def autorun_batch_progress(batch_id: str, user: dict = Depends(get_current_user)):
+    """Batch manifest enriched with live states when the API knows better."""
+    from autorun_batch import read_manifest
+    uid = user["id"]
+    m = read_manifest(uid, batch_id)
+    if not m:
+        raise HTTPException(status_code=404, detail="Batch not found.")
+    live = {}
+    for p in m.get("projects", []):
+        name = p.get("name", "")
+        live[name] = {sid: job_manager.get_status(name, sid) for sid in ("1", "1.5", "1.6", "2", "6")}
+    return {"batch": m, "live_status": live}
+
+
+@app.post("/autorun/batches/{batch_id}/retry")
+async def autorun_batch_retry(batch_id: str, body: dict, user: dict = Depends(get_current_user)):
+    """Per-PDF retry (resolved Q9) — re-runs one project from its first not-done step."""
+    if not autorun_batch_enabled():
+        raise HTTPException(status_code=404, detail="Auto Run batch is not enabled on this server.")
+    project = (body or {}).get("project") or ""
+    uid = user["id"]
+    _apply_user_env(user)
+    allowed, reason = autorun_retry_project(uid, batch_id, project)
+    if not allowed:
+        status_code = 404 if reason in ("batch-not-found", "project-not-in-batch") else 409
+        raise HTTPException(status_code=status_code, detail=reason)
+    return {"queued": True, "project": project}

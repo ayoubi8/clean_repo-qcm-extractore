@@ -5,6 +5,72 @@ export interface Project {
   last_modified: string; // ISO 8601
   total_tokens: number;  // from cost_tracker.total_tokens
   pdf_path: string;      // absolute path to source PDF — persisted in project.json
+  origin?: 'manual' | 'autorun'; // 'autorun' = created by an Auto Run batch (AR_ prefix) — drives the Resume AUTO badge
+}
+
+// ── Auto Run Batch (plan docs/plans/autorun-batch-plan.md) ─────────────────
+
+export interface DriveFileEntry { file_id: string; name: string }
+
+export type BatchSource = 'drive' | 'upload'
+
+export type CorrectionSourceMode = 'last_page' | 'first_page' | 'auto_search'
+
+export interface AutoRunBatchConfig {
+  step1: {
+    method: 'vision_ocr' | 'pypdfium2'
+    ocr_guidance?: string
+    model?: string
+  }
+  step2: {
+    model_primary?: string
+    model_fallback?: string
+    extraction_guidance?: string
+    clinical_case_hints?: boolean
+    // Serialized metadata strategies (AutoRunPanel serializeStep3 shape)
+    step3?: { config: Record<string, string>; global_values: Record<string, string>; global_pages: number[] }
+  }
+  step6: {
+    correction_source: CorrectionSourceMode
+    text_model?: string
+    text_fallback?: string
+    all_pages_model?: string
+    all_pages_fallback?: string
+    page_text_guidance?: string
+    candidate_threshold?: number
+    include_neighbors?: boolean
+  }
+}
+
+export type BatchProjectState = 'pending' | 'running' | 'done' | 'error' | 'cancelled'
+
+export interface BatchProjectEntry {
+  name: string
+  state: BatchProjectState
+  error_step?: string
+  current_step?: string
+  drive_file_id?: string
+  pdf_display_name?: string
+}
+
+export interface BatchManifest {
+  batch_id: string
+  created_at: string
+  source: BatchSource | string
+  state: string
+  config_snapshot: AutoRunBatchConfig
+  projects: BatchProjectEntry[]
+}
+
+// Wizard-stage entry (local folder file or Drive scan result + assigned AR_ name)
+export interface WizardFileEntry {
+  key: string
+  display_name: string
+  size?: number
+  file?: File
+  drive_file_id?: string
+  ar_name: string
+  selected: boolean
 }
 
 // Steps 3, 4 & 5 are no longer standalone visible steps:

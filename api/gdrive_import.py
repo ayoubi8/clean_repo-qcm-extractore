@@ -52,6 +52,12 @@ _ID_QUERY_RE = re.compile(
     r"^https://drive\.google\.com/(?:open|uc)\?(?:[^&]*&)?id=([A-Za-z0-9_-]{20,})(?:&.*)?$"
 )
 
+# Auto Run batch (Phase 2): FOLDER links are accepted by extract_drive_folder_id —
+# extract_drive_file_id keeps rejecting them (single-file import unchanged).
+_FOLDER_URL_RE = re.compile(
+    r"^https://drive\.google\.com/drive/folders/([A-Za-z0-9_-]{20,})(?:[/?].*)?$"
+)
+
 # Google-native docs that are NOT PDFs — rejected explicitly.
 _NON_PDF_PATTERNS = [
     (re.compile(r"docs\.google\.com/document/d/"), "That link is a Google Doc, not a PDF. "
@@ -79,6 +85,13 @@ MSG_NOT_PDF = "The Drive file is not a PDF."
 MSG_TOO_MANY_HOPS = "Too many redirects while downloading from Drive."
 MSG_INVALID_LINK = ("Paste a valid Drive link, e.g. "
                     "https://drive.google.com/file/d/…/view")
+
+MSG_FOLDER_INVALID = ("Paste a valid Drive FOLDER link, e.g. "
+                      "https://drive.google.com/drive/folders/…")
+MSG_FOLDER_FILE_LINK = ("That is a single-file link — Auto Run needs a Drive FOLDER "
+                        "link (https://drive.google.com/drive/folders/…).")
+MSG_FOLDER_NOT_PUBLIC = ("Couldn't read the Drive folder — make sure it is shared "
+                         "as 'Anyone with the link' → Viewer, then try again.")
 
 
 def extract_drive_file_id(link: str) -> str:
@@ -258,6 +271,32 @@ def download_drive_pdf(link: str,
     Raises GoogleDriveImportError with a user-facing message on any failure.
     """
     file_id = extract_drive_file_id(link)
+    return _download_drive_id(file_id, max_bytes=max_bytes, on_chunk=on_chunk,
+                              client_factory=client_factory)
+
+
+def download_drive_file_by_id(file_id: str,
+                              max_bytes: int = 200 * 1024 * 1024,
+                              on_chunk: Optional[Callable[[int], None]] = None,
+                              client_factory=None) -> Tuple[bytes, Optional[str]]:
+    """Download an already-validated Drive file ID (Auto Run batch flow).
+
+    Same contract as download_drive_pdf — the ID comes from scan_drive_folder,
+    but the download itself carries the exact same guards: server-built URL,
+    https + host allowlist + DNS check on every hop, streamed byte cap,
+    %PDF- magic validation. Raises GoogleDriveImportError on any failure.
+    """
+    if not _FILE_ID_RE.fullmatch(file_id or ""):
+        raise GoogleDriveImportError("INVALID_LINK", MSG_INVALID_LINK)
+    return _download_drive_id(file_id, max_bytes=max_bytes, on_chunk=on_chunk,
+                              client_factory=client_factory)
+
+
+def _download_drive_id(file_id: str,
+                       max_bytes: int,
+                       on_chunk: Optional[Callable[[int], None]],
+                       client_factory) -> Tuple[bytes, Optional[str]]:
+    """Streaming download shared by the link and file-ID entry points."""
     url = build_download_url(file_id)
     hops = 0
     confirm_retried = False
@@ -389,6 +428,193 @@ def download_drive_pdf(link: str,
             except httpx.HTTPError as e:
                 raise GoogleDriveImportError(
                     "NETWORK", f"Could not reach Google Drive ({type(e).__name__}). Try again.")
+
+
+# ---------------------------------------------------------------------------
+# Folder scan (Auto Run batch, Phase 2)
+# ---------------------------------------------------------------------------
+
+# Drive's embedded file-explorer view — the anonymous listing endpoint for
+# link-public folders (the same endpoint gdown parses). Simple anchor HTML:
+#   <a href="https://drive.google.com/file/d/<ID>/view" ...>… name.pdf …</a>
+# Sub-folders and native Google Docs use different href hosts → ignored, so
+# the scan is naturally TOP-LEVEL-only (resolved Q4).
+_FOLDER_VIEW_URL = "https://drive.google.com/embeddedfolderview?id={fid}"
+_FOLDER_TITLE_RE = re.compile(r"<title>(.*?)</title>", re.S | re.I)
+_FOLDER_ANCHOR_RE = re.compile(
+    r'<a[^>]+href="https://drive\.google\.com/file/d/([A-Za-z0-9_-]{20,})/view"[^>]*>(.*?)</a>',
+    re.S | re.I,
+)
+_TAG_RE = re.compile(r"<[^>]+>")
+_FOLDER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+
+def extract_drive_folder_id(link: str) -> str:
+    """Extract the folder ID from a pasted Drive FOLDER link. Raises otherwise."""
+    link = (link or "").strip()
+    if not link:
+        raise GoogleDriveImportError("INVALID_LINK", MSG_FOLDER_INVALID)
+
+    m = _FOLDER_URL_RE.match(link)
+    if m:
+        return m.group(1)
+
+    # Friendly near-miss hints before the generic rejection.
+    if _FILE_URL_RE.match(link) or _ID_QUERY_RE.match(link):
+        raise GoogleDriveImportError("INVALID_LINK", MSG_FOLDER_FILE_LINK)
+    for pattern, message in _NON_PDF_PATTERNS:
+        if pattern.search(link) and "folders" not in message:
+            raise GoogleDriveImportError("INVALID_LINK",
+                                         message + " " + MSG_FOLDER_FILE_LINK)
+    if "drive.google.com" in link or "docs.google.com" in link:
+        raise GoogleDriveImportError("INVALID_LINK", MSG_FOLDER_INVALID)
+
+    raise GoogleDriveImportError("INVALID_LINK", MSG_FOLDER_INVALID)
+
+
+def _build_folder_view_url(folder_id: str) -> str:
+    """Construct (never accept) the listing URL from a validated folder ID."""
+    return _FOLDER_VIEW_URL.format(fid=folder_id)
+
+
+def _strip_anchor_text(inner_html: str) -> str:
+    """Visible filename from an anchor's inner HTML (tags stripped, entities decoded)."""
+    import html as _html
+    text = _html.unescape(_TAG_RE.sub("", inner_html))
+    return " ".join(text.split())
+
+
+def _parse_folder_view_entries(html_text: str) -> dict:
+    """Parse the embedded file-explorer page → {folder_name, files, total_files}.
+
+    files = [{file_id, name}] for TOP-LEVEL entries whose name ends .pdf
+    (case-insensitive), uncapped. total_files counts every top-level file
+    entry (non-PDF names included) so callers can report the true total.
+    Folder entries (sub-folders) and native Docs/Sheets/Slides hrefs are
+    ignored by construction — they do not match the /file/d/ anchor shape.
+    """
+    title_m = _FOLDER_TITLE_RE.search(html_text)
+    folder_name = ""
+    if title_m:
+        folder_name = re.sub(r"\s*-\s*Google Drive\s*$", "", title_m.group(1).strip(),
+                             flags=re.I).strip()
+
+    files = []
+    total_files = 0
+    seen_ids = set()
+    for file_id, inner in _FOLDER_ANCHOR_RE.findall(html_text):
+        if file_id in seen_ids:
+            continue
+        seen_ids.add(file_id)
+        total_files += 1
+        name = _strip_anchor_text(inner)
+        if not name:
+            name = f"drive_{file_id[:12]}.pdf"
+        if name.lower().endswith(".pdf"):
+            files.append({"file_id": file_id, "name": name})
+
+    return {"folder_name": folder_name, "files": files, "total_files": total_files}
+
+
+def scan_drive_folder(link: str,
+                      max_files: Optional[int] = None,
+                      client_factory=None) -> dict:
+    """List the TOP-LEVEL PDFs of a PUBLIC Drive folder (no auth, no download).
+
+    Returns {"folder_name": str, "files": [{file_id, name}...capped],
+             "total_in_folder": int, "non_pdf_skipped": int}.
+
+    Security contract mirrors the file downloader: the listing URL is built
+    server-side from a strict folder-ID regex, https + host allowlist +
+    DNS guards apply, and only drive.google.com is ever contacted.
+    Raises GoogleDriveImportError with a user-facing message on failure.
+    """
+    folder_id = extract_drive_folder_id(link)
+    url = _build_folder_view_url(folder_id)
+
+    builder = client_factory or (lambda: httpx.Client(
+        follow_redirects=False, timeout=_TIMEOUT))
+
+    with builder() as client:
+        for _ in range(_MAX_REDIRECTS + 1):
+            assert_public_url(url)
+            try:
+                stream_cm = client.stream("GET", url, headers={
+                    "User-Agent": _FOLDER_UA,
+                    "Accept": "text/html",
+                })
+            except httpx.TimeoutException:
+                raise GoogleDriveImportError(
+                    "TIMEOUT", "Listing the folder timed out — try again.")
+            except httpx.HTTPError as e:
+                raise GoogleDriveImportError(
+                    "NETWORK",
+                    f"Could not reach Google Drive ({type(e).__name__}). Try again.")
+            try:
+                with stream_cm as resp:
+                    status = resp.status_code
+                    location = resp.headers.get("location") or ""
+
+                    if 300 <= status < 400:
+                        if "accounts.google.com" in (urljoin(url, location) or "").lower()[:40]:
+                            raise GoogleDriveImportError("NOT_PUBLIC", MSG_FOLDER_NOT_PUBLIC)
+                        url = urljoin(url, location or "").strip()
+                        continue
+                    if status == 404:
+                        raise GoogleDriveImportError(
+                            "NOT_FOUND",
+                            "Drive folder not found — check the link and that the folder still exists.")
+                    if status == 403:
+                        raise GoogleDriveImportError("NOT_PUBLIC", MSG_FOLDER_NOT_PUBLIC)
+                    if status >= 400:
+                        raise GoogleDriveImportError(
+                            "DRIVE_ERROR", f"Google Drive returned HTTP {status} for the folder.")
+
+                    parsed = _parse_folder_view_stream(resp)
+            except GoogleDriveImportError:
+                raise
+            except httpx.TimeoutException:
+                raise GoogleDriveImportError(
+                    "TIMEOUT", "Listing the folder timed out — try again.")
+            except httpx.HTTPError as e:
+                raise GoogleDriveImportError(
+                    "NETWORK",
+                    f"Could not reach Google Drive ({type(e).__name__}). Try again.")
+            break
+        else:
+            raise GoogleDriveImportError("TOO_MANY_HOPS", MSG_TOO_MANY_HOPS)
+
+    files = parsed["files"]
+    total = parsed["total_files"]
+    non_pdf_skipped = total - len(files)
+    if max_files is not None:
+        files = files[:max_files]
+
+    return {
+        "folder_name": parsed["folder_name"],
+        "files": files,
+        "total_in_folder": total,
+        "non_pdf_skipped": non_pdf_skipped,
+    }
+
+
+def _parse_folder_view_stream(resp) -> dict:
+    """Consume the listing response body (text/html) and parse its entries."""
+    body = resp.text if hasattr(resp, "text") else resp.read().decode("utf-8", errors="replace")
+    if not body:
+        raise GoogleDriveImportError("NOT_PUBLIC", MSG_FOLDER_NOT_PUBLIC)
+    parsed = _parse_folder_view_entries(body)
+    if parsed["total_files"] == 0 and not parsed["folder_name"]:
+        # 200 but no recognizable explorer structure → sign-in / unexpected page
+        lowered = body.lower()
+        if "accounts.google.com" in lowered or "sign in" in lowered:
+            raise GoogleDriveImportError("NOT_PUBLIC", MSG_FOLDER_NOT_PUBLIC)
+        raise GoogleDriveImportError(
+            "PARSE_ERROR",
+            "Couldn't read the folder listing — Google's page shape may have changed. "
+            "Try again later or paste individual file links.")
+    return parsed
 
 
 def is_enabled() -> bool:

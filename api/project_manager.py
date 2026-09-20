@@ -147,7 +147,8 @@ def _build_project_from_storage(email: str, pname: str, meta: dict) -> dict:
         "last_step": 0,
         "last_modified": meta.get("created_at") or meta.get("lastUpdated") or meta.get("updated_at") or "",
         "total_tokens": 0,
-        "pdf_path": ""
+        "pdf_path": "",
+        "origin": "manual",
     }
 
 
@@ -183,7 +184,7 @@ def _select_project_rows(sb, db_uid: str, cols: list) -> list:
             return getattr(q.execute(), "data", None) or []
         except Exception as e:
             dropped = False
-            for c in ("total_tokens", "last_activity_at"):
+            for c in ("total_tokens", "last_activity_at", "origin"):
                 if c in cols and _is_missing_column_error(e, c):
                     cols.remove(c)
                     print(f"[list_projects] column projects.{c} missing — retrying without it (run api/migration.sql)")
@@ -232,7 +233,7 @@ def _compute_projects(email: str) -> list:
         db_uid = get_db_user_id({"id": email})
         db_projects = _select_project_rows(
             sb, db_uid,
-            ["id", "name", "created_at", "last_activity_at", "pdf_storage_path", "total_tokens"],
+            ["id", "name", "created_at", "last_activity_at", "pdf_storage_path", "total_tokens", "origin"],
         )
     except Exception as e:
         print(f"[list_projects] DB query failed: {e}")
@@ -326,7 +327,8 @@ def _compute_projects(email: str) -> list:
             "last_step": last_step,
             "last_modified": last_modified,
             "total_tokens": total_tokens,
-            "pdf_path": pdf_path
+            "pdf_path": pdf_path,
+            "origin": row.get("origin") or "manual",
         })
 
     # 2. Self-heal merge: discover any project in Storage missing from the
@@ -411,11 +413,13 @@ def _compute_projects(email: str) -> list:
                         pass
 
                 pdf_path = ""
+                origin = "manual"
                 project_json = d / "project.json"
                 if project_json.exists():
                     try:
                         pdata = json.loads(project_json.read_text())
                         pdf_path = pdata.get("pdf_path", "")
+                        origin = pdata.get("origin") or "manual"
                     except:
                         pass
 
@@ -424,7 +428,8 @@ def _compute_projects(email: str) -> list:
                     "last_step": last_step,
                     "last_modified": datetime.fromtimestamp(d.stat().st_mtime).isoformat() + "Z",
                     "total_tokens": total_tokens,
-                    "pdf_path": pdf_path
+                    "pdf_path": pdf_path,
+                    "origin": origin,
                 })
 
     # Final sort (descending by last_modified)
