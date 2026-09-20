@@ -442,7 +442,7 @@ def _download_drive_id(file_id: str,
 _FOLDER_VIEW_URL = "https://drive.google.com/embeddedfolderview?id={fid}"
 _FOLDER_TITLE_RE = re.compile(r"<title>(.*?)</title>", re.S | re.I)
 _FOLDER_ANCHOR_RE = re.compile(
-    r'<a[^>]+href="https://drive\.google\.com/file/d/([A-Za-z0-9_-]{20,})/view"[^>]*>(.*?)</a>',
+    r'<a[^>]+href="https://drive\.google\.com/file/d/([A-Za-z0-9_-]{20,})/view(?:\?[^"]*)?"[^>]*>(.*?)</a>',
     re.S | re.I,
 )
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -600,8 +600,19 @@ def scan_drive_folder(link: str,
 
 
 def _parse_folder_view_stream(resp) -> dict:
-    """Consume the listing response body (text/html) and parse its entries."""
-    body = resp.text if hasattr(resp, "text") else resp.read().decode("utf-8", errors="replace")
+    """Consume the listing response body (text/html) and parse its entries.
+
+    NOTE: resp is a STREAMING httpx response — resp.text raises ResponseNotRead
+    until resp.read() is called (same class of bug the file downloader hit; the
+    fake test clients made this invisible offline).
+    """
+    # Streaming httpx responses must be read() before text/content access;
+    # test fakes expose .text/.content directly (no read()).
+    if hasattr(resp, "read"):
+        content = resp.read()
+    else:
+        content = getattr(resp, "text", "") or getattr(resp, "content", b"")
+    body = content.decode("utf-8", errors="replace") if isinstance(content, bytes) else str(content)
     if not body:
         raise GoogleDriveImportError("NOT_PUBLIC", MSG_FOLDER_NOT_PUBLIC)
     parsed = _parse_folder_view_entries(body)
