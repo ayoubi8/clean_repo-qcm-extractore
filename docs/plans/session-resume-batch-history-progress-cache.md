@@ -107,20 +107,16 @@ phase notes + decisions baked in; optional Phase 4b "clickable AUTO badge" NOT s
 
 ## 5. How to use (operator)
 
-- **Old sessions**: Switch Project → Auto Run tab → "Recent batches" → click a row →
-  `/batch/:id` cockpit; `expand_all` opens every folder (cached folders render instantly);
-  Interrupted → Resume batch; arrow_back to go back. Direct URL `/batch/<id>` also works.
+- **Old sessions**: Switch Project → Auto Run → "Recent batches" → click a row → `/batch/:id`;
+  `expand_all` opens every folder (cached = instant); Interrupted → Resume; arrow_back back.
 - **Costs**: batch header total + per-PDF badges; TopBar Costs = global usage; AR project
-  pipeline = full breakdown.
-- After Space rebuild: Ctrl+Shift+R (fresh bundle) · wait ~2 min · `STEP_CACHE_TTL=180`
+  pipeline = full breakdown. After a Space rebuild: Ctrl+Shift+R · wait ~2 min ·
+  `STEP_CACHE_TTL=180` secret optional.
 
 ## 6. Tests & state
 
-- `tests/test_autorun_batch.py`: F1–F4 scan/download regressions, F5–F10 engine/naming/
-  retry/auto-resume, F11–F16 (progress/merge/write-errors/history/resume/cache),
-  F17 batch costs — all green; `npm run build` green (repo-known tsc noise unrelated).
-- Still open: **Phase 4b only** — clickable AUTO badge in Resume (needs
-  `projects.batch_id` migration + `GET /projects` field).
-- Known engine-side watch item: if an auto-run still yields no step outputs after Resume,
-  grab the Space log section around `[AUTORUN-BATCH] project AR_... failed:` — that names
-  the failing call.
+- `tests/test_autorun_batch.py` F1–F17 all green (scan/engine/naming/retry/resume/
+  progress/merge/write-errors/history/resume/cache/batch-costs); `npm run build` green.
+- Still open: **Phase 4b only** — clickable AUTO badge (needs `projects.batch_id` migration).
+- If an auto-run still yields no outputs after Resume: grab the Space log section around
+  `[AUTORUN-BATCH] project AR_... failed:` — it names the failing call.
