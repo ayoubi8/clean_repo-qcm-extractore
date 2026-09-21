@@ -865,6 +865,34 @@ def _test_f16_step_cache():
     print("OK F16 — TTL knob, /status + /output + first_not_done cache hits, invalidation map.")
 
 
+def _test_f17_batch_costs():
+    print("\n--- F17: batch aggregate costs route (Phase 7) ---")
+    real_api = _import_real_api()
+    tmp = Path(tempfile.mkdtemp())
+    with patch.object(ab, "OUTPUT_ROOT", tmp):
+        def fake_all(u, p):
+            return {"AR_a": [{"cost_usd": 0.004, "tokens": 1200, "step_number": "1"},
+                             {"cost_usd": 0.006, "tokens": 800, "step_number": "2"}]}.get(p)
+        with patch.object(real_api, "_all_cost_rows", side_effect=fake_all), \
+             patch.object(real_api, "file_exists", return_value=False):
+            m = {"batch_id": "b-cost", "created_at": "t", "source": "drive",
+                 "state": "done", "config_snapshot": {},
+                 "projects": [{"name": "AR_a", "state": "done"},
+                              {"name": "AR_b", "state": "error"}]}
+            ab.write_manifest(UID, m)
+            resp = real_api.autorun_batch_costs("b-cost", {"id": UID})
+        assert resp["projects"]["AR_a"] == {"cost": 0.01, "tokens": 2000}, resp
+        assert resp["projects"]["AR_b"] == {"cost": 0.0, "tokens": 0}, resp
+        assert resp["total"] == {"cost": 0.01, "tokens": 2000}, resp
+        # missing batch → 404
+        try:
+            real_api.autorun_batch_costs("missing", {"id": UID})
+            raise AssertionError("404 expected")
+        except Exception:
+            pass
+        print("OK F17 — per-PDF aggregation, zero fallback, batch total, 404.")
+
+
 def _test_f4_single_file_regressions():
     print("\n--- F4: single-file import regressions ---")
     try:
@@ -894,6 +922,7 @@ def _run_all():
     _test_f14_resume()
     _test_f15_write_errors()
     _test_f16_step_cache()
+    _test_f17_batch_costs()
     print("\n" + "=" * 60)
     print("ALL AUTORUN-BATCH TESTS PASSED (Phases 0-5 coverage)")
     print("=" * 60)

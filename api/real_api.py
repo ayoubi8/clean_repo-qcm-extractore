@@ -2912,6 +2912,35 @@ async def ws_log(websocket: WebSocket, project: str, step_id: str, token: str = 
 
 # --- Cost Endpoints ---
 
+def _cost_summary_from_rows(sql_rows: list) -> dict:
+    """PERSISTENCE_FIX_PLAN PR-2 shape rebuilt from SQL `costs` rows — shared by
+    the per-project costs route and the batch aggregate (Phase 7)."""
+    per_step: dict = {}
+    total_cost = 0.0
+    total_tokens = 0
+    for r in (sql_rows or []):
+        sid = str(r.get("step_number"))
+        cost = float(r.get("cost_usd") or 0)
+        tk = int(r.get("tokens") or 0)
+        slot = per_step.setdefault(sid, {
+            "total_cost": 0.0, "call_count": 0,
+            "total_tokens": {"prompt": 0, "completion": 0},
+        })
+        slot["total_cost"] += cost
+        slot["call_count"] += 1
+        # SQL `costs.tokens` is a single int (prompt + completion combined);
+        # stash it on the completion slot so the sum shape matches the blob.
+        slot["total_tokens"]["completion"] += tk
+        total_cost += cost
+        total_tokens += tk
+    return {
+        "per_model": {},
+        "per_step": per_step,
+        "total_cost": total_cost,
+        "total_tokens": total_tokens,
+    }
+
+
 @app.get("/projects/{name}/costs")
 def get_project_costs(name: str, user: dict = Depends(get_current_user)):
     # PERSISTENCE_FIX_PLAN PR-2: SQL costs table first (one round-trip,
@@ -2920,30 +2949,7 @@ def get_project_costs(name: str, user: dict = Depends(get_current_user)):
     # table doesn't track per-model granularity (the blob does).
     sql_rows = _all_cost_rows(user["id"], name)
     if sql_rows:
-        per_step: dict = {}
-        total_cost = 0.0
-        total_tokens = 0
-        for r in sql_rows:
-            sid = str(r.get("step_number"))
-            cost = float(r.get("cost_usd") or 0)
-            tk = int(r.get("tokens") or 0)
-            slot = per_step.setdefault(sid, {
-                "total_cost": 0.0, "call_count": 0,
-                "total_tokens": {"prompt": 0, "completion": 0},
-            })
-            slot["total_cost"] += cost
-            slot["call_count"] += 1
-            # SQL `costs.tokens` is a single int (prompt + completion combined);
-            # stash it on the completion slot so the sum shape matches the blob.
-            slot["total_tokens"]["completion"] += tk
-            total_cost += cost
-            total_tokens += tk
-        return {
-            "per_model": {},
-            "per_step": per_step,
-            "total_cost": total_cost,
-            "total_tokens": total_tokens,
-        }
+        return _cost_summary_from_rows(sql_rows)
 
     # Fallback: Storage blob → local FS → in-memory tracker (existing path).
     storage_path = f"{user['id']}/{name}/total_costs.json"
@@ -4381,8 +4387,52 @@ def autorun_batch_progress(batch_id: str, user: dict = Depends(get_current_user)
     for p in m.get("projects", []):
         name = p.get("name", "")
         live[name] = {sid: job_manager.get_status(name, sid) for sid in ("1", "1.5", "1.6", "2", "6")}
-    merge_live_status(m)
     return {"batch": m, "live_status": live}
+
+
+@app.get("/autorun/batches/{batch_id}/costs")
+def autorun_batch_costs(batch_id: str, user: dict = Depends(get_current_user)):
+    """Per-PDF cost summary for one batch (per Q-C1 simplicity: SQL `costs`
+    rows first, `total_costs.json` blob fallback — the same sources the
+    per-project route uses — aggregated to one response)."""
+    from autorun_batch import read_manifest
+    uid = user["id"]
+    m = read_manifest(uid, batch_id)
+    if not m:
+        raise HTTPException(status_code=404, detail="Batch not found.")
+    projects: dict = {}
+    total = {"cost": 0.0, "tokens": 0}
+    for p in m.get("projects", []):
+        nm = p.get("name", "")
+        if not nm:
+            continue
+        summary = None
+        try:
+            sql_rows = _all_cost_rows(uid, nm)
+            if sql_rows:
+                summary = _cost_summary_from_rows(sql_rows)
+        except Exception as e:
+            print(f"[AUTORUN-BATCH] cost rows failed ({nm}): {e}")
+        if summary is None:
+            try:
+                if file_exists(f"{uid}/{nm}/total_costs.json"):
+                    data = json.loads(read_file(f"{uid}/{nm}/total_costs.json"))
+                    summary = data.get("summary", data)
+            except Exception:
+                summary = None
+        if not summary:
+            cost_file = Path(f"/app/output/{uid}/{nm}/total_costs.json")
+            if cost_file.exists():
+                try:
+                    summary = (json.loads(cost_file.read_text()) or {}).get("summary", {})
+                except Exception:
+                    summary = None
+        cost = float((summary or {}).get("total_cost") or 0)
+        tokens = int((summary or {}).get("total_tokens") or 0)
+        projects[nm] = {"cost": cost, "tokens": tokens}
+        total["cost"] = round(total["cost"] + cost, 6)
+        total["tokens"] += tokens
+    return {"projects": projects, "total": total}
 
 
 @app.post("/autorun/batches/{batch_id}/retry")

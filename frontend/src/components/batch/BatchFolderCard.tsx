@@ -63,11 +63,12 @@ function stateChip(p: BatchProjectEntry): { label: string; cls: string } {
 interface BatchFolderCardProps {
   project: BatchProjectEntry
   steps?: BatchSteps
+  cost?: { cost: number; tokens: number }
   selected: boolean
   onClick: () => void
 }
 
-export function BatchFolderCard({ project, steps, selected, onClick }: BatchFolderCardProps) {
+export function BatchFolderCard({ project, steps, cost, selected, onClick }: BatchFolderCardProps) {
   const { name, state } = project
   const chip = stateChip(project)
   const isRunning = state === 'running'
@@ -104,8 +105,17 @@ export function BatchFolderCard({ project, steps, selected, onClick }: BatchFold
 
       <div className="flex items-center gap-2">
         <span className={`${CHIP_BASE} ${chip.cls}`}>{chip.label}</span>
-        {isDone && (
-          <span className="text-[9px] font-black uppercase tracking-widest text-primary inline-flex items-center gap-0.5">
+        {cost && cost.cost > 0 && (
+          <span
+            title="Estimated cost so far (Auto Run runs steps 1 · 2 · 6)"
+            className="ml-auto text-[10px] font-mono text-primary bg-primary/10 px-1.5 py-0.5 rounded border border-primary/20 tabular-nums"
+          >
+            ${cost.cost < 0.01 ? cost.cost.toFixed(4) : cost.cost.toFixed(2)}
+            {cost.tokens > 0 && ` · ${(cost.tokens / 1000).toFixed(1)}K tok`}
+          </span>
+        )}
+        {isDone && !cost && (
+          <span className="text-[9px] font-black uppercase tracking-widest text-primary inline-flex items-center gap-0.5 ml-auto">
             View results
             <span className="material-symbols-outlined text-[12px]">chevron_right</span>
           </span>

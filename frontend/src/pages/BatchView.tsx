@@ -1,7 +1,7 @@
 ﻿import { useEffect, useReducer, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { useBatchStore, batchActive } from '../store/batchStore'
-import { resumeBatch } from '../lib/api'
+import { resumeBatch, fetchBatchCosts, BatchCosts } from '../lib/api'
 import { BatchFolderCard } from '../components/batch/BatchFolderCard'
 import { BatchDetailPanel } from '../components/batch/BatchDetailPanel'
 
@@ -59,6 +59,21 @@ export function BatchView() {
   const [resuming, setResuming] = useState(false)
   const expandedAll = expandedProject === 'ALL'
 
+  // Batch costs: one aggregate request per project-set/state change (not per poll)
+  const [costs, setCosts] = useState<BatchCosts | null>(null)
+  const costsKey = manifest
+    ? JSON.stringify(manifest.projects.map(p => [p.name, p.state]))
+    : ''
+  useEffect(() => {
+    const m = useBatchStore.getState().manifest
+    if (!m) { setCosts(null); return }
+    let dead = false
+    fetchBatchCosts(m.batch_id)
+      .then(d => { if (!dead) setCosts(d) })
+      .catch(() => {})
+    return () => { dead = true }
+  }, [costsKey])
+
   const handleResume = async () => {
     if (resuming || !batchId) return
     setResuming(true)
@@ -106,6 +121,15 @@ export function BatchView() {
             <span className="material-symbols-outlined text-[20px]">{expandedAll ? 'collapse_all' : 'expand_all'}</span>
           </button>
         )}
+        {costs && costs.total.cost > 0 && (
+          <span
+            className="shrink-0 px-2.5 py-1 rounded-lg text-[10px] font-mono text-primary bg-primary/10 border border-primary/20 tabular-nums"
+            title="Batch total estimated cost (all PDFs, steps 1 · 2 · 6)"
+          >
+            ${costs.total.cost < 0.01 ? costs.total.cost.toFixed(4) : costs.total.cost.toFixed(2)}
+            {costs.total.tokens > 0 && ` · ${(costs.total.tokens / 1000).toFixed(1)}K tok`}
+          </span>
+        )}
         {chip && (
           <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-widest border ${chip.cls}`}>
             {active && <span className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />}
@@ -144,6 +168,7 @@ export function BatchView() {
               <BatchFolderCard
                 project={p}
                 steps={p.steps}
+                cost={costs?.projects?.[p.name]}
                 selected={expandedAll || expandedProject === p.name}
                 onClick={() => setExpandedProject(expandedProject === p.name ? null : p.name)}
               />

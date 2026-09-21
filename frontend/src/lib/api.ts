@@ -392,6 +392,23 @@ export async function resumeBatch(batchId: string): Promise<{ started: boolean }
   return { started: true }
 }
 
+// GET /autorun/batches/{batch_id}/costs — per-PDF + batch cost totals
+export interface BatchCosts {
+  projects: Record<string, { cost: number; tokens: number }>
+  total: { cost: number; tokens: number }
+}
+
+export async function fetchBatchCosts(batchId: string): Promise<BatchCosts> {
+  const res = await fetchWithRefresh(`${BASE}/autorun/batches/${encodeURIComponent(batchId)}/costs`, {
+    headers: { ...getAuthHeaders() },
+  })
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}))
+    throw new Error(errData.detail || 'Failed to load batch costs')
+  }
+  return res.json()
+}
+
 // POST /autorun/batches/{batch_id}/retry — re-run one PDF from its first not-done step
 export async function retryBatchPdf(batchId: string, project: string): Promise<{ queued: boolean }> {
   const res = await fetchWithRefresh(`${BASE}/autorun/batches/${encodeURIComponent(batchId)}/retry`, {
