@@ -423,6 +423,20 @@ export async function retryBatchPdf(batchId: string, project: string): Promise<{
   return res.json()
 }
 
+// GET /costs/all — usage across ALL projects (Costs button with no active project)
+export interface AllCosts {
+  projects: { name: string; origin?: string; cost: number; tokens: number }[]
+  total: { cost: number; tokens: number }
+}
+
+export async function fetchAllCosts(): Promise<AllCosts> {
+  const res = await fetchWithRefresh(`${BASE}/costs/all`, {
+    headers: { ...getAuthHeaders() },
+  })
+  if (!res.ok) throw new Error('Failed to load costs')
+  return res.json()
+}
+
 // GET /projects/{name}/costs
 export async function fetchCosts(projectName: string): Promise<any> {
   const res = await fetchWithRefresh(`${BASE}/projects/${encodeURIComponent(projectName)}/costs`, {

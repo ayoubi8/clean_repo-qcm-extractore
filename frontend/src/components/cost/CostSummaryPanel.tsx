@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { fetchCosts, saveCosts } from '../../lib/api'
+import { fetchCosts, saveCosts, fetchAllCosts, AllCosts } from '../../lib/api'
 import { CostSummary, ModelCost, StepCost } from '../../types'
 import { useAppStore } from '../../store/appStore'
 
@@ -25,9 +25,37 @@ function CostStepRow({ step, data }: { step: string, data: StepCost }) {
   )
 }
 
+function CostProjectRow({ p }: { p: { name: string; origin?: string; cost: number; tokens: number } }) {
+  return (
+    <div className="flex items-center gap-4 py-3 border-b border-outline-variant/10 text-sm">
+      <span className="flex-1 font-bold text-on-surface truncate flex items-center gap-2">
+        <span className="truncate">{p.name || '—'}</span>
+        {p.origin === 'autorun' && (
+          <span className="shrink-0 text-[8px] font-black uppercase tracking-wider text-on-secondary-container bg-secondary-container/60 px-1 py-0.5 rounded border border-secondary/30">
+            AUTO
+          </span>
+        )}
+      </span>
+      <span className="w-28 font-mono text-on-surface-variant text-[11px] text-right tabular-nums">
+        {p.tokens > 0 ? `${(p.tokens / 1000).toFixed(1)}K` : p.tokens}
+      </span>
+      <span className="w-24 font-mono text-primary font-bold text-right tabular-nums">
+        ${p.cost < 0.01 ? p.cost.toFixed(4) : p.cost.toFixed(2)}
+      </span>
+    </div>
+  )
+}
+
+/**
+ * Cost Summary drawer (TopBar "Costs" button):
+ * with an active project → per-model / per-step breakdown of THAT project;
+ * with NO active project (dashboard, batch view, fresh launch) → usage across
+ * ALL projects (AR_ auto-run rows tagged AUTO) via GET /costs/all.
+ */
 export function CostSummaryPanel({ onClose }: { onClose: () => void }) {
   const activeProject = useAppStore(s => s.activeProject)
   const [summary, setSummary] = useState<CostSummary | null>(null)
+  const [allSummary, setAllSummary] = useState<AllCosts | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
@@ -35,10 +63,18 @@ export function CostSummaryPanel({ onClose }: { onClose: () => void }) {
 
   useEffect(() => {
     async function load() {
-      if (!activeProject) return
+      setLoading(true)
+      setError(null)
+      setSummary(null)
+      setAllSummary(null)
       try {
-        const data = await fetchCosts(activeProject.name)
-        setSummary(data)
+        if (activeProject) {
+          const data = await fetchCosts(activeProject.name)
+          setSummary(data ?? null)
+        } else {
+          const data = await fetchAllCosts()
+          setAllSummary(data ?? null)
+        }
       } catch (e) {
         setError('Failed to load cost summary.')
       } finally {
@@ -65,11 +101,13 @@ export function CostSummaryPanel({ onClose }: { onClose: () => void }) {
     <>
       <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[60] animate-in fade-in duration-300" onClick={onClose} />
       <div className="fixed right-0 top-0 h-full w-[480px] z-[70] bg-surface-container flex flex-col shadow-2xl border-l border-outline-variant/10 animate-in slide-in-from-right duration-500 ease-out">
-        
+
         <div className="px-8 py-8 border-b border-outline-variant/10 flex items-center justify-between bg-surface-container-high/50">
           <div>
             <h2 className="text-2xl font-black text-on-surface tracking-tighter">Cost Summary</h2>
-            <p className="text-[11px] text-outline mt-1 font-bold uppercase tracking-widest opacity-60">Usage & Token Reporting</p>
+            <p className="text-[11px] text-outline mt-1 font-bold uppercase tracking-widest opacity-60">
+              {activeProject ? 'Usage & Token Reporting' : 'Usage across all projects'}
+            </p>
           </div>
           <button onClick={onClose} className="w-10 h-10 rounded-full hover:bg-surface-container-highest flex items-center justify-center transition-colors border border-outline-variant/10">
             <span className="material-symbols-outlined text-outline">close</span>
@@ -87,7 +125,7 @@ export function CostSummaryPanel({ onClose }: { onClose: () => void }) {
             <div className="p-6 bg-error-container/10 border border-error/20 rounded-xl text-center">
               <p className="text-error text-sm font-bold">{error}</p>
             </div>
-          ) : summary && (
+          ) : activeProject && summary ? (
             <>
               {/* Models Table */}
               <section className="space-y-4">
@@ -101,7 +139,7 @@ export function CostSummaryPanel({ onClose }: { onClose: () => void }) {
                   <span className="w-24 text-right">Compl.</span>
                   <span className="w-20 text-right">Cost</span>
                 </div>
-                {Object.entries(summary.per_model).map(([model, data]) => (
+                {Object.entries(summary.per_model ?? {}).map(([model, data]) => (
                   <CostModelRow key={model} model={model} data={data} />
                 ))}
               </section>
@@ -118,7 +156,7 @@ export function CostSummaryPanel({ onClose }: { onClose: () => void }) {
                   <span className="w-28 text-right">Tokens</span>
                   <span className="w-20 text-right">Cost</span>
                 </div>
-                {Object.entries(summary.per_step).map(([step, data]) => (
+                {Object.entries(summary.per_step ?? {}).map(([step, data]) => (
                   <CostStepRow key={step} step={step} data={data} />
                 ))}
               </section>
@@ -127,41 +165,87 @@ export function CostSummaryPanel({ onClose }: { onClose: () => void }) {
               <div className="bg-surface-container-lowest p-6 rounded-2xl border border-outline-variant/20 shadow-xl">
                 <div className="flex items-center justify-between mb-2">
                   <span className="text-xs font-black text-on-surface uppercase tracking-[0.2em]">TOTAL ESTIMATED</span>
-                  <span className="font-mono text-2xl font-black text-primary">${summary.total_cost.toFixed(4)}</span>
+                  <span className="font-mono text-2xl font-black text-primary">${(summary.total_cost ?? 0).toFixed(4)}</span>
                 </div>
                 <div className="flex items-center justify-between">
                   <span className="text-[10px] text-outline font-medium">TOTAL TOKENS PROCESSED</span>
-                  <span className="text-[10px] font-mono text-on-surface-variant">{summary.total_tokens.toLocaleString()} tokens</span>
+                  <span className="text-[10px] font-mono text-on-surface-variant">{(summary.total_tokens ?? 0).toLocaleString()} tokens</span>
                 </div>
               </div>
             </>
+          ) : !activeProject && allSummary ? (
+            <>
+              {/* All-projects table */}
+              <section className="space-y-4">
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="material-symbols-outlined text-primary text-sm">payments</span>
+                  <label className="text-[10px] uppercase tracking-widest text-outline font-black">
+                    Projects ({allSummary.projects.filter(p => p.cost > 0 || p.tokens > 0).length})
+                  </label>
+                </div>
+                <div className="flex items-center gap-4 pb-2 border-b-2 border-outline-variant/20 text-[9px] font-black uppercase tracking-widest text-outline">
+                  <span className="flex-1">Project</span>
+                  <span className="w-28 text-right">Tokens</span>
+                  <span className="w-24 text-right">Cost</span>
+                </div>
+                {allSummary.projects
+                  .filter(p => p.cost > 0 || p.tokens > 0)
+                  .map(p => <CostProjectRow key={p.name} p={p} />)}
+              </section>
+
+              {/* Total Footer */}
+              <div className="bg-surface-container-lowest p-6 rounded-2xl border border-outline-variant/20 shadow-xl">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs font-black text-on-surface uppercase tracking-[0.2em]">TOTAL ESTIMATED</span>
+                  <span className="font-mono text-2xl font-black text-primary">
+                    ${allSummary.total.cost < 0.01 ? allSummary.total.cost.toFixed(4) : allSummary.total.cost.toFixed(2)}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] text-outline font-medium">TOTAL TOKENS PROCESSED</span>
+                  <span className="text-[10px] font-mono text-on-surface-variant">
+                    {allSummary.total.tokens > 0 ? `${(allSummary.total.tokens / 1000).toFixed(1)}K` : allSummary.total.tokens} tokens
+                  </span>
+                </div>
+              </div>
+              <p className="text-outline text-[11px] text-center">
+                Select a project to see its per-step / per-model breakdown.
+              </p>
+            </>
+          ) : (
+            <div className="text-center py-10 text-outline">
+              <span className="material-symbols-outlined text-4xl block mb-3 opacity-30">payments</span>
+              <p className="text-sm font-bold text-on-surface">No usage recorded yet.</p>
+            </div>
           )}
         </div>
 
-        <div className="px-8 py-8 bg-surface-container-high/80 backdrop-blur-xl border-t border-outline-variant/10">
-          <button
-            id="btn-save-costs"
-            onClick={handleSave}
-            disabled={saving || !summary}
-            className={`w-full h-14 rounded-2xl font-black uppercase tracking-widest flex items-center justify-center gap-3 transition-all ${
-              savedPath 
-                ? 'bg-primary/10 text-primary border border-primary/20' 
-                : 'bg-surface-container-highest text-on-surface border border-outline-variant/20 hover:bg-surface-container-highest/80'
-            }`}
-          >
-            {saving ? (
-              <span className="material-symbols-outlined animate-spin">refresh</span>
-            ) : (
-              <span className="material-symbols-outlined">{savedPath ? 'check_circle' : 'save'}</span>
+        {activeProject && (
+          <div className="px-8 py-8 bg-surface-container-high/80 backdrop-blur-xl border-t border-outline-variant/10">
+            <button
+              id="btn-save-costs"
+              onClick={handleSave}
+              disabled={saving || !summary}
+              className={`w-full h-14 rounded-2xl font-black uppercase tracking-widest flex items-center justify-center gap-3 transition-all ${
+                savedPath
+                  ? 'bg-primary/10 text-primary border border-primary/20'
+                  : 'bg-surface-container-highest text-on-surface border border-outline-variant/20 hover:bg-surface-container-highest/80'
+              }`}
+            >
+              {saving ? (
+                <span className="material-symbols-outlined animate-spin">refresh</span>
+              ) : (
+                <span className="material-symbols-outlined">{savedPath ? 'check_circle' : 'save'}</span>
+              )}
+              {savedPath ? 'Saved to Project Folder' : 'Save to total_costs.json'}
+            </button>
+            {savedPath && (
+              <p className="text-[9px] font-mono text-outline mt-3 truncate text-center px-4">
+                {savedPath}
+              </p>
             )}
-            {savedPath ? 'Saved to Project Folder' : 'Save to total_costs.json'}
-          </button>
-          {savedPath && (
-            <p className="text-[9px] font-mono text-outline mt-3 truncate text-center px-4">
-              📄 {savedPath}
-            </p>
-          )}
-        </div>
+          </div>
+        )}
       </div>
     </>
   )

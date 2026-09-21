@@ -2990,6 +2990,74 @@ def save_project_costs(name: str, user: dict = Depends(get_current_user)):
 def get_all_weekly_costs(user: dict = Depends(get_current_user)):
     return get_weekly_costs(user["id"])
 
+
+@app.get("/costs/all")
+def get_all_costs(user: dict = Depends(get_current_user)):
+    """Usage across ALL the user's projects in ONE response (TopBar Costs
+    button outside a project context): name/origin/total_tokens from the SQL
+    projects table, per-project cost totals from the SQL costs table (one
+    chunked IN query). Falls back to the local total_costs.json blobs. """
+    projects_out: list = []
+    total = {"cost": 0.0, "tokens": 0}
+    try:
+        sb = get_supabase()
+        db_uid = get_db_user_id(user)
+        res = sb.table("projects").select("id,name,origin,total_tokens") \
+            .eq("user_id", db_uid).limit(300).execute()
+        rows = [r for r in (getattr(res, "data", None) or []) if r.get("id")]
+        costs_by_pid: dict = {}
+        ids = [r["id"] for r in rows]
+        for i in range(0, len(ids), 200):
+            try:
+                cr = sb.table("costs").select("project_id,cost_usd,tokens") \
+                    .in_("project_id", ids[i:i + 200]).execute()
+                for c in (getattr(cr, "data", None) or []):
+                    slot = costs_by_pid.setdefault(c.get("project_id"), {"cost": 0.0, "tokens": 0})
+                    slot["cost"] += float(c.get("cost_usd") or 0)
+                    slot["tokens"] += int(c.get("tokens") or 0)
+            except Exception as e:
+                print(f"[COSTS-ALL] chunked costs query failed: {e}")
+        for r in rows:
+            slot = costs_by_pid.get(r["id"]) or {}
+            cost = float(slot.get("cost") or 0)
+            tokens = int(slot.get("tokens") or 0)
+            db_tokens = r.get("total_tokens")
+            if tokens == 0 and db_tokens:
+                try:
+                    tokens = int(db_tokens)
+                except (TypeError, ValueError):
+                    tokens = 0
+            projects_out.append({"name": r.get("name", ""), "origin": r.get("origin") or "manual",
+                                 "cost": round(cost, 6), "tokens": tokens})
+            total["cost"] = round(total["cost"] + cost, 6)
+            total["tokens"] += tokens
+        return {"projects": projects_out, "total": total}
+    except Exception as e:
+        print(f"[COSTS-ALL] SQL path failed: {e} — local blob fallback")
+    # Fallback: local total_costs.json blobs (offline container case)
+    try:
+        base = Path(f"/app/output/{user['id']}")
+        if base.is_dir():
+            for d in sorted(base.iterdir()):
+                if not d.is_dir() or d.name.startswith(("_", ".", "global")):
+                    continue
+                cf = d / "total_costs.json"
+                if not cf.exists():
+                    continue
+                try:
+                    data = json.loads(cf.read_text())
+                    summary = data.get("summary", data)
+                    cost = float(summary.get("total_cost", 0) or 0)
+                    tokens = int(summary.get("total_tokens", 0) or 0)
+                except Exception:
+                    continue
+                projects_out.append({"name": d.name, "origin": "manual", "cost": cost, "tokens": tokens})
+                total["cost"] = round(total["cost"] + cost, 6)
+                total["tokens"] += tokens
+    except Exception as e:
+        print(f"[COSTS-ALL] local fallback failed: {e}")
+    return {"projects": projects_out, "total": total}
+
 # --- .env Endpoints ---
 
 @app.get("/env")
