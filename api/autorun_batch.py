@@ -725,7 +725,7 @@ def resume_interrupted_batches() -> int:
 # Batch history (Phase 3 — history-progress-cache plan)
 # ---------------------------------------------------------------------------
 
-def _batch_is_live(batch_id: str, projects: list) -> bool:
+def batch_is_live(batch_id: str, projects: list) -> bool:
     """True while the engine actually knows this batch: the parent batch task is
     running, or any of its projects has a live step (covers per-PDF retries of
     a batch whose parent task already exited)."""
@@ -733,6 +733,8 @@ def _batch_is_live(batch_id: str, projects: list) -> bool:
     if task and not task.done():
         return True
     return any(_project_busy(p.get("name", "")) for p in (projects or []))
+
+_batch_is_live = batch_is_live   # backwards-compatible alias
 
 
 def _batch_summary(uid: str, batch_id: str, m: dict) -> dict:

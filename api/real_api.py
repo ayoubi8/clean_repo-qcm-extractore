@@ -4363,11 +4363,20 @@ def autorun_batch_progress(batch_id: str, user: dict = Depends(get_current_user)
     the manifest is never written here. `write_errors` (failed manifest writes)
     rides along in the batch payload when persistence degrades.
     """
-    from autorun_batch import merge_live_status, read_manifest
+    from autorun_batch import merge_live_status, read_manifest, batch_is_live
     uid = user["id"]
     m = read_manifest(uid, batch_id)
     if not m:
         raise HTTPException(status_code=404, detail="Batch not found.")
+    merge_live_status(m)
+    # Phase 7 hardening: a manifest claiming running/pending while NO engine
+    # knows about the batch (crash mid-run, resume skipped) is a zombie —
+    # surfacing it as `interrupted` makes the frontend STOP polling forever
+    # and instead offer Resume; list_user_batches reports the same state.
+    if (m.get("state", "pending") in ("running", "pending")
+            and not batch_is_live(m.get("batch_id", batch_id), m.get("projects", []))):
+        m["state_was"] = m.get("state")
+        m["state"] = "interrupted"
     live = {}
     for p in m.get("projects", []):
         name = p.get("name", "")

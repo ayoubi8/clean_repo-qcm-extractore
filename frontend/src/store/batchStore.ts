@@ -66,9 +66,10 @@ export const useBatchStore = create<BatchStore>((set) => ({
   stopPolling: () => stopPolling(),
 }))
 
-/** True while any project in the batch is pending/running (keeps polling alive). */
+/** True while any project in the batch is pending/running (keeps polling alive).
+ *  `interrupted` (zombie reconciliation) intentionally forces polling OFF. */
 export function batchActive(manifest: BatchManifest | null): boolean {
-  if (!manifest) return false
+  if (!manifest || manifest.state === 'interrupted') return false
   return (manifest.projects ?? []).some(p => p.state === 'pending' || p.state === 'running') ||
     manifest.state === 'running' || manifest.state === 'pending'
 }
@@ -78,6 +79,18 @@ export function batchActive(manifest: BatchManifest | null): boolean {
 let pollTimer: number | null = null
 let pollTarget: string | null = null
 let failStreak = 0
+// Phase 7 hardening: when NOTHING in the manifest changes between successful
+// polls (e.g. a stuck/zombie batch the backend hasn't reconciled yet), slow
+// down instead of hammering every 3s: 6s → 12s → 30s → 60s cap. Any change
+// (or error) snaps back to the base cadence.
+let lastFingerprint = ''
+let unchangedStreak = 0
+
+function fingerprint(manifest: BatchManifest | null): string {
+  if (!manifest) return ''
+  return manifest.state + '|' + (manifest.projects ?? []).map(p =>
+    `${p.state}:${p.current_step ?? ''}:${JSON.stringify(p.steps ?? {})}`).join(',')
+}
 
 // Phase 6 — last-good snapshot per batchId so revisiting /batch/:id renders
 // instantly (the first poll replaces it). Module-level; cleared only naturally.
@@ -124,11 +137,22 @@ async function runTick() {
     return
   }
   failStreak = 0
+  const fp = fingerprint(s.manifest)
+  if (fp === lastFingerprint) {
+    unchangedStreak += 1
+  } else {
+    unchangedStreak = 0
+  }
+  lastFingerprint = fp
   if (!batchActive(s.manifest)) {
     stopPolling()                                      // terminal manifest state only
     return
   }
-  scheduleTick(POLL_INTERVAL_MS)
+  scheduleTick(unchangedStreak === 0 ? POLL_INTERVAL_MS : unchangedBackoffMs(unchangedStreak))
+}
+
+function unchangedBackoffMs(streak: number): number {
+  return Math.min(POLL_INTERVAL_MS * Math.pow(2, streak), 60000)
 }
 
 function startPolling(batchId: string) {
@@ -148,6 +172,8 @@ function startPolling(batchId: string) {
   clearTimer()
   pollTarget = batchId
   failStreak = 0
+  lastFingerprint = ''
+  unchangedStreak = 0
   scheduleTick(0)                                      // first tick fires immediately
 }
 

@@ -1,6 +1,7 @@
-﻿import { useEffect, useReducer } from 'react'
+﻿import { useEffect, useReducer, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { useBatchStore, batchActive } from '../store/batchStore'
+import { resumeBatch } from '../lib/api'
 import { BatchFolderCard } from '../components/batch/BatchFolderCard'
 import { BatchDetailPanel } from '../components/batch/BatchDetailPanel'
 
@@ -20,6 +21,7 @@ const STATE_CHIP: Record<string, { label: string; cls: string }> = {
   running:   { label: 'Running',         cls: 'bg-primary-container/20 text-primary border-primary/30' },
   done:      { label: 'Completed',       cls: 'bg-primary/10 text-primary border-primary/40' },
   done_with_errors: { label: 'Done with errors', cls: 'bg-secondary-container/20 text-secondary border-secondary/30' },
+  interrupted: { label: 'Interrupted',  cls: 'bg-secondary-container/20 text-secondary border-secondary/30' },
   error:     { label: 'Failed',          cls: 'bg-error-container/10 text-error border-error/30' },
 }
 
@@ -53,7 +55,22 @@ export function BatchView() {
 
   const active = batchActive(manifest)
   const reconnecting = !!error && !!manifest
+  const interrupted = manifest?.state === 'interrupted'
+  const [resuming, setResuming] = useState(false)
   const expandedAll = expandedProject === 'ALL'
+
+  const handleResume = async () => {
+    if (resuming || !batchId) return
+    setResuming(true)
+    try {
+      await resumeBatch(batchId)
+      useBatchStore.getState().startPolling(batchId)
+    } catch (e: any) {
+      alert(e?.message || 'Could not resume this batch')
+    } finally {
+      setResuming(false)
+    }
+  }
 
   const chip = manifest ? (STATE_CHIP[manifest.state] ?? { label: manifest.state, cls: 'bg-surface-container-high text-outline border-outline/10' }) : null
 
@@ -157,6 +174,25 @@ export function BatchView() {
           <span className="material-symbols-outlined text-[14px] animate-spin">progress_activity</span>
           Reconnecting — showing the last received update
         </p>
+      )}
+
+      {/* Interrupted (zombie reconciliation): offer Resume instead of polling */}
+      {interrupted && (
+        <div className="p-4 rounded-xl bg-secondary-container/10 border border-secondary/20 text-center max-w-lg mx-auto">
+          <span className="material-symbols-outlined text-secondary text-3xl block mb-2">pause_circle</span>
+          <p className="text-secondary text-sm font-bold">This batch was interrupted — some PDFs never finished.</p>
+          <button
+            id="btn-resume-interrupted"
+            onClick={handleResume}
+            disabled={resuming}
+            className="mt-3 px-4 py-2 rounded-xl bg-primary/10 border border-primary/30 text-primary text-[10px] font-black uppercase tracking-widest hover:bg-primary/20 disabled:opacity-40 inline-flex items-center gap-1.5 transition-all"
+          >
+            <span className={`material-symbols-outlined text-[14px] ${resuming ? 'animate-spin' : ''}`}>
+              {resuming ? 'progress_activity' : 'play_arrow'}
+            </span>
+            {resuming ? 'Resuming…' : 'Resume batch'}
+          </button>
+        </div>
       )}
     </div>
   )
