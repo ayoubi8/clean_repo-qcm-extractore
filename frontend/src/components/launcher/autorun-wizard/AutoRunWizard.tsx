@@ -1,7 +1,8 @@
 ﻿import { useState, useEffect, useRef, ChangeEvent } from 'react'
-import { scanDriveFolder, runBatch, createProject, uploadProjectPdf, fetchProjects, fetchBatches, resumeBatch } from '../../../lib/api'
+import { scanDriveFolder, runBatch, createProject, uploadProjectPdf, fetchProjects } from '../../../lib/api'
+import { BatchHistoryList } from '../../batch/BatchHistoryList'
 import { defaultWizardConfig, buildBatchConfig, WizardConfig, BatchConfigForm } from './BatchConfigForm'
-import { WizardFileEntry, Project, BatchSummary } from '../../../types'
+import { WizardFileEntry, Project } from '../../../types'
 
 /**
  * Auto Run wizard (plan docs/plans/autorun-batch-plan.md Â§3.2):
@@ -13,24 +14,6 @@ import { WizardFileEntry, Project, BatchSummary } from '../../../types'
 const MAX_FILES = 10 // matches MAX_AUTORUN_BATCH_FILES (resolved Q11)
 
 type Stage = 'source' | 'files' | 'config' | 'starting'
-
-// Phase 4 — batch history chip styles (mini mirror of BatchView STATE_CHIP)
-const HISTORY_CHIP: Record<string, { label: string; cls: string }> = {
-  done:             { label: 'Completed',  cls: 'text-primary border-primary/30 bg-primary/5' },
-  done_with_errors: { label: 'With errors', cls: 'text-secondary border-secondary/30 bg-secondary-container/10' },
-  running:          { label: 'Running',    cls: 'text-primary border-primary/40 bg-primary/10' },
-  interrupted:      { label: 'Interrupted', cls: 'text-secondary border-secondary/30 bg-secondary-container/20' },
-  error:            { label: 'Failed',     cls: 'text-error border-error/30 bg-error-container/10' },
-}
-
-const HISTORY_STEP = 20
-
-function shortDate(iso: string): string {
-  const d = iso ? new Date(iso) : null
-  return d && !isNaN(d.getTime())
-    ? d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
-    : iso
-}
 
 interface AutoRunWizardProps {
   onStarted: (batchId: string) => void
@@ -82,118 +65,6 @@ export function AutoRunWizard({ onStarted }: { onStarted: (batchId: string) => v
   const [uploadTotal, setUploadTotal] = useState(0)
   const [rowErrors, setRowErrors] = useState<Record<string, string>>({})
   const folderInputRef = useRef<HTMLInputElement>(null)
-
-  // Phase 4 — batch history ("Recent batches" block, open old auto-run sessions)
-  const [batches, setBatches] = useState<BatchSummary[] | null>(null)   // null = loading
-  const [batchLimit, setBatchLimit] = useState(HISTORY_STEP)
-  const [resuming, setResuming] = useState<string | null>(null)
-
-  const loadBatches = async (limit: number) => {
-    try {
-      const list = await fetchBatches(limit)
-      setBatches(list ?? [])
-    } catch {
-      setBatches([])                       // history is optional — hide the block on failure
-    }
-  }
-
-  useEffect(() => { loadBatches(batchLimit) }, [batchLimit])
-
-  const handleResume = async (batchId: string) => {
-    if (resuming) return
-    setResuming(batchId)
-    try {
-      await resumeBatch(batchId)
-      onStarted(batchId)                   // queued → open the batch cockpit
-    } catch (e: any) {
-      setError(e?.message ?? 'Could not resume this batch')
-    } finally {
-      setResuming(null)
-    }
-  }
-
-  const historyBlock = batches && (
-    <div className="space-y-2">
-      {batches.length > 0 ? (
-        <>
-          <div className="flex items-center justify-between px-1">
-            <span className="text-[10px] font-black uppercase tracking-[0.2em] text-outline">
-              Recent batches
-            </span>
-            <div className="flex items-center gap-1">
-              {batches.length >= batchLimit && (
-                <button
-                  id="btn-ar-history-more"
-                  onClick={() => setBatchLimit(l => l + HISTORY_STEP)}
-                  className="text-[10px] font-bold uppercase tracking-widest text-outline hover:text-primary transition-colors"
-                >
-                  Load more
-                </button>
-              )}
-              <button
-                id="btn-ar-history-refresh"
-                title="Refresh"
-                onClick={() => loadBatches(batchLimit)}
-                className="w-6 h-6 rounded-lg hover:bg-surface-container-highest flex items-center justify-center text-outline hover:text-primary transition-colors"
-              >
-                <span className="material-symbols-outlined text-[14px]">refresh</span>
-              </button>
-            </div>
-          </div>
-          <div className="space-y-2 max-h-[192px] overflow-y-auto custom-scrollbar pr-1">
-            {batches.map(b => {
-              const chip = HISTORY_CHIP[b.state] ?? { label: b.state, cls: 'text-outline border-outline-variant/20 bg-surface-container-low' }
-              const interrupted = b.state === 'interrupted'
-              return (
-                <div
-                  key={b.batch_id}
-                  onClick={() => onStarted(b.batch_id)}
-                  className="flex items-center gap-2.5 p-2.5 cursor-pointer rounded-xl border bg-surface-container-low border-outline-variant/10 hover:border-primary/40 transition-all"
-                >
-                  <span className={`material-symbols-outlined text-[16px] shrink-0 ${interrupted ? 'text-secondary' : 'text-primary'}`}>
-                    {b.state === 'done' ? 'task_alt' : b.state === 'interrupted' ? 'pause_circle' : 'rocket_launch'}
-                  </span>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-xs font-bold text-on-surface tracking-tight">
-                      {shortDate(b.created_at)}
-                      <span className="text-outline font-medium"> · {b.counts.total} PDF{b.counts.total > 1 ? 's' : ''}</span>
-                    </p>
-                    <p className="text-[10px] text-outline font-mono truncate mt-0.5">
-                      {b.preview_names.join(' · ')}
-                    </p>
-                  </div>
-                  <span className={`shrink-0 inline-flex items-center px-1.5 py-0.5 rounded border text-[9px] font-black uppercase tracking-wider ${chip.cls}`}>
-                    {chip.label}
-                  </span>
-                  {interrupted && (
-                    <button
-                      id={`btn-ar-resume-${b.batch_id}`}
-                      onClick={(e) => { e.stopPropagation(); handleResume(b.batch_id) }}
-                      disabled={resuming === b.batch_id}
-                      title="Re-launch this batch from its remaining PDFs"
-                      className={`shrink-0 inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[9px] font-black uppercase tracking-widest border transition-all ${
-                        resuming === b.batch_id
-                          ? 'bg-primary-container/30 text-primary border-primary/40'
-                          : 'bg-primary/10 border-primary/30 text-primary hover:bg-primary/20'
-                      }`}
-                    >
-                      <span className={`material-symbols-outlined text-[12px] ${resuming === b.batch_id ? 'animate-spin' : ''}`}>
-                        {resuming === b.batch_id ? 'progress_activity' : 'play_arrow'}
-                      </span>
-                      Resume
-                    </button>
-                  )}
-                  <span className="material-symbols-outlined text-[14px] text-outline shrink-0">chevron_right</span>
-                </div>
-              )
-            })}
-          </div>
-        </>
-      ) : (
-        <p className="text-[10px] text-outline/60 text-center">No past batches yet.</p>
-      )}
-    </div>
-  )
 
   const selCount = entries.filter(e => e.selected).length
 
@@ -348,7 +219,7 @@ export function AutoRunWizard({ onStarted }: { onStarted: (batchId: string) => v
       {/* â”€â”€ Stage 1 Â· Source â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
       {stage === 'source' && (
         <div className="space-y-5 animate-in fade-in duration-300">
-          {historyBlock}
+          <BatchHistoryList onOpenBatch={onStarted} />
           <div className="flex gap-2">
             {([
               { id: 'drive', label: 'Drive folder link', icon: 'add_link' },

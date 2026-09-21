@@ -373,13 +373,19 @@ running→done auto-refresh, `removeCachedFile` on delete. `npm run build` green
 
 ---
 
-### Phase 7 · Regression, build, push
+### Phase 7 · Regression, build, push — **DONE 2026-09-20 (commit `05c6275`)**
 
 - Backend tests (below) + `npm run build` green.
 - Push targets (unchanged from session-resume-autorun-batch.md §4): `git push space main`
   (HF backend) · git-archive → frontend repo → Vercel.
 - Operator checklist: `.env.example` / HF secrets gain `STEP_CACHE_TTL=180`; migration for 4b
   only if scheduled.
+
+_Done 2026-09-20: tests F1–F16 green · `npm run build` green (114 modules) · committed and
+pushed: `space` (HF backend `5a95cf4..05c6275`, Docker rebuild), frontend mirror commit
+`e96614a` → `frontend-repo` (Vercel auto-deploy), full-repo backup `origin` synced
+(`da3633d..05c6275`). HF secrets: add `STEP_CACHE_TTL=180` (deploy also works on the code
+default without it)._
 
 ---
 

@@ -893,6 +893,61 @@ def _test_f17_batch_costs():
         print("OK F17 — per-PDF aggregation, zero fallback, batch total, 404.")
 
 
+def _test_f18_storage_fallback_listing():
+    """Regression for the broken flat-listing Storage fallback: after a HF Space
+    rebuild (empty local FS) the manifold must still surface Storage-only
+    batches — list("") returns only top-level `{uid}` folder entries, so the
+    traversal must recurse per-user `_batches`."""
+    print("\n--- F18: Storage-only batch listing after FS wipe (flat-listing fix) ---")
+    tmp = Path(tempfile.mkdtemp())
+
+    def fake_list_files(prefix):
+        if prefix == "":
+            return [{"name": f"{UID.strip('_')}", "id": None},
+                    {"name": "_logs", "id": None},
+                    {"name": "token.pkl", "id": "f1"}]
+        if prefix == f"{UID.strip('_')}/_batches":
+            return [{"name": "batch-storage-only", "id": None},
+                    {"name": "batch_eaten/batch.json", "id": "f2"}]
+        return []
+
+    import storage_client
+    mem: dict = {}   # fake bucket
+
+    def fake_write(path, content):
+        mem[path] = content
+
+    def fake_read(path):
+        if path not in mem:
+            raise FileNotFoundError(path)
+        return mem[path]
+
+    with patch.object(ab, "OUTPUT_ROOT", tmp), \
+         patch.object(storage_client, "list_files", side_effect=fake_list_files), \
+         patch.object(storage_client, "write_file", side_effect=fake_write), \
+         patch.object(storage_client, "read_file", side_effect=fake_read):
+        # Synthetic storage-only manifest (no local copy on disk)
+        uid = UID.strip("_")
+        manifest = {
+            "batch_id": "batch-storage-only", "created_at": "2026-09-20T10:00:00Z",
+            "updated_at": "2026-09-20T10:00:00Z", "source": "drive", "state": "done",
+            "projects": [{"name": "AR_x", "state": "done"}],
+        }
+        storage_client.write_file(
+            f"{uid}/_batches/batch-storage-only/batch.json",
+            json.dumps(manifest),
+        )
+        rows = ab.list_user_batches(uid)
+        assert any(r["batch_id"] == "batch-storage-only" for r in rows), rows
+        # local FS re-hydration happened
+        assert (tmp / uid / "_batches" / "batch-storage-only" / "batch.json").exists()
+        # _iterate_manifests must also see it (startup auto-resume path)
+        found = [((u, b)) for u, b, _m in ab._iterate_manifests()
+                 if u == uid and b == "batch-storage-only"]
+        assert found, list(ab._iterate_manifests())
+    print("OK F18 — storage-only batches listed + re-hydrated (list_user_batches + iterate).")
+
+
 def _test_f4_single_file_regressions():
     print("\n--- F4: single-file import regressions ---")
     try:
@@ -923,6 +978,7 @@ def _run_all():
     _test_f15_write_errors()
     _test_f16_step_cache()
     _test_f17_batch_costs()
+    _test_f18_storage_fallback_listing()
     print("\n" + "=" * 60)
     print("ALL AUTORUN-BATCH TESTS PASSED (Phases 0-5 coverage)")
     print("=" * 60)

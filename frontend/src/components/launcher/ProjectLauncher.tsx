@@ -104,7 +104,7 @@ export function ProjectLauncher() {
         {/* Body */}
         <div className="p-10">
           {tab === 'new'     && <NewProjectModal onSuccess={handleSuccess} />}
-          {tab === 'resume'  && <ResumeProjectModal onSuccess={handleSuccess} />}
+          {tab === 'resume'  && <ResumeProjectModal onSuccess={handleSuccess} onOpenBatch={handleBatchStarted} />}
           {tab === 'autorun' && <AutoRunWizard onStarted={handleBatchStarted} />}
         </div>
       </div>

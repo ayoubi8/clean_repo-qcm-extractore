@@ -85,6 +85,59 @@ def new_batch_id() -> str:
     return f"batch-{stamp}-{uuid.uuid4().hex[:6]}"
 
 
+def _storage_batch_ids(uid: str) -> list:
+    """Batch_ids seen in Storage under `{uid}/_batches` (Supabase list is FLAT —
+    a root-level `list("")` only returns the top-level `{uid}` folder entry, so
+    the old `parts == 3` matching never fired. Correct traversal: list the
+    per-user `_batches` folder → each entry IS a batch folder name."""
+    try:
+        from storage_client import list_files
+        items = list_files(f"{uid}/_batches") or []
+    except Exception as e:
+        print(f"[AUTORUN-BATCH] Storage batch listing failed ({uid}): {e}")
+        return []
+    ids = []
+    for it in items:
+        name = str(it.get("name", "")).strip("/")
+        if not name or "/" in name:
+            continue
+        if it.get("id"):            # a file, not a folder — skip
+            continue
+        ids.append(name.split("/")[-1])
+    return ids
+
+
+def _storage_uids() -> list:
+    """Top-level `{uid}` folder entries in Storage (flat root listing)."""
+    try:
+        from storage_client import list_files
+        items = list_files("") or []
+    except Exception as e:
+        print(f"[AUTORUN-BATCH] Storage root listing failed: {e}")
+        return []
+    uids = []
+    for it in items:
+        name = str(it.get("name", "")).strip("/")
+        if not name or "/" in name or it.get("id"):
+            continue
+        if name.startswith("_") or name.startswith("."):
+            continue
+        uids.append(name)
+    return uids
+
+
+def _hydrate_local(uid: str, batch_id: str, m: dict) -> None:
+    """A manifest that only existed in Storage gets re-written to the local FS
+    (best-effort) so subsequent reads don't re-hit Storage after a FS wipe."""
+    try:
+        local = _bdir(uid, batch_id) / MANIFEST_NAME
+        local.parent.mkdir(parents=True, exist_ok=True)
+        if not local.exists():
+            local.write_text(json.dumps(m, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        print(f"[AUTORUN-BATCH] local re-hydration failed ({batch_id}): {e}")
+
+
 def write_manifest(uid: str, manifest: dict) -> None:
     """Dual-write the manifest: local FS + Supabase Storage (same as project.json).
 
@@ -678,19 +731,17 @@ def _iterate_manifests():
                 if m:
                     seen.add((uid_dir.name, bd.name))
                     yield uid_dir.name, bd.name, m
-    # Storage-only manifests (local FS wiped after a container restart)
-    try:
-        from storage_client import list_files
-        for it in list_files(""):
-            name = str(it.get("name", ""))
-            parts = name.split("/")
-            if len(parts) == 3 and parts[1] == "_batches" and \
-                    (parts[0], parts[2]) not in seen:
-                m = read_manifest(parts[0], parts[2])
-                if m:
-                    yield parts[0], parts[2], m
-    except Exception as e:
-        print(f"[AUTORUN-BATCH] Storage manifest scan failed: {e}")
+    # Storage-only manifests (local FS wiped after a container restart).
+    # Supabase list("") is a FLAT root listing — recurse per-user folder instead.
+    for suid in _storage_uids():
+        for bid in _storage_batch_ids(suid):
+            if (suid, bid) in seen:
+                continue
+            m = read_manifest(suid, bid)
+            if m:
+                seen.add((suid, bid))
+                _hydrate_local(suid, bid, m)
+                yield suid, bid, m
 
 
 def resume_interrupted_batches() -> int:
@@ -787,20 +838,16 @@ def list_user_batches(uid: str, limit: int = 20) -> list:
                         rows.append(_batch_summary(uid, bd.name, m))
     except OSError as e:
         print(f"[AUTORUN-BATCH] local batch listing failed ({uid}): {e}")
-    # Storage-only manifests
-    try:
-        from storage_client import list_files
-        for it in list_files(""):
-            name = str(it.get("name", ""))
-            parts = name.split("/")
-            if len(parts) == 3 and parts[0] == uid and parts[1] == "_batches" \
-                    and parts[2] not in seen:
-                m = read_manifest(uid, parts[2])
-                if m:
-                    seen.add(parts[2])
-                    rows.append(_batch_summary(uid, parts[2], m))
-    except Exception as e:
-        print(f"[AUTORUN-BATCH] Storage batch listing failed ({uid}): {e}")
+    # Storage-only manifests (correct flat-listing traversal — see
+    # _storage_batch_ids; the old `list("") + parts==3` check never matched).
+    for bid in _storage_batch_ids(uid):
+        if bid in seen:
+            continue
+        m = read_manifest(uid, bid)
+        if m:
+            seen.add(bid)
+            _hydrate_local(uid, bid, m)
+            rows.append(_batch_summary(uid, bid, m))
     rows.sort(key=lambda r: r.get("created_at") or "", reverse=True)
     try:
         limit = max(1, min(int(limit), 50))

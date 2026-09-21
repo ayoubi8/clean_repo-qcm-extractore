@@ -2,12 +2,14 @@ import { useState, useEffect } from 'react'
 import { fetchProjects, deleteProject } from '../../lib/api'
 import { Project } from '../../types'
 import { formatRelative } from '../../lib/format'
+import { BatchHistoryList } from '../batch/BatchHistoryList'
 
 interface ResumeProjectModalProps {
   onSuccess: (project: Project) => void
+  onOpenBatch: (batchId: string) => void
 }
 
-export function ResumeProjectModal({ onSuccess }: ResumeProjectModalProps) {
+export function ResumeProjectModal({ onSuccess, onOpenBatch }: ResumeProjectModalProps) {
   const [projects, setProjects] = useState<Project[]>([])
   const [selected, setSelected] = useState<Project | null>(null)
   const [loading, setLoading] = useState(true)
@@ -76,16 +78,20 @@ export function ResumeProjectModal({ onSuccess }: ResumeProjectModalProps) {
 
   if (projects.length === 0) {
     return (
-      <div className="text-center py-8 text-outline">
-        <span className="material-symbols-outlined text-5xl block mb-4 opacity-20">folder_off</span>
-        <p className="text-sm font-bold text-on-surface">No existing projects found.</p>
-        <p className="text-xs mt-1">Start a new extraction project to see it here.</p>
+      <div className="space-y-6">
+        <BatchHistoryList onOpenBatch={onOpenBatch} />
+        <div className="text-center py-8 text-outline">
+          <span className="material-symbols-outlined text-5xl block mb-4 opacity-20">folder_off</span>
+          <p className="text-sm font-bold text-on-surface">No existing projects found.</p>
+          <p className="text-xs mt-1">Start a new extraction project to see it here.</p>
+        </div>
       </div>
     )
   }
 
   return (
     <div className="space-y-6">
+      <BatchHistoryList onOpenBatch={onOpenBatch} />
       <div className="space-y-2 max-h-[320px] overflow-y-auto pr-2 custom-scrollbar">
         {projects.map((project) => {
           const isSelected = selected?.name === project.name
