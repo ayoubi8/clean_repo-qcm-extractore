@@ -815,6 +815,7 @@ def _batch_summary(uid: str, batch_id: str, m: dict) -> dict:
         "counts": counts,
         "preview_names": names,
         "write_errors": int(m.get("write_errors") or 0),
+        "tags": m.get("tags") if isinstance(m.get("tags"), list) else [],
     }
 
 

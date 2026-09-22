@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, DragEvent } from 'react'
 import { createProject, uploadProjectPdf, importPdfFromDrive } from '../../lib/api'
-import { Project } from '../../types'
+import { Project, TagEntry } from '../../types'
+import { TagSelector, hasRegionSelection } from '../tags/TagSelector'
 
 interface NewProjectModalProps {
   onSuccess: (project: Project) => void
@@ -17,6 +18,8 @@ export function NewProjectModal({ onSuccess }: NewProjectModalProps) {
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
   const [isDragOver, setIsDragOver] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  // Tags & Search plan — region required, module optional
+  const [tags, setTags] = useState<TagEntry[]>([])
 
   // ── Drive link import (additive — file mode is untouched) ──
   const [mode, setMode] = useState<Mode>('file')
@@ -62,6 +65,9 @@ export function NewProjectModal({ onSuccess }: NewProjectModalProps) {
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault()
     if (mode === 'file' && (!file || !projectName)) return
+    if (!hasRegionSelection(tags)) return           // forced region tag
+    const region_tag = tags.find(t => t.key === 'region')?.value
+    const module_tag = tags.find(t => t.key === 'module')?.value
 
     if (mode === 'file') {
       setStage('uploading')
@@ -75,7 +81,7 @@ export function NewProjectModal({ onSuccess }: NewProjectModalProps) {
       if (mode === 'file') {
         // File flow (unchanged): create project (name auto-derived from the
         // file name in the field below) → upload → run pipeline as always.
-        const project = await createProject({ name: projectName, pdf_path: '' })
+        const project = await createProject({ name: projectName, pdf_path: '', region_tag, module_tag })
         const uploaded = await uploadProjectPdf(projectName, file!, (pct) => {
           setUploadPct(pct)
         })
@@ -85,7 +91,7 @@ export function NewProjectModal({ onSuccess }: NewProjectModalProps) {
         // Drive flow: ONE call — the project is created server-side and named
         // after the Drive PDF's own filename. No name input needed.
         setStage('importing')
-        const imported = await importPdfFromDrive(driveLink.trim())
+        const imported = await importPdfFromDrive(driveLink.trim(), { region_tag, module_tag })
         setStage('done')
         onSuccess({
           name: imported.name,
@@ -102,7 +108,8 @@ export function NewProjectModal({ onSuccess }: NewProjectModalProps) {
   }
 
   const isReady = stage === 'pick' &&
-    (mode === 'link' ? driveLink.trim().length > 0 : (file !== null && projectName.length > 0))
+    (mode === 'link' ? driveLink.trim().length > 0 : (file !== null && projectName.length > 0)) &&
+    hasRegionSelection(tags)
 
   const busy = stage === 'uploading' || stage === 'importing'
 
@@ -230,6 +237,11 @@ export function NewProjectModal({ onSuccess }: NewProjectModalProps) {
             Auto-derived from filename. You can edit it.
           </p>
         </div>
+      )}
+
+      {/* Tags — region REQUIRED, module optional (tags-search plan) */}
+      {stage === 'pick' && (
+        <TagSelector tags={tags} onChange={setTags} />
       )}
 
       {/* Upload Progress (file mode) */}

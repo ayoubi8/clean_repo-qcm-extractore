@@ -1,4 +1,6 @@
 // Maps to ProjectContext.list_projects() output + stub_api.py MOCK_PROJECTS shape
+export interface TagEntry { key: 'region' | 'module'; value: string }
+
 export interface Project {
   name: string;          // = folder name under output/
   last_step: number;     // 0–8, maps to tracker.current_step
@@ -6,6 +8,7 @@ export interface Project {
   total_tokens: number;  // from cost_tracker.total_tokens
   pdf_path: string;      // absolute path to source PDF — persisted in project.json
   origin?: 'manual' | 'autorun'; // 'autorun' = created by an Auto Run batch (AR_ prefix) — drives the Resume AUTO badge
+  tags?: TagEntry[];     // region (required) + module (optional) — tags-search plan
 }
 
 // ── Auto Run Batch (plan docs/plans/autorun-batch-plan.md) ─────────────────
@@ -72,6 +75,7 @@ export interface BatchManifest {
   state: string
   config_snapshot: AutoRunBatchConfig
   projects: BatchProjectEntry[]
+  tags?: TagEntry[]
 }
 
 // Phase 3/4 — batch history row (GET /autorun/batches)
@@ -86,6 +90,7 @@ export interface BatchSummary {
   counts: BatchSummaryCounts
   preview_names: string[]
   write_errors?: number
+  tags?: TagEntry[]
 }
 
 // Wizard-stage entry (local folder file or Drive scan result + assigned AR_ name)
@@ -304,7 +309,9 @@ export interface AppState {
   activeProject: Project | null;
   pipelineStatus: 'idle' | 'running';
   isLauncherOpen: boolean;
+  lastActiveProject?: Project | null;
   setActiveProject: (p: Project | null) => void;
   setPipelineStatus: (s: 'idle' | 'running') => void;
   setLauncherOpen: (v: boolean) => void;
+  closeLauncherRestoringSession?: () => void;
 }

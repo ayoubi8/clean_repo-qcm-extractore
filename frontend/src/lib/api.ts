@@ -101,9 +101,11 @@ export async function deleteProject(name: string): Promise<void> {
 
 // POST /projects
 export async function createProject(payload: {
-  name: string
-  pdf_path: string
-}): Promise<Project> {
+    name: string
+    pdf_path: string
+    region_tag?: string
+    module_tag?: string
+  }): Promise<Project> {
   const res = await fetchWithRefresh(`${BASE}/projects`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
@@ -118,12 +120,13 @@ export async function createProject(payload: {
 // anonymous). The project is created automatically and NAMED AFTER the Drive
 // PDF's own filename — no name is sent from the UI.
 export async function importPdfFromDrive(
-  link: string
+  link: string,
+  opts?: { region_tag?: string; module_tag?: string }
 ): Promise<{ name: string; pdf_path: string; size_bytes: number }> {
   const res = await fetchWithRefresh(`${BASE}/pdf-from-drive`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
-    body: JSON.stringify({ link }),
+    body: JSON.stringify({ link, ...opts }),
   })
   if (!res.ok) {
     const errData = await res.json().catch(() => ({}))
@@ -331,11 +334,13 @@ export async function scanDriveFolder(folderLink: string): Promise<DriveFolderSc
 // upload mode: project_names (frontend already created + uploaded each project).
 // drive mode: drive_files (backend creates + downloads inside the batch task).
 export async function runBatch(payload: {
-  source: BatchSource
-  drive_files?: DriveFileEntry[]
-  project_names?: string[]
-  config: AutoRunBatchConfig
-}): Promise<{ batch_id: string; projects: { name: string }[] }> {
+    source: BatchSource
+    drive_files?: DriveFileEntry[]
+    project_names?: string[]
+    config: AutoRunBatchConfig
+    region_tag?: string
+    module_tag?: string
+  }): Promise<{ batch_id: string; projects: { name: string }[] }> {
   const res = await fetchWithRefresh(`${BASE}/autorun/batch/start`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
@@ -558,6 +563,37 @@ export async function fetchStepModels(): Promise<any> {
   })
   if (!res.ok) throw new Error('Failed to fetch step models')
   return res.json()
+}
+
+// ── Tags (tags-search-session-preserve-plan) ───────────────────────────────
+
+export interface EnvTags {
+  region: { key: 'region'; value: string; label: string; color: string }[]
+  modules: string[]
+}
+
+// GET /env/tags — region vocabulary + the user's saved module tags
+export async function fetchEnvTags(): Promise<EnvTags> {
+  const res = await fetchWithRefresh(`${BASE}/env/tags`, { headers: { ...getAuthHeaders() } })
+  return res.json()
+}
+
+// POST /tags/modules/{name} — persist a module tag for reuse
+export async function addModuleTag(name: string): Promise<void> {
+  const res = await fetchWithRefresh(`${BASE}/tags/modules/${encodeURIComponent(name)}`, {
+    method: 'POST',
+    headers: { ...getAuthHeaders() },
+  })
+  if (!res.ok) throw new Error('Failed to save the module tag')
+}
+
+// DELETE /tags/modules/{name}
+export async function deleteModuleTag(name: string): Promise<void> {
+  const res = await fetchWithRefresh(`${BASE}/tags/modules/${encodeURIComponent(name)}`, {
+    method: 'DELETE',
+    headers: { ...getAuthHeaders() },
+  })
+  if (!res.ok) throw new Error('Failed to delete the module tag')
 }
 
 // GET /projects/{name}/steps/{step_id}/output

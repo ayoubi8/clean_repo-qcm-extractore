@@ -607,6 +607,12 @@ def create_project(body: dict, user: dict = Depends(get_current_user)):
     name = body.get("name")
     if not name:
         raise HTTPException(status_code=400, detail="Project name required")
+    # Tags & Search plan: region tag is REQUIRED for every new project.
+    from tags import build_tags, probe_tags_column
+    try:
+        project_tags = build_tags(body)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     get_or_create(name, user["id"])
 
     pdf_path = body.get("pdf_path", "")
@@ -629,14 +635,18 @@ def create_project(body: dict, user: dict = Depends(get_current_user)):
         try:
             sb = get_supabase()
             db_uid = get_db_user_id(user)
-            sb.table("projects").upsert({
+            row = {
                 "user_id": db_uid,
                 "name": name,
                 "pdf_storage_path": pdf_path,
                 "last_activity_at": datetime.utcnow().isoformat(),
                 "total_tokens": 0,
                 "tokens_synced": True,
-            }, on_conflict="user_id,name").execute()
+            }
+            if probe_tags_column(sb, "projects"):
+                row["tags"] = project_tags
+            sb.table("projects").upsert(
+                        row, on_conflict="user_id,name").execute()
             registered = True
             break
         except Exception as e:
@@ -1050,8 +1060,13 @@ def import_pdf_from_drive(body: dict, user: dict = Depends(get_current_user)):
               f"{len(content)} bytes)")
 
         # Same project-creation logic as POST /projects (route function reused;
-        # body shape is identical to what the frontend sends for a manual create)
-        project = create_project({"name": project_name, "pdf_path": ""}, user)
+        # body shape is identical to what the frontend sends for a manual create;
+        # region/module tags ride along — forced for every new project).
+        project = create_project({
+            "name": project_name, "pdf_path": "",
+            "region_tag": (body or {}).get("region_tag"),
+            "module_tag": (body or {}).get("module_tag"),
+        }, user)
         stored = _store_pdf_bytes(user, project_name, content, display_name or project_name)
         print(f"[GDRIVE] import ok → project '{project_name}'")
         return {
@@ -3148,6 +3163,47 @@ def get_step_models(user: dict = Depends(get_current_user)):
         },
     }
 
+
+# --- Tags (tags-search-session-preserve-plan) ---
+
+@app.get("/env/tags")
+def get_env_tags(user: dict = Depends(get_current_user)):
+    """Tag vocabulary: fixed region tags (with colors) + the user's module tags."""
+    from tags import REGION_TAGS
+    try:
+        sb = get_supabase()
+        res = sb.table("module_tags").select("name").eq("user_id", get_db_user_id(user)).execute()
+        modules = sorted({r.get("name", "") for r in (getattr(res, "data", None) or []) if r.get("name")})
+    except Exception as e:
+        print(f"[TAGS] module_tags list failed: {e}")
+        modules = []
+    return {"region": REGION_TAGS, "modules": modules}
+
+
+@app.post("/tags/modules/{name}")
+def add_module_tag(name: str, user: dict = Depends(get_current_user)):
+    clean = name.strip()[:60].lower()
+    if not clean:
+        raise HTTPException(status_code=400, detail="Module tag name required.")
+    try:
+        sb = get_supabase()
+        sb.table("module_tags").upsert(
+            {"user_id": get_db_user_id(user), "name": clean},
+            on_conflict="user_id,name").execute()
+    except Exception as e:
+        print(f"[TAGS] module_tags upsert failed: {e}")
+    return {"name": clean, "saved": True}
+
+
+@app.delete("/tags/modules/{name}")
+def delete_module_tag(name: str, user: dict = Depends(get_current_user)):
+    try:
+        sb = get_supabase()
+        sb.table("module_tags").delete().eq("user_id", get_db_user_id(user)).eq("name", name).execute()
+    except Exception as e:
+        print(f"[TAGS] module_tags delete failed: {e}")
+    return {"deleted": True}
+
 # --- Batch Config + Template Endpoints ---
 
 @app.get("/config/batch")
@@ -4394,6 +4450,13 @@ async def autorun_batch_start(body: dict, user: dict = Depends(get_current_user)
         raise HTTPException(status_code=400, detail="source must be 'drive' or 'upload'.")
 
     batch_id = autorun_new_batch_id()
+    # Tags & Search plan: region tag is REQUIRED for every new batch (the tag
+    # applies to the batch AND every AR_ project it creates).
+    from tags import build_tags
+    try:
+        batch_tags = build_tags(body)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     from autorun_batch import write_manifest
     from datetime import datetime, timezone as _tz
     manifest = {
@@ -4402,9 +4465,26 @@ async def autorun_batch_start(body: dict, user: dict = Depends(get_current_user)
         "source": source,
         "state": "pending",
         "config_snapshot": cfg,
+        "tags": batch_tags,
         "projects": projects,
     }
     write_manifest(uid, manifest)
+    # Best-effort SQL mirror (Plan Phase C — powers future SQL-first history).
+    try:
+        sb = get_supabase()
+        sb.table("batches").upsert({
+            "batch_id": batch_id,
+            "user_id": get_db_user_id(user),
+            "created_at": manifest["created_at"],
+            "updated_at": manifest.get("updated_at") or manifest["created_at"],
+            "state": "pending",
+            "source": source,
+            "counts": {"total": len(projects)},
+            "preview_names": [p["name"] for p in projects][:4],
+            "tags": batch_tags,
+        }, on_conflict="batch_id").execute()
+    except Exception as e:
+        print(f"[DB] batches mirror upsert failed ({batch_id}): {e}")
     if not autorun_run_batch_task(uid, batch_id):
         raise HTTPException(status_code=500, detail="Failed to start the batch task.")
     return {"batch_id": batch_id, "projects": [{"name": p["name"]} for p in projects]}

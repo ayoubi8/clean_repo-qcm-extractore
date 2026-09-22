@@ -2,7 +2,8 @@
 import { scanDriveFolder, runBatch, createProject, uploadProjectPdf, fetchProjects } from '../../../lib/api'
 import { BatchHistoryList } from '../../batch/BatchHistoryList'
 import { defaultWizardConfig, buildBatchConfig, WizardConfig, BatchConfigForm } from './BatchConfigForm'
-import { WizardFileEntry, Project } from '../../../types'
+import { WizardFileEntry, Project, TagEntry } from '../../../types'
+import { hasRegionSelection } from '../../tags/TagSelector'
 
 /**
  * Auto Run wizard (plan docs/plans/autorun-batch-plan.md Â§3.2):
@@ -61,6 +62,8 @@ export function AutoRunWizard({ onStarted }: { onStarted: (batchId: string) => v
   const [error, setError] = useState<string | null>(null)
   const [config, setConfig] = useState<WizardConfig>(defaultWizardConfig())
   const [starting, setStarting] = useState(false)
+  // Tags & Search plan — region required, module optional (applies to the batch AND its AR_ projects)
+  const [tags, setTags] = useState<TagEntry[]>([])
   const [uploadDone, setUploadDone] = useState(0)
   const [uploadTotal, setUploadTotal] = useState(0)
   const [rowErrors, setRowErrors] = useState<Record<string, string>>({})
@@ -141,6 +144,12 @@ export function AutoRunWizard({ onStarted }: { onStarted: (batchId: string) => v
 
   async function handleStart() {
     setError(null)
+    if (!hasRegionSelection(tags)) {
+      setError('Select a wilaya tag before starting the batch.')
+      return
+    }
+    const region_tag = tags.find(t => t.key === 'region')?.value
+    const module_tag = tags.find(t => t.key === 'module')?.value
     setStarting(true)
     const selected = entries.filter(e => e.selected)
     try {
@@ -154,7 +163,7 @@ export function AutoRunWizard({ onStarted }: { onStarted: (batchId: string) => v
         let done = 0
         await runPool(usable, 3, async (e) => {
           try {
-            await createProject({ name: e.ar_name, pdf_path: '' })
+            await createProject({ name: e.ar_name, pdf_path: '', region_tag, module_tag })
             await uploadProjectPdf(e.ar_name, e.file!, () => {})
             names.push(e.ar_name)
           } catch (err: any) {
@@ -173,6 +182,8 @@ export function AutoRunWizard({ onStarted }: { onStarted: (batchId: string) => v
           source: 'upload',
           project_names: names,
           config: buildBatchConfig(config),
+          region_tag,
+          module_tag,
         })
         batchId = batch_id
       } else {
@@ -182,6 +193,8 @@ export function AutoRunWizard({ onStarted }: { onStarted: (batchId: string) => v
             file_id: e.drive_file_id!, name: e.display_name,
           })),
           config: buildBatchConfig(config),
+          region_tag,
+          module_tag,
         })
         batchId = batch_id
       }
@@ -375,7 +388,7 @@ export function AutoRunWizard({ onStarted }: { onStarted: (batchId: string) => v
       {/* â”€â”€ Stage 3 Â· Config â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
       {stage === 'config' && (
         <div className="space-y-5 animate-in fade-in duration-300">
-          <BatchConfigForm config={config} onChange={updateConfig} />
+          <BatchConfigForm config={config} onChange={updateConfig} tags={tags} onTagsChange={setTags} />
 
           <div className="flex gap-2">
             <button
@@ -388,7 +401,7 @@ export function AutoRunWizard({ onStarted }: { onStarted: (batchId: string) => v
             <button
               id="btn-ar-start-batch"
               onClick={handleStart}
-              disabled={starting || selCount === 0}
+              disabled={starting || selCount === 0 || !hasRegionSelection(tags)}
               className="flex-1 py-3.5 bg-gradient-to-r from-primary to-primary-container text-on-primary font-black uppercase tracking-widest rounded-2xl flex items-center justify-center gap-3 hover:shadow-[0_8px_30px_rgba(76,215,246,0.4)] hover:scale-[1.01] transition-all disabled:opacity-30 disabled:grayscale"
             >
               {starting ? (

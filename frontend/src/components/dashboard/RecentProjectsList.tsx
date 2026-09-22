@@ -1,7 +1,11 @@
+import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAppStore } from '../../store/appStore'
-import { Project } from '../../types'
+import { Project, TagEntry } from '../../types'
 import { formatRelative } from '../../lib/format'
+import { filterBySearchTags } from '../../lib/tags'
+import { SearchBar } from '../tags/SearchBar'
+import { TagChip } from '../tags/TagChip'
 
 interface RecentProjectsListProps {
   projects: Project[]
@@ -11,6 +15,9 @@ interface RecentProjectsListProps {
 export function RecentProjectsList({ projects, loading }: RecentProjectsListProps) {
   const setActiveProject = useAppStore(s => s.setActiveProject)
   const navigate = useNavigate()
+  const [query, setQuery] = useState('')
+  const [activeTags, setActiveTags] = useState<TagEntry[]>([])
+  const [searchOpen, setSearchOpen] = useState(false)
 
   if (loading) {
     return (
@@ -24,7 +31,8 @@ export function RecentProjectsList({ projects, loading }: RecentProjectsListProp
   }
 
   const ts = (p: Project) => p.last_modified ? new Date(p.last_modified).getTime() : 0
-  const recent = [...projects]
+  const filtered = filterBySearchTags(projects, query, activeTags)
+  const recent = [...filtered]
     .sort((a, b) => ts(b) - ts(a))
     .slice(0, 5)
 
@@ -34,8 +42,30 @@ export function RecentProjectsList({ projects, loading }: RecentProjectsListProp
         <p className="text-[10px] uppercase tracking-widest text-outline font-black">
           Recent Projects
         </p>
-        <span className="text-[9px] font-mono text-outline opacity-40 uppercase tracking-widest">Showing last 5</span>
+        <button
+          id="recent-projects-search-toggle"
+          onClick={() => setSearchOpen(o => !o)}
+          title="Search by name or tag"
+          className="w-6 h-6 rounded-lg hover:bg-surface-container-highest flex items-center justify-center text-outline hover:text-primary transition-colors"
+        >
+          <span className="material-symbols-outlined text-[14px]">search</span>
+        </button>
       </div>
+
+      {searchOpen && (
+        <div className="mb-6">
+          <SearchBar
+            query={query}
+            onQueryChange={setQuery}
+            activeTags={activeTags}
+            onToggleTag={(t: TagEntry) => setActiveTags(prev =>
+              prev.some(x => x.key === t.key && x.value === t.value)
+                ? prev.filter(x => !(x.key === t.key && x.value === t.value))
+                : [...prev, t])}
+            onClear={() => { setQuery(''); setActiveTags([]) }}
+          />
+        </div>
+      )}
 
       {recent.length === 0 ? (
         <div className="py-12 flex flex-col items-center justify-center opacity-30 border-2 border-dashed border-outline-variant/10 rounded-2xl">
@@ -59,9 +89,14 @@ export function RecentProjectsList({ projects, loading }: RecentProjectsListProp
                   <span className="material-symbols-outlined text-outline group-hover:text-primary transition-colors">description</span>
                 </div>
                 <div>
-                  <p className="text-sm font-black text-on-surface group-hover:text-primary transition-colors truncate max-w-[320px] tracking-tight">
-                    {proj.name}
-                  </p>
+                  <div className="flex items-center gap-2">
+                    <p className="text-sm font-black text-on-surface group-hover:text-primary transition-colors truncate max-w-[320px] tracking-tight">
+                      {proj.name}
+                    </p>
+                    {(proj.tags ?? []).slice(0, 2).map((t, i) => (
+                      <TagChip key={i} tag={t} />
+                    ))}
+                  </div>
                   <p className="text-[10px] text-outline mt-0.5 font-medium uppercase tracking-widest opacity-60">
                     Step {(proj.last_step === 4 || proj.last_step === 5) ? 3 : proj.last_step}/8 · {formatRelative(proj.last_modified)}
                   </p>

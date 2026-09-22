@@ -37,6 +37,7 @@ export function ProjectLauncher() {
   const [autorunEnabled, setAutorunEnabled] = useState<boolean | null>(null)
   const setActiveProject = useAppStore((s) => s.setActiveProject)
   const setLauncherOpen = useAppStore((s) => s.setLauncherOpen)
+  const closeLauncherRestoringSession = useAppStore((s) => s.closeLauncherRestoringSession)
   const activeProject = useAppStore((s) => s.activeProject)
   const navigate = useNavigate()
 
@@ -65,12 +66,11 @@ export function ProjectLauncher() {
       {/* Dialog */}
       <div className="bg-surface-container w-full max-w-[520px] rounded-2xl shadow-2xl border border-outline-variant/20 overflow-hidden animate-in fade-in zoom-in duration-300 relative">
 
-        {/* Close Button */}
+        {/* Close Button — restores the prior session instead of a blank dashboard */}
         <button
           id="btn-close-launcher"
           onClick={() => {
-            setLauncherOpen(false)
-            if (!activeProject) navigate('/')
+            closeLauncherRestoringSession()
           }}
           className="absolute top-4 right-4 w-8 h-8 rounded-full hover:bg-surface-container-highest flex items-center justify-center text-outline transition-colors z-10"
         >

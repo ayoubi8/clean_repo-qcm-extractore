@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useStepModels } from '../../../hooks/useStepModels'
-import { MetaStrategy, MetaFieldConfig, AutoRunBatchConfig } from '../../../types'
+import { MetaStrategy, MetaFieldConfig, AutoRunBatchConfig, TagEntry } from '../../../types'
+import { TagSelector } from '../../tags/TagSelector'
 
 /**
  * Auto Run batch — one config for ALL PDFs (plan docs/plans/autorun-batch-plan.md §3.2).
@@ -468,13 +469,20 @@ function Step6Section({ config, onChange, models, loading }: SectionProps) {
   )
 }
 
-export function BatchConfigForm({ config, onChange }: {
+export function BatchConfigForm({ config, onChange, tags, onTagsChange }: {
   config: WizardConfig
   onChange: (c: Partial<WizardConfig>) => void
+  tags: TagEntry[]
+  onTagsChange: (tags: TagEntry[]) => void
 }) {
   const { models, loading } = useStepModels()
   return (
     <div className="space-y-10 animate-in fade-in slide-in-from-bottom-2 duration-300">
+      {/* Tags & Search plan — required wilaya + optional module */}
+      <div>
+        <TagSelector tags={tags} onChange={onTagsChange} />
+      </div>
+      <div className="border-t border-outline-variant/10 pt-6" />
       <Step1Section config={config} onChange={onChange} models={models} loading={loading} />
       <div className="border-t border-outline-variant/10 pt-6" />
       <Step2Section config={config} onChange={onChange} models={models} loading={loading} />

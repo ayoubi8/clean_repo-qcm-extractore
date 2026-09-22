@@ -132,3 +132,35 @@ ALTER TABLE reference_databases ENABLE ROW LEVEL SECURITY;
 -- Note: Frontend never touches Supabase directly, all access goes through FastAPI 
 -- which uses the service role key (bypasses RLS). 
 -- This keeps the backend as the single source of truth.
+
+
+-- TAGS & SEARCH (tags-search-session-preserve-plan)
+-- Region tag is REQUIRED for every new project/batch: oran | mosta | tlemcen.
+-- Module tag is optional free text. Shape: [{"key":"region","value":"oran"}, ...]
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS tags JSONB DEFAULT '[]';
+
+-- BATCHES table (also feeds the SQL-first history listing — Plan §Phase C).
+CREATE TABLE IF NOT EXISTS batches (
+    batch_id      TEXT PRIMARY KEY,
+    user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at    TIMESTAMPTZ DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ DEFAULT NOW(),
+    state         TEXT DEFAULT 'pending',
+    source        TEXT DEFAULT 'drive',
+    counts        JSONB DEFAULT '{}',
+    preview_names JSONB DEFAULT '[]',
+    tags          JSONB DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS batches_user_created_idx
+    ON batches (user_id, created_at DESC);
+ALTER TABLE batches ENABLE ROW LEVEL SECURITY;
+
+-- MODULE_TAGS: optional course-module names for tagging (user editable via API).
+CREATE TABLE IF NOT EXISTS module_tags (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name       TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(user_id, name)
+);
+ALTER TABLE module_tags ENABLE ROW LEVEL SECURITY;

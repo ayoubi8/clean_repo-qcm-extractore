@@ -1,8 +1,11 @@
 import { useState, useEffect } from 'react'
 import { fetchProjects, deleteProject } from '../../lib/api'
-import { Project } from '../../types'
+import { Project, TagEntry } from '../../types'
 import { formatRelative } from '../../lib/format'
 import { BatchHistoryList } from '../batch/BatchHistoryList'
+import { SearchBar } from '../tags/SearchBar'
+import { TagChip } from '../tags/TagChip'
+import { filterBySearchTags } from '../../lib/tags'
 
 interface ResumeProjectModalProps {
   onSuccess: (project: Project) => void
@@ -16,6 +19,11 @@ export function ResumeProjectModal({ onSuccess, onOpenBatch }: ResumeProjectModa
   const [error, setError] = useState<string | null>(null)
   const [deletingName, setDeletingName] = useState<string | null>(null)
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
+  // Tags & Search plan — one filter drives projects + batch history rows
+  const [query, setQuery] = useState('')
+  const [activeTags, setActiveTags] = useState<TagEntry[]>([])
+
+  const visibleProjects = filterBySearchTags(projects, query, activeTags)
 
   useEffect(() => {
     load()
@@ -56,6 +64,15 @@ export function ResumeProjectModal({ onSuccess, onOpenBatch }: ResumeProjectModa
     }
   }
 
+  const searchProps = {
+    query, onQueryChange: setQuery, activeTags,
+    onToggleTag: (t: TagEntry) => setActiveTags(prev =>
+      prev.some(x => x.key === t.key && x.value === t.value)
+        ? prev.filter(x => !(x.key === t.key && x.value === t.value))
+        : [...prev, t]),
+    onClear: () => { setQuery(''); setActiveTags([]) },
+  }
+
   if (loading) {
     return (
       <div className="space-y-3">
@@ -77,9 +94,11 @@ export function ResumeProjectModal({ onSuccess, onOpenBatch }: ResumeProjectModa
   }
 
   if (projects.length === 0) {
+    const searchProps0 = searchProps
     return (
       <div className="space-y-6">
-        <BatchHistoryList onOpenBatch={onOpenBatch} />
+        <SearchBar {...searchProps0} />
+        <BatchHistoryList onOpenBatch={onOpenBatch} query={query} activeTags={activeTags} />
         <div className="text-center py-8 text-outline">
           <span className="material-symbols-outlined text-5xl block mb-4 opacity-20">folder_off</span>
           <p className="text-sm font-bold text-on-surface">No existing projects found.</p>
@@ -89,11 +108,21 @@ export function ResumeProjectModal({ onSuccess, onOpenBatch }: ResumeProjectModa
     )
   }
 
+  const emptyFiltered = visibleProjects.length === 0 && (query || activeTags.length > 0)
+
   return (
     <div className="space-y-6">
-      <BatchHistoryList onOpenBatch={onOpenBatch} />
+      <SearchBar {...searchProps} />
+      <BatchHistoryList onOpenBatch={onOpenBatch} query={query} activeTags={activeTags} />
+      {emptyFiltered ? (
+        <div className="text-center py-8 text-outline">
+          <span className="material-symbols-outlined text-5xl block mb-4 opacity-20">search_off</span>
+          <p className="text-sm font-bold text-on-surface">No matches.</p>
+          <p className="text-xs mt-1">Try a different name or clear the tag filters.</p>
+        </div>
+      ) : (
       <div className="space-y-2 max-h-[320px] overflow-y-auto pr-2 custom-scrollbar">
-        {projects.map((project) => {
+        {visibleProjects.map((project) => {
           const isSelected = selected?.name === project.name
           const isDeleting = deletingName === project.name
           const isConfirming = confirmDelete === project.name
@@ -124,6 +153,9 @@ export function ResumeProjectModal({ onSuccess, onOpenBatch }: ResumeProjectModa
                       AUTO
                     </span>
                   )}
+                  {(project.tags ?? []).map((t, i) => (
+                    <TagChip key={i} tag={t} clickable onClick={() => searchProps.onToggleTag(t)} />
+                  ))}
                 </div>
                 <p className="text-[11px] text-outline mt-0.5 font-medium">
                   Step {(project.last_step === 4 || project.last_step === 5) ? 3 : project.last_step} / 8 · {formatRelative(project.last_modified)}
@@ -165,6 +197,7 @@ export function ResumeProjectModal({ onSuccess, onOpenBatch }: ResumeProjectModa
           )
         })}
       </div>
+      )}
 
       {/* Error toast */}
       {error && (
