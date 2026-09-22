@@ -226,7 +226,7 @@ export function AutoRunWizard({ onStarted }: { onStarted: (batchId: string) => v
   )
 
   return (
-    <div className="max-h-[72vh] overflow-y-auto custom-scrollbar space-y-5 pr-1">
+    <div className="space-y-5">
       {stepper}
 
       {/* â”€â”€ Stage 1 Â· Source â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}

@@ -96,7 +96,7 @@ export function BatchHistoryList({ onOpenBatch, query = '', activeTags = [] }: B
           </button>
         </div>
       </div>
-      <div className="space-y-2 max-h-[192px] overflow-y-auto custom-scrollbar pr-1">
+      <div className="space-y-2 max-h-[240px] overflow-y-auto custom-scrollbar pr-1">
         {visible.map(b => {
           const chip = HISTORY_CHIP[b.state] ?? { label: b.state, cls: 'text-outline border-outline-variant/20 bg-surface-container-low' }
           const interrupted = b.state === 'interrupted'

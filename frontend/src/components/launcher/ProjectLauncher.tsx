@@ -63,8 +63,9 @@ export function ProjectLauncher() {
 
   return (
     <div className="fixed inset-0 bg-black/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
-      {/* Dialog */}
-      <div className="bg-surface-container w-full max-w-[520px] rounded-2xl shadow-2xl border border-outline-variant/20 overflow-hidden animate-in fade-in zoom-in duration-300 relative">
+      {/* Dialog — capped to the viewport; ONLY the body scrolls so the
+          close button + tabs stay reachable on tall content (Resume Project) */}
+      <div className="bg-surface-container w-full max-w-[520px] max-h-[92vh] rounded-2xl shadow-2xl border border-outline-variant/20 overflow-hidden animate-in fade-in zoom-in duration-300 relative flex flex-col">
 
         {/* Close Button — restores the prior session instead of a blank dashboard */}
         <button
@@ -78,7 +79,7 @@ export function ProjectLauncher() {
         </button>
 
         {/* Tab switcher */}
-        <div className={`flex border-b border-outline-variant/10 pr-12 ${showAutorunTab ? '' : ''}`}>
+        <div className={`flex border-b border-outline-variant/10 pr-12 shrink-0 ${showAutorunTab ? '' : ''}`}>
           <TabButton
             id="tab-new-project"
             active={tab === 'new'}
@@ -101,11 +102,13 @@ export function ProjectLauncher() {
           )}
         </div>
 
-        {/* Body */}
-        <div className="p-10">
-          {tab === 'new'     && <NewProjectModal onSuccess={handleSuccess} />}
-          {tab === 'resume'  && <ResumeProjectModal onSuccess={handleSuccess} onOpenBatch={handleBatchStarted} />}
-          {tab === 'autorun' && <AutoRunWizard onStarted={handleBatchStarted} />}
+        {/* Body — scrolls independently */}
+        <div className="overflow-y-auto custom-scrollbar flex-1 min-h-0">
+          <div className="p-10">
+            {tab === 'new'     && <NewProjectModal onSuccess={handleSuccess} />}
+            {tab === 'resume'  && <ResumeProjectModal onSuccess={handleSuccess} onOpenBatch={handleBatchStarted} />}
+            {tab === 'autorun' && <AutoRunWizard onStarted={handleBatchStarted} />}
+          </div>
         </div>
       </div>
     </div>
