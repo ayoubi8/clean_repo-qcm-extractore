@@ -10,6 +10,8 @@ export function TagSelector({ tags, onChange }: {
   tags: TagEntry[]            // the current selection (region required)
   onChange: (tags: TagEntry[]) => void
 }) {
+  const region = tags.find(t => t.key === 'region')?.value ?? ''
+  const moduleTag = tags.find(t => t.key === 'module')?.value ?? ''
   const [env, setEnv] = useState<EnvTags | null>(null)
   const [moduleDraft, setModuleDraft] = useState(moduleTag)
 
@@ -19,10 +21,7 @@ export function TagSelector({ tags, onChange }: {
 
   useEffect(() => { setModuleDraft(moduleTag) }, [moduleTag])
 
-  const region = tags.find(t => t.key === 'region')?.value ?? ''
-  const moduleTag = tags.find(t => t.key === 'module')?.value ?? ''
   const modules = env?.modules ?? []
-  const isRegionPicked = !!region
 
   function pickRegion(value: string) {
     const next = tags.filter(t => t.key !== 'region')
