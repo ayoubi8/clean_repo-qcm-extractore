@@ -145,12 +145,24 @@ export function ResumeProjectModal({ onSuccess, onOpenBatch }: ResumeProjectModa
                     {project.name}
                   </p>
                   {project.origin === 'autorun' && (
-                    <span
-                      title="Created by Auto Run batch"
-                      className="shrink-0 inline-flex items-center gap-1 text-[9px] font-black uppercase tracking-wider text-on-secondary-container bg-secondary-container/60 px-1.5 py-0.5 rounded border border-secondary/30"
+                    <span className="shrink-0 inline-flex items-center">
+                    <button
+                      type="button"
+                      title={project.batch_id
+                        ? 'Click to open this project\'s Auto Run batch'
+                        : 'Created by an old Auto Run batch (batch link not recorded)'}
+                      disabled={!project.batch_id}
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        if (project.batch_id) onOpenBatch(project.batch_id)
+                      }}
+                      className={`inline-flex items-center gap-1 text-[9px] font-black uppercase tracking-wider text-on-secondary-container bg-secondary-container/60 px-1.5 py-0.5 rounded border border-secondary/30 ${
+                        project.batch_id ? 'cursor-pointer hover:brightness-125' : 'cursor-default'
+                      }`}
                     >
                       <span className="material-symbols-outlined text-[12px] leading-none">rocket_launch</span>
                       AUTO
+                    </button>
                     </span>
                   )}
                   {(project.tags ?? []).map((t, i) => (

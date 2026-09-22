@@ -206,6 +206,15 @@ def _mutate_manifest(uid: str, batch_id: str, apply) -> Optional[dict]:
 
 def _set_batch_state(uid: str, batch_id: str, state: str) -> None:
     _mutate_manifest(uid, batch_id, lambda m: m.__setitem__("state", state))
+    # SQL mirror keeps the `batches` row current (best-effort, Phase C/4b)
+    try:
+        from supabase_client import get_supabase
+        from auth import get_db_user_id
+        get_supabase().table("batches").update(
+            {"state": state, "updated_at": _now_iso()}
+        ).eq("batch_id", batch_id).execute()
+    except Exception:
+        pass
 
 
 def _mutate_project(uid: str, batch_id: str, project_name: str, state: str,
@@ -540,11 +549,28 @@ def _mark_project_autorun(uid: str, name: str, batch_id: str) -> None:
     try:
         from supabase_client import get_supabase
         from auth import get_db_user_id
-        get_supabase().table("projects").update({"origin": "autorun"}) \
+        get_supabase().table("projects").update(
+            {"origin": "autorun", "batch_id": batch_id}) \
             .eq("user_id", get_db_user_id({"id": uid})).eq("name", name).execute()
     except Exception as e:
         print(f"[AUTORUN-BATCH] origin DB update skipped ({name}): {e}")
     invalidate_projects_cache(uid)
+
+
+def link_projects_to_batch(uid: str, batch_id: str, names: list) -> None:
+    """Phase 4b best-effort: stamp `projects.batch_id` on already-registered
+    rows (upload-mode projects exist before the batch starts)."""
+    if not names:
+        return
+    try:
+        from supabase_client import get_supabase
+        from auth import get_db_user_id, is_missing_column_error
+        db_uid = get_db_user_id({"id": uid})
+        sb = get_supabase()
+        sb.table("projects").update({"batch_id": batch_id}) \
+          .in_("name", names).eq("user_id", db_uid).execute()
+    except Exception as e:
+        print(f"[AUTORUN-BATCH] batch_id stamp failed ({batch_id}): {e}")
 
 
 # ---------------------------------------------------------------------------

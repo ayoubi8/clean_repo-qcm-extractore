@@ -93,6 +93,17 @@ export function RecentProjectsList({ projects, loading }: RecentProjectsListProp
                     <p className="text-sm font-black text-on-surface group-hover:text-primary transition-colors truncate max-w-[320px] tracking-tight">
                       {proj.name}
                     </p>
+                    {proj.origin === 'autorun' && proj.batch_id && (
+                      <button
+                        type="button"
+                        title="Open the Auto Run batch that created this project"
+                        onClick={(e) => { e.stopPropagation(); navigate(`/batch/${proj.batch_id}`) }}
+                        className="shrink-0 inline-flex items-center gap-1 text-[9px] font-black uppercase tracking-wider text-on-secondary-container bg-secondary-container/60 px-1.5 py-0.5 rounded border border-secondary/30 hover:brightness-125"
+                      >
+                        <span className="material-symbols-outlined text-[12px] leading-none">rocket_launch</span>
+                        AUTO
+                      </button>
+                    )}
                     {(proj.tags ?? []).slice(0, 2).map((t, i) => (
                       <TagChip key={i} tag={t} />
                     ))}

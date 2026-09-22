@@ -8,6 +8,7 @@ export interface Project {
   total_tokens: number;  // from cost_tracker.total_tokens
   pdf_path: string;      // absolute path to source PDF — persisted in project.json
   origin?: 'manual' | 'autorun'; // 'autorun' = created by an Auto Run batch (AR_ prefix) — drives the Resume AUTO badge
+  batch_id?: string;     // Phase 4b — parent batch; AUTO badge deep-links to /batch/:id
   tags?: TagEntry[];     // region (required) + module (optional) — tags-search plan
 }
 

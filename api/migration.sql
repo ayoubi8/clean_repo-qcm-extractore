@@ -139,6 +139,9 @@ ALTER TABLE reference_databases ENABLE ROW LEVEL SECURITY;
 -- Module tag is optional free text. Shape: [{"key":"region","value":"oran"}, ...]
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS tags JSONB DEFAULT '[]';
 
+-- PHASE 4b — clickable AUTO badge: which batch created this project.
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS batch_id TEXT;
+
 -- BATCHES table (also feeds the SQL-first history listing — Plan §Phase C).
 CREATE TABLE IF NOT EXISTS batches (
     batch_id      TEXT PRIMARY KEY,

@@ -184,7 +184,7 @@ def _select_project_rows(sb, db_uid: str, cols: list) -> list:
             return getattr(q.execute(), "data", None) or []
         except Exception as e:
             dropped = False
-            for c in ("total_tokens", "last_activity_at", "origin", "tags"):
+            for c in ("total_tokens", "last_activity_at", "origin", "tags", "batch_id"):
                 if c in cols and _is_missing_column_error(e, c):
                     cols.remove(c)
                     print(f"[list_projects] column projects.{c} missing — retrying without it (run api/migration.sql)")
@@ -233,7 +233,7 @@ def _compute_projects(email: str) -> list:
         db_uid = get_db_user_id({"id": email})
         db_projects = _select_project_rows(
             sb, db_uid,
-            ["id", "name", "created_at", "last_activity_at", "pdf_storage_path", "total_tokens", "origin", "tags"],
+            ["id", "name", "created_at", "last_activity_at", "pdf_storage_path", "total_tokens", "origin", "tags", "batch_id"],
         )
     except Exception as e:
         print(f"[list_projects] DB query failed: {e}")
@@ -330,6 +330,7 @@ def _compute_projects(email: str) -> list:
             "pdf_path": pdf_path,
             "origin": row.get("origin") or "manual",
             "tags": row.get("tags") if isinstance(row.get("tags"), list) else [],
+            "batch_id": row.get("batch_id") or "",
         })
 
     # 2. Self-heal merge: discover any project in Storage missing from the

@@ -4470,6 +4470,10 @@ async def autorun_batch_start(body: dict, user: dict = Depends(get_current_user)
     }
     write_manifest(uid, manifest)
     # Best-effort SQL mirror (Plan Phase C — powers future SQL-first history).
+    # Phase 4b: also stamp batch_id onto the projects rows so the frontend
+    # AUTO badge can deep-link to the parent batch. Driver projects created
+    # later by the batch task get the stamp right after their row appears
+    # (see _set_batch_state / manifest mount in autorun_batch).
     try:
         sb = get_supabase()
         sb.table("batches").upsert({
@@ -4483,6 +4487,8 @@ async def autorun_batch_start(body: dict, user: dict = Depends(get_current_user)
             "preview_names": [p["name"] for p in projects][:4],
             "tags": batch_tags,
         }, on_conflict="batch_id").execute()
+        from autorun_batch import link_projects_to_batch
+        link_projects_to_batch(uid, batch_id, [p["name"] for p in projects])
     except Exception as e:
         print(f"[DB] batches mirror upsert failed ({batch_id}): {e}")
     if not autorun_run_batch_task(uid, batch_id):
