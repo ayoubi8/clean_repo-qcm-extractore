@@ -29,7 +29,8 @@ load_dotenv(override=False)
 # Setup path to include the root /app (so modules can be imported)
 sys.path.insert(0, "/app")
 
-from job_manager import job_manager
+from job_manager import job_manager, job_project
+from modules.utils import run_env
 from log_capture import LogCapture
 import step_cache
 from autorun_batch import (batch_enabled as autorun_batch_enabled,
@@ -49,7 +50,7 @@ from project_manager import (get_or_create, list_projects, step_output_exists,
                               _is_missing_column_error)
 from env_manager import read_env, mask, write_env_keys, EDITABLE_KEYS
 from auth import (get_current_user, require_admin, load_users,
-                     find_user_by_email, hash_password, verify_password, rehash_if_legacy,
+                     find_user_by_email, find_user_by_id, hash_password, verify_password, rehash_if_legacy,
                      create_access_token, add_user, update_user_field, delete_user,
                      check_rate_limit,
                      create_refresh_token, verify_and_rotate_refresh_token, revoke_all_refresh_tokens,
@@ -587,13 +588,26 @@ def get_user_projects(uid: str, admin: dict = Depends(require_admin)):
     
     return {"projects": sorted(projects, key=lambda p: p["last_modified"], reverse=True)}
 
-def _apply_user_env(user: dict):
-    key = user.get("api_key", "")
-    if key:
-        os.environ["GEMINI_API_KEY"] = key
-        os.environ["OPENAI_API_KEY"] = key
-        os.environ["ANTHROPIC_API_KEY"] = key
-        os.environ["OPENROUTER_API_KEY"] = key
+def _user_run_env(user_id: str) -> dict:
+    """Per-run config overlay seeded with the user's OWN API key.
+
+    Replaces the old _apply_user_env, which wrote the key into the
+    process-global os.environ: with two runs in flight, one user's steps
+    could bill another user's key, and a user without a key silently used
+    the last key written. Now the key lives only in this run's overlay
+    (modules.utils.run_env); users without their own key use the server key
+    from .env / Settings.
+    """
+    try:
+        rec = find_user_by_email(ADMIN_EMAIL) if user_id == "admin" else find_user_by_id(user_id)
+    except Exception as e:
+        print(f"[RUN-ENV] user lookup failed for {user_id}: {e}")
+        rec = None
+    key = ((rec or {}).get("api_key") or "").strip()
+    if not key:
+        return {}
+    return {"OPENROUTER_API_KEY": key, "GEMINI_API_KEY": key,
+            "OPENAI_API_KEY": key, "ANTHROPIC_API_KEY": key}
 
 
 # --- Project Endpoints ---
@@ -2126,11 +2140,11 @@ async def run_step(name: str, step_id: str, body: dict, user: dict = Depends(get
     # invisible cascade after Step 2 succeeds (see run_post_step2_metadata).
     if str(step_id) == "3":
         raise HTTPException(status_code=410, detail="Step 3 is no longer a standalone step. It runs automatically after Step 2 succeeds. Call POST /projects/{name}/steps/2/run instead.")
-    if job_manager.is_running(name, step_id):
+    _jp = job_project(user["id"], name)
+    if job_manager.is_running(_jp, step_id):
         return {"error": "Step already running"}
 
-    _apply_user_env(user)
-    _step_start_time[f"{name}-{step_id}"] = time.time()
+    _step_start_time[f"{_jp}-{step_id}"] = time.time()
 
     # Bump last_activity_at in DB
     try:
@@ -2142,8 +2156,8 @@ async def run_step(name: str, step_id: str, body: dict, user: dict = Depends(get
 
     # Pass the config body to the task
     task = asyncio.ensure_future(_run_step_task(name, user["id"], step_id, body))
-    job_manager.set_running(name, step_id, task)
-    _job_user_ids[job_manager.key(name, step_id)] = user["id"]
+    job_manager.set_running(_jp, step_id, task)
+    _job_user_ids[job_manager.key(_jp, step_id)] = user["id"]
     return {"job_id": f"{name}-{step_id}-001"}
 
 
@@ -2152,10 +2166,11 @@ async def stop_step(name: str, step_id: str, body: dict = None, user: dict = Dep
     """Gracefully stop a running step while preserving partial outputs."""
     body = body or {}
     mode = "cancelled" if body.get("mode") == "cancel" else "stopped"
-    owner = _job_user_ids.get(job_manager.key(name, step_id))
+    _jp = job_project(user["id"], name)
+    owner = _job_user_ids.get(job_manager.key(_jp, step_id))
     if owner and owner != user["id"]:
         raise HTTPException(status_code=403, detail="Not authorized to stop this step")
-    if not job_manager.request_stop(name, step_id, mode):
+    if not job_manager.request_stop(_jp, step_id, mode):
         raise HTTPException(status_code=409, detail="Step is not running")
     return {"status": "stopping", "mode": mode}
 
@@ -2163,6 +2178,15 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
     ctx_data = get_or_create(project, user_id)
     context = ctx_data["context"]
     tracker = ctx_data["tracker"]
+    _jp = job_project(user_id, project)
+
+    # Per-run config overlay: this user's API key + this run's model
+    # overrides (written by _call_step via run_env.setenv). This coroutine
+    # always runs as its own asyncio Task, so the overlay dies with it.
+    # Every executor hop below goes through run_env.bind() to carry it (and
+    # the log sink / input responder) into the worker thread.
+    _loop0 = asyncio.get_event_loop()
+    run_env.enter_run(await _loop0.run_in_executor(None, _user_run_env, user_id))
 
     # PHASE 5 (step_cache): the run is about to overwrite this step's outputs
     # (and Sheets sync-before-run may already have) — drop the cached view now;
@@ -2172,13 +2196,13 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
     # Shared cooperative-stop check for this step (used by both the worker
     # thread inside _run_with_capture and the auto-enrich cascade).
     def cancel_check():
-        return job_manager.should_stop(project, step_id)
+        return job_manager.should_stop(_jp, step_id)
 
     # TELEMETRY: run_id follows the SAME convention as step_results
     # ("YYYY-MM-DDThh-mm-ss" from the step's start time). A step_run row is
     # inserted into step_call_logs BEFORE anything runs and updated with the
     # outcome afterwards — identical for the 1st and the 100th run.
-    _tele_start_ts = _step_start_time.get(f"{project}-{step_id}", time.time())
+    _tele_start_ts = _step_start_time.get(f"{_jp}-{step_id}", time.time())
     _tele_run_id = datetime.utcfromtimestamp(_tele_start_ts).strftime("%Y-%m-%dT%H-%M-%S")
     _tele_row = None
     _tele_finished = {"done": False}
@@ -2207,7 +2231,7 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
         print(f"[TELEMETRY] step_run start failed for step {step_id}: {_te}")
 
     def log_callback(line: dict):
-        job_manager.append_log(project, step_id, line)
+        job_manager.append_log(_jp, step_id, line)
 
     def _run_with_capture():
         # ContextVars do not propagate into run_in_executor worker threads —
@@ -2252,7 +2276,7 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
                 # Upload archive to Supabase
                 _upload_step_folder_to_storage(user_id, project, f"_history/step{step_id}/{archive_ts}", archive_storage)
 
-            await loop.run_in_executor(None, _do_archive)
+            await loop.run_in_executor(None, run_env.bind(_do_archive))
 
         # Ensure source.pdf is on local disk before running any step.
         # After a container restart the local FS is wiped; download from Supabase.
@@ -2290,7 +2314,7 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
         try:
             loop2 = asyncio.get_event_loop()
             await loop2.run_in_executor(
-                None, _pre_run_sheets_sync, user_id, project, str(step_id))
+                None, run_env.bind(_pre_run_sheets_sync), user_id, project, str(step_id))
         except Exception as _prs:
             print(f"[PRE-RUN-SYNC] ⚠️ hook failed: {_prs} — run proceeds.")
 
@@ -2320,11 +2344,11 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
         step_outcome = "error"
 
         try:
-            await loop.run_in_executor(None, _run_with_capture)
+            await loop.run_in_executor(None, run_env.bind(_run_with_capture))
 
-            if job_manager.should_stop(project, step_id):
-                step_outcome = job_manager.get_stop_mode(project, step_id)
-                job_manager.set_stopped(project, step_id, step_outcome)
+            if job_manager.should_stop(_jp, step_id):
+                step_outcome = job_manager.get_stop_mode(_jp, step_id)
+                job_manager.set_stopped(_jp, step_id, step_outcome)
                 log_callback({
                     "ts": datetime.now().strftime("%H:%M:%S"),
                     "type": "warn",
@@ -2342,7 +2366,7 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
             # cascade block below (in its finally). For all other steps,
             # set_done is called here as before.
             if step_id != "2":
-                job_manager.set_done(project, step_id)
+                job_manager.set_done(_jp, step_id)
             log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "ok", "text": f"\u2705 Step {step_id} completed successfully."})
 
             # POST-STEP-2 AUTO-ENRICH: after Step 2 succeeds, invisibly run
@@ -2365,24 +2389,24 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
                         step3_cfg = config.get("step3", config.get("step3_config", {}))
                         res = await loop.run_in_executor(
                             None,
-                            lambda: _cascade_with_telemetry(
+                            run_env.bind(lambda: _cascade_with_telemetry(
                                 tracker, context, user_id, project,
                                 step3_cfg, cancel_check, step_id, _tele_run_id,
-                            )
+                            ))
                         )
                         rstatus = res.get("status")
                         if rstatus == "ok":
                             total = res.get("build", {}).get("step5", {}).get("total_qcms", 0)
                             log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "ok", "text": f"⚡ Auto-enrich (Step 3 + build) completed: {total} QCMs merged."})
-                            job_manager.set_done(project, "3")
-                            job_manager.set_done(project, "4")
-                            job_manager.set_done(project, "5")
+                            job_manager.set_done(_jp, "3")
+                            job_manager.set_done(_jp, "4")
+                            job_manager.set_done(_jp, "5")
                             auto_build_folders = ["step3_metadata", "step4_format", "step5_json"]
                             # Record success badges for the hidden steps so history matches reality
                             for _sid in ("3", "4", "5"):
                                 try:
                                     _b, _s = _compute_step_badge(project, user_id, _sid)
-                                    _record_step_history(project, user_id, _sid, _step_start_time.get(f"{project}-{_sid}", time.time()), _b, _s)
+                                    _record_step_history(project, user_id, _sid, _step_start_time.get(f"{_jp}-{_sid}", time.time()), _b, _s)
                                 except Exception as _be:
                                     print(f"[POST-STEP-2] badge record failed for {_sid}: {_be}")
                         elif rstatus == "no_qcms":
@@ -2396,14 +2420,14 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
                     finally:
                         # Now mark Step 2 as done — the WS log stream will see
                         # "done" and close AFTER pushing all cascade log lines.
-                        job_manager.set_done(project, step_id)
+                        job_manager.set_done(_jp, step_id)
 
         except asyncio.CancelledError:
             # Cancel-mode hard-cancel interrupts the pending awaits here.
             # Record the terminal "cancelled" status and log before
             # re-raising so the WebSocket stream sees a terminal state and
             # the frontend can recover its Run/Resume button.
-            job_manager.set_stopped(project, step_id, "cancelled")
+            job_manager.set_stopped(_jp, step_id, "cancelled")
             step_outcome = "cancelled"
             log_callback({
                 "ts": datetime.now().strftime("%H:%M:%S"),
@@ -2414,7 +2438,7 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
         except Exception as e:
             import traceback
             traceback.print_exc()
-            job_manager.set_error(project, step_id)
+            job_manager.set_error(_jp, step_id)
             step_outcome = "error"
             log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "error", "text": f"❌ Step {step_id} failed: {str(e)}"})
 
@@ -2483,7 +2507,7 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
                     })
 
             try:
-                await loop.run_in_executor(None, _do_post_step)
+                await loop.run_in_executor(None, run_env.bind(_do_post_step))
             except Exception as post_e:
                 # Log but do NOT propagate — post-step I/O failure must not change
                 # the step's status which was already set above.
@@ -2491,7 +2515,7 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
 
             # Record history based on the actual step outcome (not post-step I/O outcome)
             try:
-                start_ts = _step_start_time.get(f"{project}-{step_id}", time.time())
+                start_ts = _step_start_time.get(f"{_jp}-{step_id}", time.time())
                 run_id = datetime.utcfromtimestamp(start_ts).strftime("%Y-%m-%dT%H-%M-%S")
                 if step_succeeded:
                     badge, stats = _compute_step_badge(project, user_id, step_id)
@@ -2522,7 +2546,7 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
                 _terminal = "done" if step_succeeded else (
                     step_outcome if step_outcome in ("error", "stopped", "cancelled")
                     else "error")
-                step_cache.put(user_id, project, step_id, status=terminal,
+                step_cache.put(user_id, project, step_id, status=_terminal,
                                output_exists=step_output_exists(project, step_id, user_id))
             except Exception:
                 pass
@@ -2531,7 +2555,7 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
         # A hard-cancel during setup (archive/PDF restore awaits) must also
         # land in a terminal state — otherwise the UI stays stuck at
         # "stopping" forever.
-        job_manager.set_stopped(project, step_id, "cancelled")
+        job_manager.set_stopped(_jp, step_id, "cancelled")
         step_cache.invalidate(user_id, project, step_id)
         _tele_status("cancelled", error_message="cancelled during setup")
         log_callback({
@@ -2545,13 +2569,13 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
         # that happen before the step even starts.
         import traceback
         traceback.print_exc()
-        job_manager.set_error(project, step_id)
+        job_manager.set_error(_jp, step_id)
         step_cache.invalidate(user_id, project, step_id)
         step_outcome = "error"
         _tele_status("error", error_message=f"setup: {outer_e}")
         log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "error", "text": f"❌ Step {step_id} setup failed: {str(outer_e)}"})
         try:
-            _record_step_history(project, user_id, step_id, _step_start_time.get(f"{project}-{step_id}", time.time()), "error", {})
+            _record_step_history(project, user_id, step_id, _step_start_time.get(f"{_jp}-{step_id}", time.time()), "error", {})
         except Exception as be:
             print(f"[POST-STEP] Badge recording failed for step {step_id}: {be}")
 
@@ -2642,58 +2666,59 @@ def _call_step(step_id: str, tracker, context, config: dict, cancel_check=None):
         print(f"[AUTO-INPUT] Unhandled prompt, returning empty string")
         return ""
 
-    # Install the patch
-    builtins.input = _auto_input
+    # Install the auto-responder for THIS run only (a process-global
+    # builtins.input swap let concurrent runs answer each other's prompts).
+    run_env.set_input_handler(_auto_input)
     
     # Apply model overrides to environment before importing/running modules.
     # Only override when the UI explicitly sends a non-empty model string.
     if step_id == "1" and config.get("model"):
-        os.environ["STEP1_MODEL"] = config["model"]
+        run_env.setenv("STEP1_MODEL", config["model"])
     if step_id == "2":
         # Visibility: log where the effective models came from. The run
         # payload (Step 2 panel, persisted in the browser) overrides the
         # Settings env whenever non-empty — a stale panel value silently
         # stomps a fresh Settings change, which looks "hardcoded".
-        _prev_s2_primary = os.getenv("STEP2_MODEL", "")
-        _prev_s2_fallback = os.getenv("STEP2_FALLBACK_MODEL", "")
+        _prev_s2_primary = run_env.getenv("STEP2_MODEL", "")
+        _prev_s2_fallback = run_env.getenv("STEP2_FALLBACK_MODEL", "")
         if config.get("model_primary"):
-            os.environ["STEP2_MODEL"] = config["model_primary"]
+            run_env.setenv("STEP2_MODEL", config["model_primary"])
             # Sync Step 2's model to Step 3 so the metadata cascade (which
             # fires inside Step 2's run via run_post_step2_metadata) uses the
             # same model the user picked — there is now a single model
             # selector pair in the UI that applies to both QCM extraction
             # and metadata detection.
-            os.environ["STEP3_MODEL"] = config["model_primary"]
+            run_env.setenv("STEP3_MODEL", config["model_primary"])
         if config.get("model_fallback"):
-            os.environ["STEP2_FALLBACK_MODEL"] = config["model_fallback"]
-            os.environ["STEP3_FALLBACK_MODEL"] = config["model_fallback"]
+            run_env.setenv("STEP2_FALLBACK_MODEL", config["model_fallback"])
+            run_env.setenv("STEP3_FALLBACK_MODEL", config["model_fallback"])
         print(f"[STEP2] models — run-config primary={config.get('model_primary') or '(empty → keep env)'} "
               f"fallback={config.get('model_fallback') or '(empty → keep env)'} | "
-              f"effective STEP2_MODEL={os.getenv('STEP2_MODEL')} "
-              f"STEP2_FALLBACK_MODEL={os.getenv('STEP2_FALLBACK_MODEL')} "
+              f"effective STEP2_MODEL={run_env.getenv('STEP2_MODEL')} "
+              f"STEP2_FALLBACK_MODEL={run_env.getenv('STEP2_FALLBACK_MODEL')} "
               f"(env was: {_prev_s2_primary or '(unset)'} / {_prev_s2_fallback or '(unset)'})")
         # Phase 1 — Clinical Case Checker (verification pass inside the
         # Step 2 auto-enrich cascade). Independent from the Step 2/3 models
         # so a cheap/fast verifier can be configured (e.g. mercury).
         cc_cfg = config.get("clinical_case_checker", {}) or {}
         if cc_cfg.get("model_primary"):
-            os.environ["CC_CHECKER_MODEL"] = cc_cfg["model_primary"]
+            run_env.setenv("CC_CHECKER_MODEL", cc_cfg["model_primary"])
         if cc_cfg.get("model_fallback"):
-            os.environ["CC_CHECKER_FALLBACK_MODEL"] = cc_cfg["model_fallback"]
+            run_env.setenv("CC_CHECKER_FALLBACK_MODEL", cc_cfg["model_fallback"])
     if step_id == "3":
         if config.get("model"):
-            os.environ["STEP3_MODEL"] = config["model"]
+            run_env.setenv("STEP3_MODEL", config["model"])
         if config.get("model_fallback"):
-            os.environ["STEP3_FALLBACK_MODEL"] = config["model_fallback"]
+            run_env.setenv("STEP3_FALLBACK_MODEL", config["model_fallback"])
     if step_id == "6":
         if config.get("text_model"):
-            os.environ["STEP6_TEXT_MODEL"] = config["text_model"]
+            run_env.setenv("STEP6_TEXT_MODEL", config["text_model"])
         if config.get("all_pages_model"):
-            os.environ["STEP6_ALL_PAGES_MODEL"] = config["all_pages_model"]
+            run_env.setenv("STEP6_ALL_PAGES_MODEL", config["all_pages_model"])
         if config.get("ai_model"):
-            os.environ["STEP6_AI_MODEL"] = config["ai_model"]
+            run_env.setenv("STEP6_AI_MODEL", config["ai_model"])
         if config.get("vision_model"):
-            os.environ["STEP6_ALL_PAGES_MODEL"] = config["vision_model"]
+            run_env.setenv("STEP6_ALL_PAGES_MODEL", config["vision_model"])
     
     if step_id == "8":
         if config.get("ref_db_path"):
@@ -2702,24 +2727,24 @@ def _call_step(step_id: str, tracker, context, config: dict, cancel_check=None):
             if ref_db_val and not (ref_db_val.startswith("/") or ":" in ref_db_val or "\\" in ref_db_val):
                 uid = context.name.split("/")[0]
                 ref_db_val = f"/app/output/{uid}/ref_dbs/{ref_db_val}"
-            os.environ["REFERENCE_DB_PATH"] = ref_db_val
+            run_env.setenv("REFERENCE_DB_PATH", ref_db_val)
         if config.get("match_mode"):
-            os.environ["MATCH_MODE"] = config["match_mode"]
+            run_env.setenv("MATCH_MODE", config["match_mode"])
         if config.get("threshold") is not None:
-            os.environ["MATCH_THRESHOLD"] = str(config["threshold"])
+            run_env.setenv("MATCH_THRESHOLD", str(config["threshold"]))
         if config.get("text_weight") is not None:
-            os.environ["MATCH_TEXT_WEIGHT"] = str(config["text_weight"])
+            run_env.setenv("MATCH_TEXT_WEIGHT", str(config["text_weight"]))
         if config.get("corr_weight") is not None:
-            os.environ["MATCH_CORRECTION_WEIGHT"] = str(config["corr_weight"])
+            run_env.setenv("MATCH_CORRECTION_WEIGHT", str(config["corr_weight"]))
         if config.get("color_green") is not None:
-            os.environ["MATCH_COLOR_GREEN"] = str(config["color_green"])
+            run_env.setenv("MATCH_COLOR_GREEN", str(config["color_green"]))
         if config.get("color_yellow") is not None:
-            os.environ["MATCH_COLOR_YELLOW"] = str(config["color_yellow"])
+            run_env.setenv("MATCH_COLOR_YELLOW", str(config["color_yellow"]))
         # NEW: tag-merge phase config (auto-merge floor + self-scan flag)
         if config.get("auto_merge_floor") is not None:
-            os.environ["MATCH_AUTO_MERGE_FLOOR"] = str(config["auto_merge_floor"])
+            run_env.setenv("MATCH_AUTO_MERGE_FLOOR", str(config["auto_merge_floor"]))
         if config.get("self_scan") is not None:
-            os.environ["MATCH_SELF_SCAN"] = "1" if config["self_scan"] else "0"
+            run_env.setenv("MATCH_SELF_SCAN", "1" if config["self_scan"] else "0")
 
     # Late imports to avoid circular deps and only load what's needed
     from modules.step1_extraction import Step1Extraction
@@ -2840,7 +2865,7 @@ def _check_step_done_in_storage(user_id: str, project: str, step_id: str) -> boo
 @app.get("/projects/{name}/steps/{step_id}/status")
 def get_step_status(name: str, step_id: str, user: dict = Depends(get_current_user)):
     uid = user["id"]
-    mem_status = job_manager.get_status(name, step_id)
+    mem_status = job_manager.get_status(job_project(uid, name), step_id)
 
     # If the job is actively tracked in memory (running or finished this session),
     # trust the in-memory state — it's the most up-to-date.
@@ -2902,17 +2927,21 @@ async def ws_log(websocket: WebSocket, project: str, step_id: str, token: str = 
         return
 
     await websocket.accept()
+    # Logs are keyed per user: a caller can only ever stream its OWN
+    # project's logs (previously any valid token could read any project).
+    _ws_uid = "admin" if payload.get("email") == ADMIN_EMAIL else payload.get("sub")
+    _jp = job_project(_ws_uid, project)
     sent_count = 0
     try:
         while True:
-            all_logs = job_manager.get_logs(project, step_id)
+            all_logs = job_manager.get_logs(_jp, step_id)
             # Push new lines
             while sent_count < len(all_logs):
                 await websocket.send_text(json.dumps(all_logs[sent_count]))
                 sent_count += 1
             
             # Exit loop if job is finished and all lines pushed
-            status = job_manager.get_status(project, step_id)
+            status = job_manager.get_status(_jp, step_id)
             if status in ("done", "error", "stopped", "cancelled") and sent_count >= len(all_logs):
                 break
             
@@ -3075,19 +3104,49 @@ def get_all_costs(user: dict = Depends(get_current_user)):
 
 # --- .env Endpoints ---
 
-@app.get("/env")
-def get_environment(user: dict = Depends(get_current_user)):
+# Secrets in the global .env. Non-admin users never see their values and
+# never write them — a non-admin's OpenRouter key is stored on their OWN
+# user record (used for their runs via _user_run_env), not in the shared .env.
+_SECRET_ENV_KEYS = {"OPENROUTER_API_KEY"}
+
+
+def _user_view_of_env(user: dict, unmask_for_admin: bool) -> dict:
     env = read_env()
+    is_admin = bool(user.get("is_admin"))
     result = {}
     for k, v in env.items():
-        if k in EDITABLE_KEYS:
-            result[k] = mask(v)
-        elif any(x in k for x in ["MODEL", "ENABLE", "STEP"]):
-            result[k] = v
+        if k in EDITABLE_KEYS or any(x in k for x in ["MODEL", "ENABLE", "STEP"]):
+            if k in _SECRET_ENV_KEYS:
+                result[k] = v if (is_admin and unmask_for_admin) else mask(v)
+            elif k in EDITABLE_KEYS and not unmask_for_admin:
+                result[k] = mask(v)
+            else:
+                result[k] = v
+    if not is_admin:
+        own = (user.get("api_key") or "").strip()
+        result["OPENROUTER_API_KEY"] = mask(own) if own else ""
     return result
+
+
+@app.get("/env")
+def get_environment(user: dict = Depends(get_current_user)):
+    return _user_view_of_env(user, unmask_for_admin=False)
 
 @app.post("/env")
 def update_environment(body: dict, user: dict = Depends(get_current_user)):
+    body = body or {}
+    if not user.get("is_admin"):
+        # Non-admins may only set their OWN OpenRouter key (stored per user).
+        # Global models / knobs / the server key are admin-only: these used
+        # to be writable by any user and changed every user's runs.
+        other = [k for k in body if k != "OPENROUTER_API_KEY"]
+        if other:
+            raise HTTPException(status_code=403,
+                                detail="Only admins can change global settings: " + ", ".join(sorted(other)))
+        if "OPENROUTER_API_KEY" in body:
+            update_user_field(user["id"], "api_key", (body.get("OPENROUTER_API_KEY") or "").strip())
+            return {"updated": ["OPENROUTER_API_KEY"]}
+        return {"updated": []}
     updated = write_env_keys(body)
     # Update current process environment for immediate effect (hot-swap)
     env = read_env()
@@ -3097,13 +3156,9 @@ def update_environment(body: dict, user: dict = Depends(get_current_user)):
 
 @app.get("/env/raw")
 def get_environment_raw(user: dict = Depends(get_current_user)):
-    """Returns all env values unmasked for the settings UI."""
-    env = read_env()
-    result = {}
-    for k, v in env.items():
-        if k in EDITABLE_KEYS or any(x in k for x in ["MODEL", "ENABLE", "STEP"]):
-            result[k] = v  # NO masking
-    return result
+    """Settings UI values. Model/knob values are returned as-is; secrets are
+    unmasked for admins only (any logged-in user used to get the server key)."""
+    return _user_view_of_env(user, unmask_for_admin=True)
 
 ADMIN_ENV_PATH = Path("/app/admin.env")
 
@@ -3276,7 +3331,7 @@ def get_step_output_files(name: str, step_id: str, user: dict = Depends(get_curr
                 })
         if files:
             step_cache.put(uid, name, step_id, files=files, output_exists=True,
-                           status=job_manager.get_status(name, step_id))
+                           status=job_manager.get_status(job_project(user["id"], name), step_id))
             return {"files": _sort_output_file_items(files)}
 
     # PERSISTENCE_FIX_PLAN PR-2: SQL-first manifest. After a container restart
@@ -4196,18 +4251,19 @@ def _sync_step_from_sheets_svc(name: str, step_id: str, user_id: str,
 
 @app.post("/projects/{name}/step8/export-existing")
 async def export_matches_only(name: str, body: dict, user: dict = Depends(get_current_user)):
-    _apply_user_env(user)
+    _jp = job_project(user["id"], name)
     task = asyncio.ensure_future(_export_step8_task(name, user["id"], body))
-    job_manager.set_running(name, "8-export", task)
-    _job_user_ids[job_manager.key(name, "8-export")] = user["id"]
+    job_manager.set_running(_jp, "8-export", task)
+    _job_user_ids[job_manager.key(_jp, "8-export")] = user["id"]
     return {"job_id": f"{name}-8-export-001"}
 
 async def _export_step8_task(project: str, email: str, body: dict):
     ctx_data = get_or_create(project, email)
     context = ctx_data["context"]
     tracker = ctx_data["tracker"]
+    _jp = job_project(email, project)
     def log_callback(line: dict):
-        job_manager.append_log(project, "8-export", line)
+        job_manager.append_log(_jp, "8-export", line)
     def _run():
         with LogCapture(log_callback):
             from modules.step8_matcher import Step8Matcher
@@ -4224,16 +4280,15 @@ async def _export_step8_task(project: str, email: str, body: dict):
                 if "to   %" in p or "to %" in p: return str(int(float(body.get("export_to", 0.6)) * 100))
                 if "output filename" in p: return body.get("export_filename", "custom_export")
                 return ""
-            import builtins
-            builtins.input = _export_auto
+            run_env.set_input_handler(_export_auto)
             matcher.export_from_existing()
     try:
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _run)
-        job_manager.set_done(project, "8-export")
+        await loop.run_in_executor(None, run_env.bind(_run))
+        job_manager.set_done(_jp, "8-export")
         log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "ok", "text": "✅ Custom export complete."})
     except Exception as e:
-        job_manager.set_error(project, "8-export")
+        job_manager.set_error(_jp, "8-export")
         log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "error", "text": f"❌ Export failed: {str(e)}"})
 
 # --- Step 8 merge-outputs manifest (PR-S8-2) ---
@@ -4254,7 +4309,6 @@ async def step8_merge_outputs(name: str, user: dict = Depends(get_current_user))
     Storage. The per-file download URLs still resolve via the generic
     /download route, which itself now streams from Storage.
     """
-    _apply_user_env(user)
     ctx_data = get_or_create(name, user["id"])
     context = ctx_data["context"]
     out_dir = context.base_path / "step8_matches"
@@ -4337,7 +4391,6 @@ async def step8_merge_outputs(name: str, user: dict = Depends(get_current_user))
 
 @app.post("/projects/{name}/autorun")
 async def start_autorun_sequence(name: str, body: dict, user: dict = Depends(get_current_user)):
-    _apply_user_env(user)
     # Sequential execution of multiple steps
     asyncio.ensure_future(_autorun_task(name, user["id"], body))
     return {"job_id": f"{name}-autorun-001"}
@@ -4367,11 +4420,12 @@ async def _autorun_task(project: str, email: str, body: dict):
         # Register each autorun step with the JobManager. Previously the task
         # was awaited directly with no set_running() call, so Stop/Cancel on
         # any autorun step returned 409 "Step is not running" forever.
-        if job_manager.is_running(project, step_id):
+        _jp = job_project(email, project)
+        if job_manager.is_running(_jp, step_id):
             continue
         task = asyncio.ensure_future(_run_step_task(project, email, step_id, cfg))
-        job_manager.set_running(project, step_id, task)
-        _job_user_ids[job_manager.key(project, step_id)] = email
+        job_manager.set_running(_jp, step_id, task)
+        _job_user_ids[job_manager.key(_jp, step_id)] = email
 
         try:
             await task
@@ -4382,7 +4436,7 @@ async def _autorun_task(project: str, email: str, body: dict):
             raise
 
         # Stop the sequence if the step did not complete cleanly.
-        if job_manager.get_status(project, step_id) in ("error", "stopped", "cancelled"):
+        if job_manager.get_status(_jp, step_id) in ("error", "stopped", "cancelled"):
             break
 
 
@@ -4415,7 +4469,6 @@ async def autorun_batch_start(body: dict, user: dict = Depends(get_current_user)
         raise HTTPException(status_code=404, detail="Auto Run batch is not enabled on this server.")
 
     uid = user["id"]
-    _apply_user_env(user)
     _check_user_rate_limit(uid, "autorun_batch", limit=3, window_seconds=600)
 
     source = (body or {}).get("source")
@@ -4528,19 +4581,19 @@ def autorun_batch_progress(batch_id: str, user: dict = Depends(get_current_user)
     m = read_manifest(uid, batch_id)
     if not m:
         raise HTTPException(status_code=404, detail="Batch not found.")
-    merge_live_status(m)
+    merge_live_status(m, uid=uid)
     # Phase 7 hardening: a manifest claiming running/pending while NO engine
     # knows about the batch (crash mid-run, resume skipped) is a zombie —
     # surfacing it as `interrupted` makes the frontend STOP polling forever
     # and instead offer Resume; list_user_batches reports the same state.
     if (m.get("state", "pending") in ("running", "pending")
-            and not batch_is_live(m.get("batch_id", batch_id), m.get("projects", []))):
+            and not batch_is_live(m.get("batch_id", batch_id), m.get("projects", []), uid)):
         m["state_was"] = m.get("state")
         m["state"] = "interrupted"
     live = {}
     for p in m.get("projects", []):
         name = p.get("name", "")
-        live[name] = {sid: job_manager.get_status(name, sid) for sid in ("1", "1.5", "1.6", "2", "6")}
+        live[name] = {sid: job_manager.get_status(job_project(uid, name), sid) for sid in ("1", "1.5", "1.6", "2", "6")}
     return {"batch": m, "live_status": live}
 
 
@@ -4596,7 +4649,6 @@ async def autorun_batch_retry(batch_id: str, body: dict, user: dict = Depends(ge
         raise HTTPException(status_code=404, detail="Auto Run batch is not enabled on this server.")
     project = (body or {}).get("project") or ""
     uid = user["id"]
-    _apply_user_env(user)
     allowed, reason = autorun_retry_project(uid, batch_id, project)
     if not allowed:
         status_code = 404 if reason in ("batch-not-found", "project-not-in-batch") else 409
@@ -4612,7 +4664,6 @@ async def autorun_batch_resume(batch_id: str, user: dict = Depends(get_current_u
     if not autorun_batch_enabled():
         raise HTTPException(status_code=404, detail="Auto Run batch is not enabled on this server.")
     uid = user["id"]
-    _apply_user_env(user)
     _check_user_rate_limit(uid, "autorun_resume", limit=10, window_seconds=60)
     started, reason = autorun_resume_batch(uid, batch_id)
     if not started:

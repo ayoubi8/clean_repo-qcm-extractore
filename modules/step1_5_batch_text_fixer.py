@@ -1,4 +1,6 @@
 import json
+from modules.utils import run_env  # per-run config overlay (see run_env.py)
+from modules.openrouter_client import OpenRouterFatalError
 import re
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
@@ -169,9 +171,9 @@ class Step1_5BatchTextFixer:
         try:
             print(f"[LLM] Calling Text Fixer with {len(flagged_pairs)} pairs...")
             
-            primary_model = os.getenv("STEP1_5_MODEL", "google/gemma-3-27b-it:free")
-            fallback_model = os.getenv("STEP1_5_FALLBACK_MODEL", "google/gemini-2.0-flash-lite-001")
-            max_tokens = int(os.getenv("STEP1_5_MAX_TOKENS", "8000"))
+            primary_model = run_env.getenv("STEP1_5_MODEL", "google/gemma-3-27b-it:free")
+            fallback_model = run_env.getenv("STEP1_5_FALLBACK_MODEL", "google/gemini-2.0-flash-lite-001")
+            max_tokens = int(run_env.getenv("STEP1_5_MAX_TOKENS", "8000"))
             
             try:
                 response = self.client.generate_completion(
@@ -180,6 +182,8 @@ class Step1_5BatchTextFixer:
                     max_tokens=max_tokens
                 )
                 model_used = primary_model
+            except OpenRouterFatalError:
+                raise  # bad key / no credits: abort, don't loop
             except Exception as e:
                 print(f"[WARN] Batch fixer primary model failed: {e}")
                 print(f"[INFO] Retrying with fallback: {fallback_model}")
@@ -207,6 +211,8 @@ class Step1_5BatchTextFixer:
             # Parse batch response
             return self._parse_batch_response(content, flagged_pairs)
             
+        except OpenRouterFatalError:
+            raise  # bad key / no credits: abort, don't loop
         except Exception as e:
             print(f"[ERROR] Batch LLM call failed: {e}")
             return {}

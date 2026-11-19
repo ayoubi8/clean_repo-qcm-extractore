@@ -472,9 +472,9 @@ class _Runner:
             self.calls.append((project, step_id))
             await asyncio.sleep(0.01)
             if project in self.fail_projects and step_id == self.fail_step:
-                ab.job_manager.set_error(project, step_id)
+                ab.job_manager.set_error(ab.job_project(uid, project), step_id)
             else:
-                ab.job_manager.set_done(project, step_id)
+                ab.job_manager.set_done(ab.job_project(uid, project), step_id)
         finally:
             self.active.discard(project)
 

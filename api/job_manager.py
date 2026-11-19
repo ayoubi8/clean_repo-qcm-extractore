@@ -77,3 +77,10 @@ class JobManager:
         return self._status.get(self.key(project, step), "idle")
 
 job_manager = JobManager()  # singleton
+
+
+def job_project(user_id: str, project: str) -> str:
+    """User-scoped job identity. Project names are only unique PER USER, so
+    every job_manager call must pass this instead of the bare project name —
+    otherwise two users' "immuno" projects share status, logs and stop flags."""
+    return f"{user_id}/{project}"

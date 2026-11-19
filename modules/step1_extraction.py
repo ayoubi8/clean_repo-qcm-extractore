@@ -1,4 +1,6 @@
 import os
+from modules.utils import run_env  # per-run config overlay (see run_env.py)
+from modules.openrouter_client import OpenRouterFatalError
 import json
 from pathlib import Path
 from typing import List, Dict
@@ -133,12 +135,14 @@ class Step1Extraction:
                 return idx, None, 0.0, {}, "stopped"
             prompt = self._build_vision_prompt(guidance)
             primary_model, fallback_model = get_model_pair("step1_ocr")
-            max_tokens = int(os.getenv("STEP1_MAX_TOKENS", "15000"))
+            max_tokens = int(run_env.getenv("STEP1_MAX_TOKENS", "15000"))
 
             try:
                 try:
                     response = client.generate_completion(prompt, [img], model=primary_model, max_tokens=max_tokens)
                     used_model = primary_model
+                except OpenRouterFatalError:
+                    raise
                 except Exception as e:
                     print(f"  [WARN] Page {idx+1} primary OCR failed: {e}")
                     print(f"  [INFO] Retrying Page {idx+1} with fallback: {fallback_model}")
@@ -153,15 +157,17 @@ class Step1Extraction:
                 self.cache.save(pdf_path, idx + 1, content, pdf_hash)
                 
                 return idx, content, cost, usage, used_model
+            except OpenRouterFatalError:
+                raise   # bad key / no credits → abort Step 1 with a clear error
             except Exception as e:
                 print(f"❌ Error on page {idx+1}: {e}")
                 return idx, None, 0.0, {}, "error"
 
         # Use max 5 threads to avoid overwhelming rate limits (Gemini is fine, others vary)
-        max_workers = max(1, int(os.getenv("STEP1_MAX_WORKERS", "5")))
+        max_workers = max(1, int(run_env.getenv("STEP1_MAX_WORKERS", "5")))
         print(f"[STEP1] Processing {len(pending_pages)} uncached page(s) with {max_workers} concurrent request(s).")
         executor = ThreadPoolExecutor(max_workers=max_workers)
-        future_to_idx = {executor.submit(process_page, idx, img): idx for idx, img in pending_pages}
+        future_to_idx = {executor.submit(run_env.bind(process_page), idx, img): idx for idx, img in pending_pages}
         failed_indices = []
         try:
             for future in as_completed(future_to_idx):
@@ -188,7 +194,7 @@ class Step1Extraction:
 
         # A failed page gets one bounded second pass. This catches transient
         # provider/rate-limit failures without multiplying every page's cost.
-        retry_limit = max(0, int(os.getenv("STEP1_FAILED_PAGE_RETRIES", "1")))
+        retry_limit = max(0, int(run_env.getenv("STEP1_FAILED_PAGE_RETRIES", "1")))
         for retry_number in range(retry_limit):
             if not failed_indices or (cancel_check and cancel_check()):
                 break

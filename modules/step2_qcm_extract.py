@@ -1,5 +1,6 @@
 import json
 import os
+from modules.utils import run_env  # per-run config overlay (see run_env.py)
 import re
 from pathlib import Path
 from typing import Dict, List, Any
@@ -139,9 +140,9 @@ class Step2QCMExtract:
         # Build semantic extraction prompt
         prompt = self._build_semantic_prompt(full_text, page_num, global_guidance)
         
-        primary_model = os.getenv("STEP2_MODEL", "google/gemini-2.5-flash-lite-preview-09-2025")
-        fallback_model = os.getenv("STEP2_FALLBACK_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
-        max_tokens = int(os.getenv("STEP2_MAX_TOKENS", "20000"))
+        primary_model = run_env.getenv("STEP2_MODEL", "google/gemini-2.5-flash-lite-preview-09-2025")
+        fallback_model = run_env.getenv("STEP2_FALLBACK_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
+        max_tokens = int(run_env.getenv("STEP2_MAX_TOKENS", "20000"))
         
         try:
             try:

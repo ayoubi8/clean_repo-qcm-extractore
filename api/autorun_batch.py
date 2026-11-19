@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from job_manager import job_manager              # same singleton real_api uses
+from job_manager import job_manager, job_project  # same singleton real_api uses
 from project_manager import STEP_FOLDER_MAP       # step id → output folder
 from project_manager import invalidate_projects_cache
 
@@ -275,7 +275,7 @@ def _record_skipped_steps(uid: str, batch_id: str, project_name: str, sids: list
     _mutate_manifest(uid, batch_id, _apply)
 
 
-def merge_live_status(m: dict, status_lookup=None) -> dict:
+def merge_live_status(m: dict, status_lookup=None, uid: Optional[str] = None) -> dict:
     """Phase 1 merge: in-memory job_manager states OVER the manifest's durable
     `steps` map — response-only (the manifest is never written here).
 
@@ -284,7 +284,7 @@ def merge_live_status(m: dict, status_lookup=None) -> dict:
     which is what keeps per-step progress true after a container restart.
     """
     if status_lookup is None:
-        status_lookup = job_manager.get_status
+        status_lookup = lambda name, sid: job_manager.get_status(job_project(uid, name), sid)
     for p in m.get("projects", []):
         name = p.get("name", "")
         steps = dict(p.get("steps") or {})
@@ -577,9 +577,10 @@ def link_projects_to_batch(uid: str, batch_id: str, names: list) -> None:
 # Engine: 5-slot PDF queue, per-PDF sequential steps, failure isolation
 # ---------------------------------------------------------------------------
 
-def _project_busy(project: str) -> bool:
+def _project_busy(project: str, uid: Optional[str] = None) -> bool:
     """Any batch step of this project currently running/stopping in job_manager."""
-    return any(job_manager.get_status(project, sid) in ("running", "stopping")
+    jp = job_project(uid, project)
+    return any(job_manager.get_status(jp, sid) in ("running", "stopping")
                for sid in BATCH_SEQUENCE)
 
 
@@ -619,14 +620,14 @@ async def _run_one_project(uid: str, project_name: str, config: dict, batch_id: 
                     cfg = resolve_step_config(sid, config, uid, project_name)
                     task = asyncio.ensure_future(
                         _spawn_runtime_task(project_name, uid, sid, cfg))
-                    job_manager.set_running(project_name, sid, task)
+                    job_manager.set_running(job_project(uid, project_name), sid, task)
                     try:
                         await task
                     except asyncio.CancelledError:
                         _record_step(uid, batch_id, project_name, sid, "cancelled")
                         _mutate_project(uid, batch_id, project_name, "cancelled")
                         raise
-                    status = job_manager.get_status(project_name, sid)
+                    status = job_manager.get_status(job_project(uid, project_name), sid)
                     if status in ("error", "stopped", "cancelled"):
                         _record_step(uid, batch_id, project_name, sid, status)
                         _mutate_project(uid, batch_id, project_name, "error", error_step=sid)
@@ -700,7 +701,7 @@ def retry_project(uid: str, batch_id: str, project: str):
         return (False, "already-running")
     if proj.get("state") == "done":
         return (False, "already-done")
-    if _project_busy(project):
+    if _project_busy(project, uid):
         return (False, "step-busy")
 
     proj["state"] = "pending"
@@ -802,14 +803,14 @@ def resume_interrupted_batches() -> int:
 # Batch history (Phase 3 — history-progress-cache plan)
 # ---------------------------------------------------------------------------
 
-def batch_is_live(batch_id: str, projects: list) -> bool:
+def batch_is_live(batch_id: str, projects: list, uid: Optional[str] = None) -> bool:
     """True while the engine actually knows this batch: the parent batch task is
     running, or any of its projects has a live step (covers per-PDF retries of
     a batch whose parent task already exited)."""
     task = _BATCH_TASKS.get(batch_id)
     if task and not task.done():
         return True
-    return any(_project_busy(p.get("name", "")) for p in (projects or []))
+    return any(_project_busy(p.get("name", ""), uid) for p in (projects or []))
 
 _batch_is_live = batch_is_live   # backwards-compatible alias
 
@@ -827,7 +828,7 @@ def _batch_summary(uid: str, batch_id: str, m: dict) -> dict:
         else:
             counts["pending"] += 1
     state = m.get("state") or "unknown"
-    if state in ("running", "pending") and not _batch_is_live(batch_id, projects):
+    if state in ("running", "pending") and not _batch_is_live(batch_id, projects, uid):
         state = "interrupted"            # crashed where startup resume couldn't relaunch
     names = [p.get("name", "") for p in projects if p.get("name")]
     if len(names) > 3:
@@ -893,7 +894,7 @@ def resume_batch(uid: str, batch_id: str) -> tuple:
     m = read_manifest(uid, batch_id)
     if not m:
         return (False, "batch-not-found")
-    if _batch_is_live(batch_id, m.get("projects", [])):
+    if _batch_is_live(batch_id, m.get("projects", []), uid):
         return (False, "already-running")
     # Same pre-flight as startup auto-resume: a fresh engine cannot have a
     # project actually running — flip + drop stale step records.

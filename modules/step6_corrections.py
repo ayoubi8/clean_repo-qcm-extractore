@@ -1,5 +1,7 @@
 import json
 import os
+from modules.utils import run_env  # per-run config overlay (see run_env.py)
+from modules.openrouter_client import OpenRouterFatalError
 import re
 from pathlib import Path
 from typing import Dict, List, Any
@@ -353,6 +355,8 @@ CORRECTION:"""
                 print(f"  Q{qcm.get('Num', i)}: {correction}")
                 cost = resp.get('cost', 0.0) or self.deepseek.estimate_cost("deepseek/deepseek-r1-distill-llama-70b", resp["usage"])
                 self.cost_tracker.log_api_call("step6_ai", "deepseek", resp["usage"], cost)
+            except OpenRouterFatalError:
+                raise  # bad key / no credits: abort, don't loop
             except Exception as e:
                 print(f"  ❌ Error solving Q{i}: {e}")
                 qcm["Correct"] = ""
@@ -370,7 +374,7 @@ CORRECTION:"""
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
             futures = []
             for i, batch in enumerate(batches):
-                futures.append(executor.submit(self._process_single_batch, batch, i, len(batches), qcms))
+                futures.append(executor.submit(run_env.bind(self._process_single_batch), batch, i, len(batches), qcms))
             
             for future in concurrent.futures.as_completed(futures):
                 pass
@@ -442,6 +446,8 @@ QUESTIONS TO SOLVE:
                 cost = resp.get('cost', 0.0) or self.deepseek.estimate_cost("deepseek/deepseek-r1-distill-llama-70b", resp["usage"])
                 self.cost_tracker.log_api_call("step6_ai_batch", "deepseek", resp["usage"], cost)
                 break
+            except OpenRouterFatalError:
+                raise  # bad key / no credits: abort, don't loop
             except Exception as e:
                 print(f"   ❌ Batch {batch_idx + 1} failed (Attempt {attempt+1}/{max_retries}): {e}")
                 if attempt == max_retries - 1: 
@@ -508,7 +514,7 @@ QUESTIONS TO SOLVE:
             print(f"     🤖 No pattern match on page {page_num}, trying AI...")
             # We do a lightweight inline AI call here for just this page.
             primary_model, fallback_model = get_model_pair("step6_text")
-            max_tokens = int(os.getenv("STEP6_TEXT_MAX_TOKENS", "4000"))
+            max_tokens = int(run_env.getenv("STEP6_TEXT_MAX_TOKENS", "4000"))
             prompt = self._build_correction_prompt(text, page_num)
             # Alternate primary -> fallback across attempts so a parse failure
             # on the primary model is retried with the fallback model.
@@ -534,6 +540,8 @@ QUESTIONS TO SOLVE:
                         print(f"     ⚠️  AI returned a partial correction map — retrying with fallback ({fallback_model})...")
                         continue  # do not break — let next attempt use fallback
                     break
+                except OpenRouterFatalError:
+                    raise  # bad key / no credits: abort, don't loop
                 except Exception as e:
                     print(f"     ⚠️  AI attempt {attempt+1} failed for page {page_num} ({model_used}): {e}")
 
@@ -760,7 +768,7 @@ PAGE {page_num} OCR TEXT:
         include_neighbors = scan_cfg.get("include_neighbors", True)
         
         primary_model, fallback_model = get_model_pair("step6_all_pages")
-        max_tokens = int(os.getenv("STEP6_ALL_PAGES_MAX_TOKENS", "4000"))
+        max_tokens = int(run_env.getenv("STEP6_ALL_PAGES_MAX_TOKENS", "4000"))
         
         guidance = config.get("page_text", {}).get("extraction_guidance", "")
 
@@ -902,6 +910,8 @@ DOCUMENT TEXT:
                         max_tokens=max_tokens
                     )
                     used_model = primary_model
+                except OpenRouterFatalError:
+                    raise  # bad key / no credits: abort, don't loop
                 except Exception as e:
                     print(f"  [WARN] Primary model failed: {e}")
                     print(f"  [INFO] Retrying with fallback: {fallback_model}")
@@ -1007,7 +1017,7 @@ DOCUMENT TEXT:
         include_neighbors = scan_cfg.get("include_neighbors", True)
 
         primary_model, fallback_model = get_model_pair("step6_auto_detect")
-        max_tokens = int(os.getenv("STEP6_ALL_PAGES_MAX_TOKENS", "4000"))
+        max_tokens = int(run_env.getenv("STEP6_ALL_PAGES_MAX_TOKENS", "4000"))
         guidance = (config.get("page_text", {}) or {}).get("extraction_guidance", "")
 
         if self.context:
@@ -1222,6 +1232,8 @@ PAGE {pn} TEXT:
                         print("     ⚠️  AI returned a partial correction map — retrying with fallback.")
                         continue
                     break
+                except OpenRouterFatalError:
+                    raise  # bad key / no credits: abort, don't loop
                 except Exception as e:
                     print(f"     ⚠️  AI attempt {attempt+1} failed for page {pn} ({model_used}): {e}")
 
@@ -1539,7 +1551,7 @@ TEXT:
         # FIX 1: No [:5000] truncation — send full text to the model
 
         primary_model, fallback_model = get_model_pair("step6_text")
-        max_tokens = int(os.getenv("STEP6_TEXT_MAX_TOKENS", "4000"))
+        max_tokens = int(run_env.getenv("STEP6_TEXT_MAX_TOKENS", "4000"))
         
         max_retries = 3
         for attempt in range(max_retries):
@@ -1547,6 +1559,8 @@ TEXT:
                 try:
                     response = self.openrouter.generate_completion(prompt, model=primary_model, max_tokens=max_tokens)
                     model_used = primary_model
+                except OpenRouterFatalError:
+                    raise  # bad key / no credits: abort, don't loop
                 except Exception as e:
                     print(f"⚠️ Primary model failed: {e}")
                     print(f"🔄 Retrying with fallback: {fallback_model}...")
@@ -1757,6 +1771,8 @@ TEXT:
                     continue # Retry same batch
                 elif choice == 's':
                     print(f"Skipped page {p_label}")
+            except OpenRouterFatalError:
+                raise  # bad key / no credits: abort, don't loop
             except Exception as e:
                 print(f"❌ Error on page {p_label}: {e}")
                 if input("Try next page? [y/n]: ").lower() != 'y':
@@ -1827,6 +1843,8 @@ Format: {{"10": "ACE", "11": "BD"}}"""
                 print(f"✅ Successfully linked {applied} corrections.")
             else:
                 print("❌ Could not parse mapping JSON from AI response.")
+        except OpenRouterFatalError:
+            raise  # bad key / no credits: abort, don't loop
         except Exception as e:
             print(f"❌ Linking failed: {e}")
             

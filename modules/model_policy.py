@@ -5,6 +5,7 @@ defaults only prevent different Step 6 paths from silently drifting apart.
 """
 
 import os
+from modules.utils import run_env  # per-run config overlay (see run_env.py)
 from typing import Dict, Tuple
 
 
@@ -54,6 +55,6 @@ def get_model_pair(slot: str) -> Tuple[str, str]:
 
     primary_key, fallback_key = ENV_KEYS[slot]
     default_primary, default_fallback = MODEL_DEFAULTS[slot]
-    primary = os.getenv(primary_key, "").strip() or default_primary
-    fallback = os.getenv(fallback_key, "").strip() or default_fallback
+    primary = run_env.getenv(primary_key, "").strip() or default_primary
+    fallback = run_env.getenv(fallback_key, "").strip() or default_fallback
     return primary, fallback

@@ -1,6 +1,11 @@
 import json
+import threading
 from typing import Dict, List
 from datetime import datetime
+
+# Shared by every tracker: log_api_call does read-modify-write on dicts and is
+# called from parallel workers (Step 1 page pool, parallel Step 2, CC checker).
+_LOG_LOCK = threading.RLock()
 
 class CostTracker:
     """Track API costs across all steps"""
@@ -14,6 +19,10 @@ class CostTracker:
         }
         
     def log_api_call(self, step: str, model: str, tokens: Dict, cost: float):
+        with _LOG_LOCK:
+            return self._log_api_call_unlocked(step, model, tokens, cost)
+
+    def _log_api_call_unlocked(self, step: str, model: str, tokens: Dict, cost: float):
         """
         Log individual API call
         Args:

@@ -1,4 +1,5 @@
 import os
+from modules.utils import run_env  # per-run config overlay (see run_env.py)
 import json
 import time
 import httpx
@@ -25,7 +26,7 @@ class DeepSeekClient:
         if api_key:
             self.api_key = api_key
         else:
-            self.api_key = os.getenv("OPENROUTER_API_KEY")
+            self.api_key = run_env.getenv("OPENROUTER_API_KEY")
             
         if not self.api_key:
             raise ValueError("API Key missing. Set OPENROUTER_API_KEY env or pass explicit key.")
@@ -37,8 +38,8 @@ class DeepSeekClient:
             "Content-Type": "application/json"
         }
         
-        primary_model = os.getenv("STEP6_AI_MODEL", "deepseek/deepseek-r1-distill-llama-70b")
-        fallback_model = os.getenv("STEP6_AI_FALLBACK_MODEL", "deepseek/deepseek-r1")
+        primary_model = run_env.getenv("STEP6_AI_MODEL", "deepseek/deepseek-r1-distill-llama-70b")
+        fallback_model = run_env.getenv("STEP6_AI_FALLBACK_MODEL", "deepseek/deepseek-r1")
         self.MODELS = [primary_model, fallback_model]
         self.primary_model = primary_model
 
@@ -97,7 +98,7 @@ class DeepSeekClient:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
 
-        max_tokens = int(os.getenv("STEP6_AI_MAX_TOKENS", "4000"))
+        max_tokens = int(run_env.getenv("STEP6_AI_MAX_TOKENS", "4000"))
         full_payload = {
             "messages": messages,
             "temperature": 0.1,  # Low temp for reasoning

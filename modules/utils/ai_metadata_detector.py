@@ -1,5 +1,7 @@
 import json
 import os
+from modules.utils import run_env  # per-run config overlay (see run_env.py)
+from modules.openrouter_client import OpenRouterFatalError
 import re
 from typing import Dict, List, Optional
 from modules.openrouter_client import OpenRouterClient
@@ -62,9 +64,9 @@ If a field is not found or ambiguous, use null with confidence 0.0.
 """
         
         try:
-            primary_model = os.getenv("STEP3_MODEL", "qwen/qwen3.6-plus-preview:free")
-            fallback_model = os.getenv("STEP3_FALLBACK_MODEL", "google/gemini-2.0-flash-lite-001")
-            max_tokens = int(os.getenv("STEP3_MAX_TOKENS", "4000"))
+            primary_model = run_env.getenv("STEP3_MODEL", "qwen/qwen3.6-plus-preview:free")
+            fallback_model = run_env.getenv("STEP3_FALLBACK_MODEL", "google/gemini-2.0-flash-lite-001")
+            max_tokens = int(run_env.getenv("STEP3_MAX_TOKENS", "4000"))
 
             try:
                 response = self.client.generate_completion(
@@ -73,6 +75,8 @@ If a field is not found or ambiguous, use null with confidence 0.0.
                     max_tokens=max_tokens
                 )
                 model_used = primary_model
+            except OpenRouterFatalError:
+                raise  # bad key / no credits: abort, don't loop
             except Exception as e:
                 print(f"⚠️ Primary AI detector model failed: {e}. Retrying with {fallback_model}...")
                 response = self.client.generate_completion(
@@ -122,6 +126,8 @@ If a field is not found or ambiguous, use null with confidence 0.0.
                 print("⚠️ No JSON found in AI response")
                 return self._empty_result(prompt_fields)
                 
+        except OpenRouterFatalError:
+            raise  # bad key / no credits: abort, don't loop
         except Exception as e:
             print(f"❌ AI metadata detection failed: {e}")
             return self._empty_result(prompt_fields)

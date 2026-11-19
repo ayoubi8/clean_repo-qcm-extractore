@@ -1,4 +1,5 @@
 import os
+from modules.utils import run_env  # per-run config overlay (see run_env.py)
 import json
 import time
 from typing import List, Dict, Any, Optional
@@ -21,7 +22,7 @@ class OCRProcessor:
         self.client = vision_client
         self.output_dir_base = output_dir_base
         # Default to env setting or fall back to efficient model
-        self.model = model_name or os.getenv("OCR_MODEL", "qwen/qwen-2.5-vl-7b-instruct")
+        self.model = model_name or run_env.getenv("OCR_MODEL", "qwen/qwen-2.5-vl-7b-instruct")
         
     def collect_ocr_guidance(self) -> str:
         """Interactive prompt for OCR hints"""

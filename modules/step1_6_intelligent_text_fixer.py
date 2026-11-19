@@ -1,4 +1,6 @@
 import os
+from modules.utils import run_env  # per-run config overlay (see run_env.py)
+from modules.openrouter_client import OpenRouterFatalError
 import re
 from pathlib import Path
 from typing import Dict, Any, List
@@ -38,9 +40,9 @@ class Step1_6IntelligentTextFixer:
             return {"status": "error"}
             
         # Parse config
-        primary_model = os.getenv("STEP1_6_MODEL", "meta-llama/llama-3.3-70b-instruct")
-        fallback_model = os.getenv("STEP1_6_FALLBACK_MODEL", "google/gemini-2.0-flash-lite-001")
-        max_tokens = int(os.getenv("STEP1_6_MAX_TOKENS", "4000"))
+        primary_model = run_env.getenv("STEP1_6_MODEL", "meta-llama/llama-3.3-70b-instruct")
+        fallback_model = run_env.getenv("STEP1_6_FALLBACK_MODEL", "google/gemini-2.0-flash-lite-001")
+        max_tokens = int(run_env.getenv("STEP1_6_MAX_TOKENS", "4000"))
         guidance = config.get("guidance", "Focus on medical French terminology. l/I confusion, missing accents.") if config else ""
         
         print(f"🧠 Using AI: {primary_model}")
@@ -50,7 +52,7 @@ class Step1_6IntelligentTextFixer:
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
             future_to_file = {
-                executor.submit(self._fix_text_file, txt_file, primary_model, fallback_model, max_tokens, guidance): txt_file
+                executor.submit(run_env.bind(self._fix_text_file), txt_file, primary_model, fallback_model, max_tokens, guidance): txt_file
                 for txt_file in txt_files
             }
             
@@ -85,6 +87,8 @@ TEXT:
             try:
                 response = self.client.generate_completion(prompt, model=primary_model, max_tokens=max_tokens)
                 used_model = primary_model
+            except OpenRouterFatalError:
+                raise  # bad key / no credits: abort, don't loop
             except Exception as e:
                 print(f"  [WARN] Primary model failed for {txt_file.name}: {e}")
                 print(f"  [INFO] Retrying with fallback: {fallback_model}")
@@ -106,6 +110,8 @@ TEXT:
             txt_file.write_text(fixed_content, encoding='utf-8')
             print(f"  ✅ Fixed {txt_file.name}")
             return True
+        except OpenRouterFatalError:
+            raise  # bad key / no credits: abort, don't loop
         except Exception as e:
             print(f"  ❌ Error fixing {txt_file.name}: {e}")
             return False

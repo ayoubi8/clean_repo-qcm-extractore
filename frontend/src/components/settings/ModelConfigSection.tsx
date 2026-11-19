@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { fetchEnvKeysRaw, saveEnvKeys, fetchAvailableModels } from '../../lib/api';
+import { useAuthStore } from '../../store/authStore';
 
 const STEP_KEYS = [
   { label: 'Step 1 (OCR)',       keys: ['STEP1_MODEL',          'STEP1_FALLBACK_MODEL'] },
@@ -27,6 +28,8 @@ export function ModelConfigSection() {
   const [loading,         setLoading]         = useState(true);
   const [saving,          setSaving]          = useState(false);
   const [status,          setStatus]          = useState<string | null>(null);
+  // Global model defaults are admin-only on the backend (POST /env → 403).
+  const isAdmin = useAuthStore((s) => s.user?.is_admin === true);
 
   useEffect(() => {
     async function load() {
@@ -206,9 +209,14 @@ export function ModelConfigSection() {
               {status}
             </span>
           )}
+          {!isAdmin && (
+            <span className="text-xs text-on-surface-variant">
+              Global models are set by the admin. Pick models per run in each step's panel.
+            </span>
+          )}
           <button
             onClick={handleSave}
-            disabled={saving}
+            disabled={saving || !isAdmin}
             className="px-8 py-3 bg-on-surface text-surface rounded-full font-black uppercase tracking-widest text-[10px] hover:scale-105 active:scale-95 disabled:opacity-50 transition-all shadow-xl shadow-surface-container-highest"
           >
             {saving ? 'Updating...' : 'Save Models'}

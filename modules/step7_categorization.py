@@ -1,5 +1,7 @@
 import json
 import os
+from modules.utils import run_env  # per-run config overlay (see run_env.py)
+from modules.openrouter_client import OpenRouterFatalError
 from pathlib import Path
 from typing import Dict, List, Any
 
@@ -153,14 +155,16 @@ class Step7Categorization:
         
         prompt = self._build_prompt_with_context(q_text, props_text, domain)
         
-        primary_model = os.getenv("STEP7_MODEL", "meta-llama/llama-3.3-70b-instruct")
-        fallback_model = os.getenv("STEP7_FALLBACK_MODEL", "google/gemini-2.0-flash-lite-001")
-        max_tokens = int(os.getenv("STEP7_MAX_TOKENS", "4000"))
+        primary_model = run_env.getenv("STEP7_MODEL", "meta-llama/llama-3.3-70b-instruct")
+        fallback_model = run_env.getenv("STEP7_FALLBACK_MODEL", "google/gemini-2.0-flash-lite-001")
+        max_tokens = int(run_env.getenv("STEP7_MAX_TOKENS", "4000"))
         
         try:
             try:
                 resp = self.llama.generate_completion(prompt, model=primary_model, max_tokens=max_tokens)
                 model_used = primary_model
+            except OpenRouterFatalError:
+                raise  # bad key / no credits: abort, don't loop
             except Exception as e:
                 print(f"⚠️ Primary model failed: {e}")
                 print(f"🔄 Retrying with fallback: {fallback_model}...")
@@ -176,6 +180,8 @@ class Step7Categorization:
             # Prone to extra chars, so we try to fuzzy match back to DB keys
             return self._fuzzy_match_module(content, domain)
             
+        except OpenRouterFatalError:
+            raise  # bad key / no credits: abort, don't loop
         except Exception as e:
             print(f"Error AI: {e}")
             return "Inconnu"

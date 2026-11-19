@@ -22,6 +22,7 @@ import json
 import uuid
 from datetime import datetime
 import os
+from modules.utils import run_env  # per-run config overlay (see run_env.py)
 import re
 import sys
 import unicodedata
@@ -220,16 +221,16 @@ class Step8Matcher:
         self.context = project_context
 
         # Read .env config (with sane defaults)
-        self.ref_db_path   = os.getenv("REFERENCE_DB_PATH", "").strip().strip('"').strip("'")
-        self.threshold     = float(os.getenv("MATCH_THRESHOLD", "0.75"))
-        self.mode          = os.getenv("MATCH_MODE", "text_only").strip().lower()
-        self.text_weight   = float(os.getenv("MATCH_TEXT_WEIGHT", "0.7"))
-        self.corr_weight   = float(os.getenv("MATCH_CORRECTION_WEIGHT", "0.3"))
-        self.color_green   = float(os.getenv("MATCH_COLOR_GREEN", "0.90"))
-        self.color_yellow  = float(os.getenv("MATCH_COLOR_YELLOW", "0.75"))
+        self.ref_db_path   = run_env.getenv("REFERENCE_DB_PATH", "").strip().strip('"').strip("'")
+        self.threshold     = float(run_env.getenv("MATCH_THRESHOLD", "0.75"))
+        self.mode          = run_env.getenv("MATCH_MODE", "text_only").strip().lower()
+        self.text_weight   = float(run_env.getenv("MATCH_TEXT_WEIGHT", "0.7"))
+        self.corr_weight   = float(run_env.getenv("MATCH_CORRECTION_WEIGHT", "0.3"))
+        self.color_green   = float(run_env.getenv("MATCH_COLOR_GREEN", "0.90"))
+        self.color_yellow  = float(run_env.getenv("MATCH_COLOR_YELLOW", "0.75"))
         # NEW: tag-merge phase config
-        self.auto_merge_floor = float(os.getenv("MATCH_AUTO_MERGE_FLOOR", "0.97"))
-        self.self_scan        = os.getenv("MATCH_SELF_SCAN", "0").strip() == "1"
+        self.auto_merge_floor = float(run_env.getenv("MATCH_AUTO_MERGE_FLOOR", "0.97"))
+        self.self_scan        = run_env.getenv("MATCH_SELF_SCAN", "0").strip() == "1"
         self._source_label = "Unknown"  # set during _resolve_source
         self._ref_path_used: Optional[str] = None  # set during _resolve_ref_db
 

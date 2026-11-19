@@ -47,6 +47,8 @@ same uid set (mirrors the Q8 fast-path in post_step2_metadata).
 import asyncio
 import json
 import os
+from modules.utils import run_env  # per-run config overlay (see run_env.py)
+from modules.openrouter_client import OpenRouterFatalError
 import re
 import threading
 import time
@@ -286,6 +288,8 @@ async def _ask_verdict_async(client: OpenRouterClient, tracker, prompt: str,
                 model, resp.get("usage", {}))
             tracker.log_api_call("cc_checker", model, resp.get("usage", {}), cost)
             return {"status": "ok", "model": model, **verdict}
+        except OpenRouterFatalError:
+            raise  # bad key / no credits: abort, don't loop
         except Exception as e:
             print(f"[CC-CHECK] ⚠️ Verification call failed ({model}): {e}")
             continue
@@ -389,9 +393,9 @@ def run_boundary_checks(tracker, context) -> Dict:
         except Exception:
             pass
 
-    primary_model  = os.getenv("CC_CHECKER_MODEL", DEFAULT_CC_MODEL)
-    fallback_model = os.getenv("CC_CHECKER_FALLBACK_MODEL", DEFAULT_CC_FALLBACK)
-    max_tokens = max(int(os.getenv("CC_CHECKER_MAX_TOKENS") or "500"), 500)
+    primary_model  = run_env.getenv("CC_CHECKER_MODEL", DEFAULT_CC_MODEL)
+    fallback_model = run_env.getenv("CC_CHECKER_FALLBACK_MODEL", DEFAULT_CC_FALLBACK)
+    max_tokens = max(int(run_env.getenv("CC_CHECKER_MAX_TOKENS") or "500"), 500)
 
     results: List[Dict] = []
     client = OpenRouterClient()
@@ -855,18 +859,18 @@ def run_clinical_case_checker(tracker, context) -> Dict:
               "Delete step3_metadata/clinical_case_verification.json to force re-verification.")
         return {"status": "skipped"}
 
-    primary_model  = os.getenv("CC_CHECKER_MODEL", DEFAULT_CC_MODEL)
-    fallback_model = os.getenv("CC_CHECKER_FALLBACK_MODEL", DEFAULT_CC_FALLBACK)
-    max_tokens     = int(os.getenv("CC_CHECKER_MAX_TOKENS") or "500")
+    primary_model  = run_env.getenv("CC_CHECKER_MODEL", DEFAULT_CC_MODEL)
+    fallback_model = run_env.getenv("CC_CHECKER_FALLBACK_MODEL", DEFAULT_CC_FALLBACK)
+    max_tokens     = int(run_env.getenv("CC_CHECKER_MAX_TOKENS") or "500")
     print(f"[CC-CHECK] Model: {primary_model} (fallback: {fallback_model})")
 
     client = OpenRouterClient()
     try:
-        max_parallel = max(1, int(os.getenv("CC_CHECKER_MAX_PARALLEL")
+        max_parallel = max(1, int(run_env.getenv("CC_CHECKER_MAX_PARALLEL")
                                   or DEFAULT_CC_MAX_PARALLEL))
     except (TypeError, ValueError):
         max_parallel = DEFAULT_CC_MAX_PARALLEL
-    early_stop = (os.getenv("CC_CHECKER_EARLY_STOP", "1") != "0")
+    early_stop = (run_env.getenv("CC_CHECKER_EARLY_STOP", "1") != "0")
     print(f"[CC-CHECK] ▶ Starting: {len(chains)} clinical case chain(s) over "
           f"{sum(len(c['items']) for c in chains)} QCMs — parallel (max {max_parallel}), "
           f"early_stop={'on' if early_stop else 'off'}", flush=True)
@@ -889,7 +893,7 @@ def run_clinical_case_checker(tracker, context) -> Dict:
         def _worker() -> None:
             _box["res"] = asyncio.run(_verify_all_chains_async(**_gather_kwargs))
 
-        _wt = threading.Thread(target=_worker, daemon=True)
+        _wt = threading.Thread(target=run_env.bind(_worker), daemon=True)
         _wt.start()
         _wt.join()
         chain_results = _box["res"]

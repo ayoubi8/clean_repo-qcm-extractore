@@ -1,6 +1,11 @@
 import json
 import os
+from modules.utils import run_env  # per-run config overlay (see run_env.py)
+from modules.openrouter_client import OpenRouterFatalError
 import re
+import copy
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Any
 
@@ -180,7 +185,7 @@ class Step2QCMExtractBatch:
         
         return "\n\n".join(parts)
     
-    def _extract_all_qcms_batch(self, full_text: str, start_page: int, end_page: int, config: Dict = None, prev_page_qcm_numbers: list = None, cancel_check=None) -> List[Dict]:
+    def _extract_all_qcms_batch(self, full_text: str, start_page: int, end_page: int, config: Dict = None, prev_page_qcm_numbers: list = None, cancel_check=None, null_missing_numbers: bool = False) -> List[Dict]:
         """Extract all QCMs using batch LLM call with smart fallback.
         prev_page_qcm_numbers: list of integer QCM numbers extracted from the previous page/chunk.
         When provided, injected into the prompt so the LLM can infer sequential numbers
@@ -248,6 +253,18 @@ class Step2QCMExtractBatch:
                 f"If a number IS visible, preserve it and continue the sequence from there.\n"
             )
 
+        # Numbering rule. Sequential mode feeds the previous chunk's numbers so
+        # the model can continue a cropped sequence. Parallel mode has no
+        # previous chunk yet: the model must leave unseen numbers null (never
+        # guess - a guessed "1" would collide with the real Q1 downstream) and
+        # _fill_missing_numbers() completes them deterministically in page order.
+        if null_missing_numbers:
+            numbering_rule = ("- Preserve visible question numbers EXACTLY. If a question's number is NOT "
+                              "visible (missing or cropped), set \"number\": null - never guess it.")
+        else:
+            numbering_rule = ("- Preserve visible question numbers EXACTLY. If a question number is missing "
+                              "or cropped, use the PREVIOUS PAGE QCM NUMBERS above to assign the correct sequential number.")
+
         prompt = f"""Extract ALL QCMs (multiple choice questions) from these pages.
 {prev_numbers_block}
 {full_text}
@@ -258,7 +275,7 @@ IMPORTANT RULES:
 - The text is divided by markers in the format `=== PAGE X ===`. Each QCM MUST include a "page" field set to X, where X is the number from the `=== PAGE X ===` marker that appears IMMEDIATELY BEFORE the question text.
 - If a QCM spans two pages (question on one page, propositions on the next), assign it to the page where the QUESTION TEXT begins.
 - QCMs may span across page breaks — merge split QCMs but assign to the page of the question text.
-- Preserve visible question numbers EXACTLY. If a question number is missing or cropped, use the PREVIOUS PAGE QCM NUMBERS above to assign the correct sequential number.
+{numbering_rule}
 - Propositions may be labeled with LETTERS (A, B, C, D, E) or with NUMBERS (1, 2, 3, 4, 5) in the source — handle BOTH labeling styles the same way. Always output propositions keyed "a"-"e" in order, mapping a=1, b=2, c=3, d=4, e=5: label "1" and label "A" both go to the "a" field, label "2" and "B" both go to "b", and so on. Never invent a "1"-"5" key in the output.
 - Do NOT include Answer Key tables in the output.
 {guidance}
@@ -289,8 +306,8 @@ OUTPUT FORMAT (JSON array):
 Return ONLY the JSON array, no markdown, no explanation.
 """
         
-        primary_model = os.getenv("STEP2_MODEL", "google/gemini-2.5-flash-lite-preview-09-2025")
-        fallback_model = os.getenv("STEP2_FALLBACK_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
+        primary_model = run_env.getenv("STEP2_MODEL", "google/gemini-2.5-flash-lite-preview-09-2025")
+        fallback_model = run_env.getenv("STEP2_FALLBACK_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
         # Promotion scope = THIS call (one chunk) only: start on primary
         # unless the primary failed 2+ consecutive chunks (fail streak). The
         # old sticky latch pinned fallback for the rest of Step 2 after a
@@ -302,8 +319,8 @@ Return ONLY the JSON array, no markdown, no explanation.
         if self._step2_promoted_to_fallback:
             print(f"[INFO] Primary failed {streak} chunk(s) in a row — starting this chunk on fallback: {fallback_model}")
         active_model = fallback_model if self._step2_promoted_to_fallback else primary_model
-        base_max_tokens = int(os.getenv("STEP2_MAX_TOKENS", "20000"))
-        max_retries = int(os.getenv("STEP2_MAX_RETRIES", "3"))
+        base_max_tokens = int(run_env.getenv("STEP2_MAX_TOKENS", "20000"))
+        max_retries = int(run_env.getenv("STEP2_MAX_RETRIES", "3"))
         retries = max(1, max_retries)  # at least 1 attempt
 
         result_qcms: List[Dict] = []
@@ -316,7 +333,7 @@ Return ONLY the JSON array, no markdown, no explanation.
             # A larger budget on the retry lets the model finish writing all QCMs.
             max_tokens = int(base_max_tokens * attempt)
             # Clamp to a safe ceiling so we never send an absurd value.
-            max_tokens = min(max_tokens, int(os.getenv("STEP2_MAX_TOKENS_CEILING", "64000")))
+            max_tokens = min(max_tokens, int(run_env.getenv("STEP2_MAX_TOKENS_CEILING", "64000")))
             attempt_note = f"  (attempt {attempt}/{retries})" if retries > 1 else ""
 
             print(f"[API] Trying {active_model}...{attempt_note}")
@@ -328,6 +345,8 @@ Return ONLY the JSON array, no markdown, no explanation.
                         max_tokens=max_tokens
                     )
                     model_used = active_model
+                except OpenRouterFatalError:
+                    raise   # bad key / no credits: every page would fail — abort the step
                 except Exception as e:
                     if active_model == primary_model:
                         self._step2_promoted_to_fallback = True
@@ -344,6 +363,8 @@ Return ONLY the JSON array, no markdown, no explanation.
                     )
                     model_used = active_model
 
+            except OpenRouterFatalError:
+                raise
             except Exception as e2:
                 print(f"❌ Both primary and fallback models failed. Final error: {e2}")
                 if attempt < retries:
@@ -366,10 +387,24 @@ Return ONLY the JSON array, no markdown, no explanation.
 
             print(f"[OK] Used {model_used} (${cost:.4f})")
 
+            # Truncation guard: finish_reason == "length" means the model hit
+            # max_tokens mid-array. _parse_json would still SALVAGE the complete
+            # objects, and a non-empty salvage used to count as success — the
+            # QCMs after the cut were silently lost. Retry with the larger
+            # budget instead; keep the salvage only on the last attempt.
+            truncated = response.get("finish_reason") == "length"
+            if truncated and attempt < retries:
+                print(f"[TRUNCATED] Output hit max_tokens={max_tokens:,} on pages "
+                      f"{start_page}–{end_page} — discarding the partial result and "
+                      f"retrying with a larger budget (attempt {attempt + 1}/{retries}).")
+                continue
+
             # Parse JSON and separate correction-page markers from real QCM
             # rows BEFORE deciding whether to retry.
             qcms = self._parse_json(content)
-            qcms = self._parse_json(content)
+            if truncated and qcms:
+                print(f"[TRUNCATED] Final attempt still truncated — keeping {len(qcms)} complete "
+                      f"QCM(s); questions after the cut on pages {start_page}–{end_page} may be MISSING.")
 
             markers, rest = self._split_correction_markers(qcms, start_page, end_page)
             if markers:
@@ -473,7 +508,14 @@ Return ONLY the JSON array, no markdown, no explanation.
         d.mkdir(parents=True, exist_ok=True)
         return d / "correction_pages.json"
 
+    _correction_pages_lock = threading.Lock()
+
     def _save_correction_pages(self, pages: List[int]):
+        # Parallel chunks may detect correction pages at the same time.
+        with Step2QCMExtractBatch._correction_pages_lock:
+            return self._save_correction_pages_unlocked(pages)
+
+    def _save_correction_pages_unlocked(self, pages: List[int]):
         """Merge detected correction-page numbers into the sidecar
         step2_qcm/accepted/correction_pages.json (idempotent, append-only).
         Step 6 reads this file to target answer-key pages directly."""
@@ -778,6 +820,11 @@ Return ONLY the JSON array, no markdown, no explanation.
         print(f"\n🔁 AUTO-LOOP MODE: {total_pages} pages → {total_chunks} chunks of {chunk_size}")
         print(f"   Each chunk = 1 LLM call. Results accumulate in all_qcms.json\n")
 
+        parallel = max(1, self._safe_int(run_env.getenv("STEP2_PARALLEL", "1"), 1))
+        if parallel > 1 and total_chunks > 1:
+            return self._run_loop_mode_parallel(chunks, txt_files, correction_map, config,
+                                                cancel_check, parallel)
+
         total_extracted = 0
         prev_page_qcm_numbers = None  # Tracks QCM numbers from the last processed chunk
 
@@ -838,6 +885,100 @@ Return ONLY the JSON array, no markdown, no explanation.
 
         print(f"\n✅ AUTO-LOOP COMPLETE — All {total_chunks} chunks processed.")
         return total_extracted
+
+    @staticmethod
+    def _fill_missing_numbers(qcms: List[Dict], prev_numbers: list = None) -> List[Dict]:
+        """Deterministic numbering repair (replaces the LLM's previous-page
+        context in parallel mode): QCMs come back in reading order, so a QCM
+        without a visible number is the one after the last known number."""
+        last = max(prev_numbers) if prev_numbers else 0
+        for q in qcms:
+            n = q.get("number")
+            if isinstance(n, str) and n.strip().isdigit():
+                n = int(n.strip())
+                q["number"] = n
+            if isinstance(n, int) and not isinstance(n, bool) and n > 0:
+                last = n
+                continue
+            last += 1
+            q["number"] = last
+            print(f"   🔢 [SEQ-FILL] page {q.get('page', '?')}: number not visible → assigned #{last}")
+        return qcms
+
+    def _run_loop_mode_parallel(self, chunks: List[List[Path]], txt_files: List[Path], correction_map: Dict,
+                                config: Dict, cancel_check, parallel: int) -> int:
+        """Parallel auto-loop: LLM extraction for up to `parallel` chunks at
+        once; everything order-dependent (numbering repair, corrections,
+        incomplete-QCM re-extraction, saving) still runs sequentially in page
+        order, as soon as each next chunk is available - partial progress is
+        saved exactly like the sequential loop."""
+        from modules.utils.call_logger import item_scope
+        total_chunks = len(chunks)
+        print(f"⚡ PARALLEL MODE: {total_chunks} chunks, {parallel} LLM calls at a time "
+              f"(STEP2_PARALLEL={parallel}). Numbers that are not visible are filled in page order.")
+
+        def extract(i: int, chunk: List[Path]):
+            if cancel_check and cancel_check():
+                return i, None
+            worker = copy.copy(self)          # private per-chunk retry / fallback state
+            start_p = self._extract_page_number(chunk[0].name)
+            end_p = self._extract_page_number(chunk[-1].name)
+            print(f"📦 Chunk {i}/{total_chunks}: pages {start_p}–{end_p} started")
+            with item_scope(f"chunk_{i}/{total_chunks} (pages {start_p}-{end_p})"):
+                qcms = worker._extract_all_qcms_batch(
+                    self._concatenate_pages(chunk), start_p, end_p, config,
+                    prev_page_qcm_numbers=None, cancel_check=cancel_check,
+                    null_missing_numbers=True)
+            return i, qcms
+
+        ready: Dict[int, Any] = {}
+        state = {"next": 1, "total": 0, "prev": None}
+
+        def drain():
+            while state["next"] in ready:
+                i = state["next"]
+                chunk = chunks[i - 1]
+                qcms = ready.pop(i)
+                start_p = self._extract_page_number(chunk[0].name)
+                end_p = self._extract_page_number(chunk[-1].name)
+                if qcms:
+                    qcms = self._stamp_pages(qcms, chunk)
+                    qcms = self._fill_missing_numbers(qcms, state["prev"])
+                    valid = [q["number"] for q in qcms if isinstance(q.get("number"), int) and q["number"] > 0]
+                    if valid:
+                        state["prev"] = valid
+                    if correction_map:
+                        applied = 0
+                        for qcm in qcms:
+                            qnum = str(qcm.get('number'))
+                            if qnum in correction_map:
+                                qcm['Correct'] = correction_map[qnum]
+                                applied += 1
+                        print(f"✅ Applied {applied} corrections to extracted QCMs.")
+                    qcms = self._apply_incomplete_fix(qcms, txt_files, config, cancel_check)
+                    self._save_batch_results_accumulate(qcms)
+                    state["total"] += len(qcms)
+                    print(f"✅ Chunk {i}/{total_chunks} (pages {start_p}–{end_p}): {len(qcms)} QCM(s) saved")
+                elif qcms is not None:
+                    print(f"⚠️  No QCMs extracted for chunk {i} (pages {start_p}–{end_p}). Skipping.")
+                state["next"] = i + 1
+
+        executor = ThreadPoolExecutor(max_workers=parallel)
+        futures = [executor.submit(run_env.bind(extract), i, c) for i, c in enumerate(chunks, start=1)]
+        try:
+            for fut in as_completed(futures):
+                i, qcms = fut.result()        # fatal key errors propagate and abort the step
+                ready[i] = qcms
+                drain()
+                if cancel_check and cancel_check():
+                    print(f"\n⏸ Stop requested — {state['total']} QCM(s) already saved.")
+                    break
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+        drain()
+        print(f"\n✅ PARALLEL LOOP COMPLETE — {state['total']} QCM(s) from "
+              f"{state['next'] - 1}/{total_chunks} chunk(s).")
+        return state["total"]
 
     def _compute_min_prop_threshold(self, qcms: List[Dict]) -> int:
         """

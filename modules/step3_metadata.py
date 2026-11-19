@@ -1,5 +1,7 @@
 import json
 import os
+from modules.utils import run_env  # per-run config overlay (see run_env.py)
+from modules.openrouter_client import OpenRouterFatalError
 import re
 from pathlib import Path
 from typing import Dict, List, Optional, Any
@@ -187,7 +189,7 @@ class Step3Metadata:
         if pages:
             print(f"   Extracting from pages: {pages}")
             texts = []
-            max_input_chars = int(os.getenv("STEP3_MAX_INPUT_CHARS") or "50000")
+            max_input_chars = int(run_env.getenv("STEP3_MAX_INPUT_CHARS") or "50000")
             for page_num in pages:
                 file_path = Path(step1_dir) / f"page_{page_num}.txt"
                 if file_path.exists():
@@ -196,7 +198,7 @@ class Step3Metadata:
             text = "\n\n".join(texts)
         else:
             print("   Extracting from page 1 (default)")
-            max_input_chars = int(os.getenv("STEP3_MAX_INPUT_CHARS") or "50000")
+            max_input_chars = int(run_env.getenv("STEP3_MAX_INPUT_CHARS") or "50000")
             with open(txt_files[0], 'r', encoding='utf-8') as f:
                 text = f.read(max_input_chars)
             
@@ -250,7 +252,7 @@ class Step3Metadata:
 
         nums_str = ", ".join(str(n) for n in qcm_numbers) if qcm_numbers else "(unknown)"
 
-        max_input_chars = int(os.getenv("STEP3_MAX_INPUT_CHARS", "24000"))
+        max_input_chars = int(run_env.getenv("STEP3_MAX_INPUT_CHARS", "24000"))
 
         prompt = f"""You are analyzing a French medical exam page to detect clinical case (Cas Clinique) blocks.
 
@@ -280,14 +282,16 @@ Do NOT include any markdown fences, explanation, or extra text — ONLY the JSON
 RAW PAGE TEXT:
 {page_text[:max_input_chars]}"""
 
-        primary_model = os.getenv("STEP3_MODEL", "qwen/qwen3.6-plus-preview:free")
-        fallback_model = os.getenv("STEP3_FALLBACK_MODEL", "google/gemini-2.0-flash-lite-001")
-        max_tokens = int(os.getenv("STEP3_MAX_TOKENS") or "10000")
+        primary_model = run_env.getenv("STEP3_MODEL", "qwen/qwen3.6-plus-preview:free")
+        fallback_model = run_env.getenv("STEP3_FALLBACK_MODEL", "google/gemini-2.0-flash-lite-001")
+        max_tokens = int(run_env.getenv("STEP3_MAX_TOKENS") or "10000")
         
         try:
             try:
                 resp = self.client.generate_completion(prompt, model=primary_model, max_tokens=max_tokens)
                 model_used = primary_model
+            except OpenRouterFatalError:
+                raise  # bad key / no credits: abort, don't loop
             except Exception as e:
                 print(f"⚠️ Primary model failed for CC detection: {e}")
                 print(f"🔄 Retrying with fallback: {fallback_model}...")
@@ -396,14 +400,16 @@ Do NOT include markdown fences, explanation, or extra text — ONLY the JSON arr
 DOCUMENT:
 {full_doc_text}"""
 
-        primary_model  = os.getenv("STEP3_MODEL", "qwen/qwen3.6-plus-preview:free")
-        fallback_model = os.getenv("STEP3_FALLBACK_MODEL", "google/gemini-2.0-flash-lite-001")
-        max_tokens     = int(os.getenv("STEP3_MAX_TOKENS") or "10000")
+        primary_model  = run_env.getenv("STEP3_MODEL", "qwen/qwen3.6-plus-preview:free")
+        fallback_model = run_env.getenv("STEP3_FALLBACK_MODEL", "google/gemini-2.0-flash-lite-001")
+        max_tokens     = int(run_env.getenv("STEP3_MAX_TOKENS") or "10000")
 
         try:
             try:
                 resp = self.client.generate_completion(prompt, model=primary_model, max_tokens=max_tokens)
                 model_used = primary_model
+            except OpenRouterFatalError:
+                raise  # bad key / no credits: abort, don't loop
             except Exception as e:
                 print(f"⚠️ Primary model failed for document CC detection: {e}")
                 print(f"🔄 Retrying with fallback: {fallback_model}...")
@@ -1133,7 +1139,7 @@ DOCUMENT:
             nums_str = "none — this page holds no numbered questions"
         else:
             nums_str = ", ".join(str(n) for n in qcm_numbers)
-        max_input_chars = int(os.getenv("STEP3_MAX_INPUT_CHARS", "24000"))
+        max_input_chars = int(run_env.getenv("STEP3_MAX_INPUT_CHARS", "24000"))
 
         if carry_over:
             co = carry_over
@@ -1261,9 +1267,9 @@ PAGE TEXT:
 
         # V4-0: reasoning-capable primary, fast model kept for outage
         # resilience only (env knobs reused — no new config surface).
-        primary_model  = os.getenv("STEP3_MODEL", "google/gemini-2.5-pro")
-        fallback_model = os.getenv("STEP3_FALLBACK_MODEL", "google/gemini-2.5-flash-lite")
-        max_tokens     = int(os.getenv("STEP3_MAX_TOKENS") or "10000")
+        primary_model  = run_env.getenv("STEP3_MODEL", "google/gemini-2.5-pro")
+        fallback_model = run_env.getenv("STEP3_FALLBACK_MODEL", "google/gemini-2.5-flash-lite")
+        max_tokens     = int(run_env.getenv("STEP3_MAX_TOKENS") or "10000")
 
         # FIX-2/FIX-3 (ratrapage run): a model call "succeeding" is not enough
         # — BLANK responses (null/whitespace) and UNPARSABLE responses are
@@ -1278,7 +1284,17 @@ PAGE TEXT:
             if attempt_label == "fallback":
                 print(f"🔄 Retrying with fallback: {fallback_model}...")
             try:
-                resp = self.client.generate_completion(prompt, model=attempt_model, max_tokens=max_tokens)
+                # Optional reasoning budget (OpenRouter `reasoning` param). A
+                # reasoning model's thinking tokens count against max_tokens;
+                # capping them leaves room for the JSON answer. Opt-in so
+                # non-reasoning models / existing runs are unchanged.
+                _extra = {}
+                _rb = str(run_env.getenv("STEP3_REASONING_MAX_TOKENS", "") or "").strip()
+                if _rb.isdigit() and int(_rb) > 0:
+                    _extra["reasoning"] = {"max_tokens": int(_rb)}
+                resp = self.client.generate_completion(prompt, model=attempt_model, max_tokens=max_tokens, **_extra)
+            except OpenRouterFatalError:
+                raise  # bad key / no credits: abort, don't loop
             except Exception as e:
                 print(f"⚠️ {attempt_label} model failed for CC sequential detection: {e}")
                 continue
@@ -1288,7 +1304,12 @@ PAGE TEXT:
                 content, qcm_numbers)
 
             if not content:
-                print(f"⚠️ {attempt_label} model returned an empty/blank response — treating as failure.")
+                if resp.get("finish_reason") == "length":
+                    print(f"⚠️ {attempt_label} model ({attempt_model}) returned NOTHING because it hit "
+                          f"max_tokens={max_tokens:,} — a reasoning model spent the whole budget thinking. "
+                          f"Raise STEP3_MAX_TOKENS or set STEP3_REASONING_MAX_TOKENS (e.g. 4000).")
+                else:
+                    print(f"⚠️ {attempt_label} model returned an empty/blank response — treating as failure.")
                 continue
             if status_map is None:
                 print(f"⚠️ No JSON array found in CC response ({attempt_label} model).")
@@ -1583,14 +1604,16 @@ INSTRUCTIONS:
 - "faculty": the matched faculty from VALID FACULTIES (intermediate field, used to derive Source).
 If a field is not found or ambiguous, use null.
 """
-        primary_model = os.getenv("STEP3_MODEL", "qwen/qwen3.6-plus-preview:free")
-        fallback_model = os.getenv("STEP3_FALLBACK_MODEL", "google/gemini-2.0-flash-lite-001")
-        max_tokens = int(os.getenv("STEP3_MAX_TOKENS") or "10000")
+        primary_model = run_env.getenv("STEP3_MODEL", "qwen/qwen3.6-plus-preview:free")
+        fallback_model = run_env.getenv("STEP3_FALLBACK_MODEL", "google/gemini-2.0-flash-lite-001")
+        max_tokens = int(run_env.getenv("STEP3_MAX_TOKENS") or "10000")
         
         try:
             try:
                 resp = self.client.generate_completion(prompt, model=primary_model, max_tokens=max_tokens)
                 model_used = primary_model
+            except OpenRouterFatalError:
+                raise  # bad key / no credits: abort, don't loop
             except Exception as e:
                 print(f"⚠️ Primary metadata extraction failed: {e}")
                 print(f"🔄 Retrying with fallback: {fallback_model}...")
@@ -1631,6 +1654,8 @@ If a field is not found or ambiguous, use null.
             else:
                  print("⚠️ No JSON object found in response.")
 
+        except OpenRouterFatalError:
+            raise  # bad key / no credits: abort, don't loop
         except Exception as e:
             print(f"⚠️ Metadata extraction failed: {e}")
             
