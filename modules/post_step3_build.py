@@ -16,23 +16,27 @@ from modules.step5_builder import Step5Builder
 
 # Default skeleton mirroring the columns of the repo's Template.xlsx file.
 # Includes ALL fields (= "all Fields to Include" preset from the old Step 4 UI).
+# Columns only: every value is None. The old example values (Year 2024,
+# Tag ["Externat","2024"], Correct "ABC", categoryName "Cardiologie"...) leaked
+# into the export whenever a QCM lacked that field (plan P9).
 DEFAULT_TEMPLATE_XLSX: Dict[str, Any] = {
-    "Num": 0,
+    "Num": None,
+    "Number": None,
     "Cas": None,
-    "Text": "Question text here...",
-    "A": "Option A",
-    "B": "Option B",
-    "C": "Option C",
-    "D": "Option D",
-    "E": "Option E",
+    "Text": None,
+    "A": None,
+    "B": None,
+    "C": None,
+    "D": None,
+    "E": None,
     "Hint": None,
-    "Correct": "ABC",
-    "Exp": "",
-    "categoryName": "Cardiologie",
-    "tagSuggere": "Semiologie",
-    "Year": 2024,
-    "Tag": ["Externat", "2024"],
-    "Type": "QCS",
+    "Correct": None,
+    "Exp": None,
+    "categoryName": None,
+    "tagSuggere": None,
+    "Year": None,
+    "Tag": None,
+    "Type": None,
 }
 
 DEFAULT_TEMPLATE_NAME = "Default-Template-xlsx"
@@ -114,6 +118,11 @@ def run_post_step3_build(tracker, context, output_user_id: str = None,
             xlsx_dst = Path(step3_accepted) / Path(xlsx_src_str).name
             shutil.copy2(xlsx_src_str, xlsx_dst)
             print(f"[AUTO-BUILD] ✅ Copied xlsx → step3_metadata/accepted/{xlsx_dst.name}")
+        for key in ("mbset_import_file", "mbset_report_file"):
+            src = s5_result.get(key, "")
+            if src and Path(src).exists():
+                shutil.copy2(src, Path(step3_accepted) / Path(src).name)
+                print(f"[AUTO-BUILD] ✅ Copied {Path(src).name} → step3_metadata/accepted/")
     except Exception as copy_e:
         print(f"[AUTO-BUILD] ⚠️ Failed to surface merged result into step3 output: {copy_e}")
 

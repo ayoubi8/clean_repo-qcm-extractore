@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { fetchAuthenticatedBlobUrl, downloadAuthenticatedFile, syncFromSheets, deleteStepOutput } from '../../lib/api';
 import { ensureStepOutput, reloadStepOutput, removeCachedFile } from '../../store/outputsCache';
 import { usePipelineStore } from '../../store/pipelineStore';
@@ -33,6 +33,9 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
   const [previewFile, setPreviewFile] = useState<string | null>(null);
   const [previewContent, setPreviewContent] = useState<string>('');
   const [previewLoading, setPreviewLoading] = useState(false);
+  // "Needs review" filter (exam papers plan §6 UI): QCMs carrying review_flags
+  // (suspect / missing exam number, origin mismatch, ambiguous correction…).
+  const [reviewOnly, setReviewOnly] = useState(false);
   const [sheetsLoading, setSheetsLoading] = useState<string | null>(null);
   
   // History state
@@ -222,6 +225,28 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
     }
   };
 
+  const flaggedQcms = useMemo(() => {
+    if (!previewFile || !previewFile.endsWith('.json') || !previewContent.trimStart().startsWith('[')) return [];
+    try {
+      const data = JSON.parse(previewContent);
+      if (!Array.isArray(data)) return [];
+      return data.filter((q: any) => q && Array.isArray(q.review_flags) && q.review_flags.length > 0);
+    } catch {
+      return [];
+    }
+  }, [previewFile, previewContent]);
+
+  const reviewText = useMemo(() => JSON.stringify(
+    flaggedQcms.map((q: any) => ({
+      Num: q.Num ?? q.number,
+      Number: q.Number ?? q.papers?.[0]?.number ?? null,
+      page: q.page,
+      session: q.session ?? null,
+      origin_line: q.origin_line ?? null,
+      review_flags: q.review_flags,
+      Text: String(q.Text ?? q.text ?? '').slice(0, 120),
+    })), null, 2), [flaggedQcms]);
+
   const openPreview = async (file: any) => {
     if (file.name === previewFile) {
       setPreviewFile(null);
@@ -229,6 +254,7 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
       return;
     }
     setPreviewFile(file.name);
+    setReviewOnly(false);
     setPreviewLoading(true);
     try {
       const encodedName = file.name.split('/').map(encodeURIComponent).join('/');
@@ -528,11 +554,27 @@ export function OutputViewer({ projectName, stepId }: OutputViewerProps) {
 
             {previewFile === file.name && !file.name.endsWith('.xlsx') && (
               <div className="animate-in slide-in-from-top-2 fade-in duration-300 ml-4">
+                {!previewLoading && flaggedQcms.length > 0 && (
+                  <div className="flex justify-end mb-2">
+                    <button
+                      id="btn-output-needs-review"
+                      onClick={() => setReviewOnly(v => !v)}
+                      aria-pressed={reviewOnly}
+                      className={`px-3 py-1.5 rounded-lg text-[10px] font-bold uppercase tracking-widest border transition-colors ${
+                        reviewOnly
+                          ? 'bg-tertiary/10 border-tertiary/40 text-tertiary'
+                          : 'border-outline-variant/20 text-outline hover:text-tertiary hover:border-tertiary/30'
+                      }`}
+                    >
+                      {reviewOnly ? 'Show all' : `Needs review (${flaggedQcms.length})`}
+                    </button>
+                  </div>
+                )}
                 <div className="bg-surface-container-lowest rounded-xl border border-outline-variant/20 p-4 font-mono text-[11px] leading-relaxed overflow-x-auto custom-scrollbar max-h-96 whitespace-pre-wrap">
                   {previewLoading ? (
                     <div className="flex items-center justify-center py-8 text-outline italic">Loading content...</div>
                   ) : (
-                    <code className="text-on-surface-variant">{previewContent}</code>
+                    <code className="text-on-surface-variant">{reviewOnly ? reviewText : previewContent}</code>
                   )}
                 </div>
               </div>

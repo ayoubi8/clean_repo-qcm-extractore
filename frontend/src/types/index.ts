@@ -31,6 +31,11 @@ export interface AutoRunBatchConfig {
     model_fallback?: string
     extraction_guidance?: string
     clinical_case_hints?: boolean
+    // Exam papers (plan §7): document type + paper defaults
+    exam_mode?: 'auto' | 'single_paper' | 'compilation'
+    exam_source?: string
+    exam_period?: string
+    exam_year?: string
     // Serialized metadata strategies (AutoRunPanel serializeStep3 shape)
     step3?: { config: Record<string, string>; global_values: Record<string, string>; global_pages: number[] }
   }
@@ -140,6 +145,11 @@ export interface Step2Config {
   model_fallback: string
   extraction_guidance: string
   clinical_case_hints: boolean
+  // Exam papers (plan §7) — optional so older persisted panels still load
+  exam_mode?: 'auto' | 'single_paper' | 'compilation'
+  exam_source?: string
+  exam_period?: string
+  exam_year?: string
 }
 
 export type MetaStrategy = 'skip' | 'global' | 'per_qcm' | 'per_group'

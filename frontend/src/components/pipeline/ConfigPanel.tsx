@@ -135,6 +135,10 @@ export function ConfigPanel() {
           model_fallback: s.model_fallback,
           extraction_guidance: s.extraction_guidance,
           clinical_case_hints: s.clinical_case_hints,
+          exam_mode: s.exam_mode ?? 'auto',
+          exam_source: s.exam_source ?? '',
+          exam_period: s.exam_period ?? '',
+          exam_year: s.exam_year ?? '',
           // Step 3 config is embedded in the merged Step 2 panel and
           // forwarded to run_post_step2_metadata. Includes huge_edit flag.
           step3: store.step3Config,

@@ -13,6 +13,8 @@ from modules.openrouter_client import OpenRouterClient
 from modules.utils.cost_tracker import CostTracker
 from modules.utils.prompt_helper import PromptHelper
 from modules.utils.file_manager import FileManager
+from modules.utils import exam_papers
+from modules.utils.exam_papers import extract_int
 
 
 class Step2QCMExtractBatch:
@@ -89,12 +91,21 @@ class Step2QCMExtractBatch:
         else:
             print(f"\n📋 [AUTO] Using page range: {page_range}")
         
+        # Exam document mode (plan §4.1): a classified compilation carries an
+        # origin line before each question and does NOT number sequentially.
+        self._page_texts = self._read_page_texts(txt_files)
+        requested_mode = ((config or {}).get("qcm_extraction", {}) or {}).get("exam_mode") \
+            or run_env.getenv("EXAM_MODE", "auto")
+        self._exam_mode = exam_papers.resolve_mode(requested_mode, self._page_texts)
+        print(f"📚 Exam document mode: {self._exam_mode} (requested: {requested_mode})")
+
         # Parse range
         loop_match = re.match(r'^(\d+)-\1-\1$', page_range.strip())
-        
+
         if loop_match:
             chunk_size = int(loop_match.group(1))
             total_extracted = self._run_loop_mode(txt_files, chunk_size, correction_map, config, cancel_check)
+            self._annotate_exam_papers()
             print(f"\n✅ Step 2 Complete. Total new/updated QCMs in this loop run: {total_extracted}")
             return {"total_extracted": total_extracted}
         else:
@@ -135,10 +146,52 @@ class Step2QCMExtractBatch:
             
             # Save results (Accumulate safe)
             self._save_batch_results_accumulate(all_qcms)
-            
+            self._annotate_exam_papers()
+
             print(f"\n✅ Step 2 Complete. Total new/updated QCMs in this run: {len(all_qcms)}")
             return {"total_extracted": len(all_qcms)}
 
+
+    def _read_page_texts(self, txt_files: List[Path]) -> Dict[int, str]:
+        texts: Dict[int, str] = {}
+        for f in txt_files:
+            try:
+                texts[self._extract_page_number(f.name)] = f.read_text(encoding="utf-8")
+            except Exception as e:
+                print(f"[WARN] Could not read {f.name} for exam-paper detection: {e}")
+        return texts
+
+    def _is_compilation(self) -> bool:
+        return getattr(self, "_exam_mode", None) == exam_papers.MODE_COMPILATION
+
+    def _annotate_exam_papers(self) -> None:
+        """Post-pass over the WHOLE all_qcms.json (plan §4-§5): numbering
+        scopes, exam papers from origin lines (cross-checked against the page
+        text), review flags. Idempotent; data only, exports unchanged."""
+        if self.context:
+            output_file = self.context.get_path("step2_qcm", "accepted") / "all_qcms.json"
+        else:
+            output_file = Path("output/step2_qcm/accepted/all_qcms.json")
+        if not output_file.exists():
+            return
+        try:
+            with open(output_file, "r", encoding="utf-8") as f:
+                qcms = json.load(f)
+            if not isinstance(qcms, list) or not qcms:
+                return
+            mode = getattr(self, "_exam_mode", None) or exam_papers.MODE_SINGLE
+            stats = exam_papers.annotate_qcms(qcms, getattr(self, "_page_texts", {}) or {}, mode)
+            qcms = sorted(qcms, key=exam_papers.reading_order_key)
+            with open(output_file, "w", encoding="utf-8") as f:
+                json.dump(qcms, f, indent=2, ensure_ascii=False)
+            flagged = sum(1 for q in qcms if q.get("review_flags"))
+            scopes = sorted({q.get("scope") for q in qcms})
+            print(f"📚 [EXAM-PAPERS] mode={mode} · scopes={scopes} · origin lines={stats['origin_line']} "
+                  f"(aligned {stats['aligned']}, mismatch {stats['mismatch']}, suspect {stats['suspect']}, "
+                  f"missing {stats['missing']}) · {flagged} QCM(s) flagged for review")
+        except Exception as e:
+            # Never lose Step 2 output over the post-pass.
+            print(f"[WARN] Exam-paper post-pass failed (Step 2 output kept as is): {e}")
 
     def _load_correction_map(self) -> Dict:
         """Load pre-extracted corrections if available."""
@@ -258,8 +311,23 @@ class Step2QCMExtractBatch:
         # previous chunk yet: the model must leave unseen numbers null (never
         # guess - a guessed "1" would collide with the real Q1 downstream) and
         # _fill_missing_numbers() completes them deterministically in page order.
+        # Exam origin lines + section headers (plan §6 Step 2). In a classified
+        # compilation every question is preceded by the exam it comes from;
+        # Python parses origin_raw deterministically after the run.
+        exam_rule = (
+            "- EXAM ORIGIN LINES: a question may be preceded by a line naming the exam it comes from, "
+            "e.g. \"• Question N° 32, Sec 01 de l'année 2021-2022\" or \"Question N° 07, Partie pratique, "
+            "Rattrapage de l'année 2020-2021\". That line belongs to the question that FOLLOWS it: copy it "
+            "VERBATIM into that question's \"origin_raw\" field. Never put it inside a proposition or the "
+            "question text. \"number\" is the number printed directly in front of the question text "
+            "(e.g. \"29-\"), NEVER the N° of the origin line. Omit \"origin_raw\" when no such line precedes the question.\n"
+            "- SECTION HEADERS: when a part / session / chapter heading (e.g. \"Partie pratique\", "
+            "\"Partie théorique\", \"Rattrapage\", a chapter title) appears above a question on these pages, "
+            "set that question's \"section_header\" to the latest such heading, verbatim. Omit it otherwise."
+        )
+
         if null_missing_numbers:
-            numbering_rule = ("- Preserve visible question numbers EXACTLY. If a question's number is NOT "
+            numbering_rule =("- Preserve visible question numbers EXACTLY. If a question's number is NOT "
                               "visible (missing or cropped), set \"number\": null - never guess it.")
         else:
             numbering_rule = ("- Preserve visible question numbers EXACTLY. If a question number is missing "
@@ -276,6 +344,7 @@ IMPORTANT RULES:
 - If a QCM spans two pages (question on one page, propositions on the next), assign it to the page where the QUESTION TEXT begins.
 - QCMs may span across page breaks — merge split QCMs but assign to the page of the question text.
 {numbering_rule}
+{exam_rule}
 - Propositions may be labeled with LETTERS (A, B, C, D, E) or with NUMBERS (1, 2, 3, 4, 5) in the source — handle BOTH labeling styles the same way. Always output propositions keyed "a"-"e" in order, mapping a=1, b=2, c=3, d=4, e=5: label "1" and label "A" both go to the "a" field, label "2" and "B" both go to "b", and so on. Never invent a "1"-"5" key in the output.
 - Do NOT include Answer Key tables in the output.
 {guidance}
@@ -296,12 +365,14 @@ OUTPUT FORMAT (JSON array):
       "d": "Fourth proposition",
       "e": "Fifth proposition"
     }},
-    "year": "2024"{cc_hint_format}
+    "year": "2024",
+    "origin_raw": "<the exam origin line printed before this question, verbatim — omit if none>",
+    "section_header": "<latest part/session/chapter heading above it, verbatim — omit if none>"{cc_hint_format}
   }}
 ]
 ("page" is REQUIRED for every QCM — read it from the `=== PAGE X ===` marker before the question.)
 (propositions are ALWAYS keyed "a"-"e" in the output, regardless of whether the source labels them A-E or 1-5.)
-(year{', clinical_case_hint' if cc_hint_enabled else ''} are optional, include only if detected.)
+(year, origin_raw, section_header{', clinical_case_hint' if cc_hint_enabled else ''} are optional, include only if detected.)
 
 Return ONLY the JSON array, no markdown, no explanation.
 """
@@ -678,10 +749,14 @@ Return ONLY the JSON array, no markdown, no explanation.
         for qcm in qcms:
             raw_num = qcm.get('number')
             raw_page = qcm.get('page')
-            if raw_num is None or not isinstance(raw_num, int):
-                safe_num = self._safe_int(raw_num, default=0)
-                if raw_num is None:
-                    print(f"  [SANITIZE] QCM with null number on page {raw_page} → assigned number=0 (manual review needed)")
+            if raw_num is None or not isinstance(raw_num, int) or isinstance(raw_num, bool):
+                # 'QuestionN010' / 'N° 7' / '12-' -> the digits inside (plan P3);
+                # int() alone turned every such label into 0.
+                safe_num = extract_int(raw_num) if not isinstance(raw_num, bool) else None
+                if safe_num is None:
+                    safe_num = 0
+                    print(f"  [SANITIZE] QCM with no readable number ({raw_num!r}) on page {raw_page} "
+                          f"→ assigned number=0 (manual review needed)")
                 qcm['number'] = safe_num
             if raw_page is None or not isinstance(raw_page, int):
                 qcm['page'] = self._safe_int(raw_page, default=0)
@@ -761,8 +836,11 @@ Return ONLY the JSON array, no markdown, no explanation.
                 added += 1
             existing_map[key] = qcm
 
-        # Sort by (page, number) - both ints, no more TypeError
-        merged = sorted(existing_map.values(), key=lambda q: (q['page'], q['number']))
+        # Sort in READING order: (page, position in the LLM response). Sorting
+        # by bare number put a "Partie pratique" Q1 before the theory Q40
+        # printed above it on the same page (plan §4.2). Legacy uids without a
+        # position fall back to the number.
+        merged = sorted(existing_map.values(), key=exam_papers.reading_order_key)
 
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(merged, f, indent=2, ensure_ascii=False)
@@ -840,20 +918,28 @@ Return ONLY the JSON array, no markdown, no explanation.
             print(f"📦 Chunk {i}/{total_chunks}: pages {start_p}–{end_p}  ({len(chunk)} pages)")
             print(f"{'='*60}")
 
-            if prev_page_qcm_numbers:
+            if prev_page_qcm_numbers and not self._is_compilation():
                 print(f"   📌 [SEQ-CONTEXT] Previous chunk QCM numbers: {sorted(prev_page_qcm_numbers)} → next expected #{max(prev_page_qcm_numbers) + 1}")
 
             full_text = self._concatenate_pages(chunk)
             from modules.utils.call_logger import item_scope
+            # Compilation: numbers are NOT sequential across pages (each
+            # question keeps the document position printed in front of it),
+            # so the previous-page sequence hint would push the model to
+            # renumber. Unseen numbers stay null and are filled in page order.
+            compilation = self._is_compilation()
             with item_scope(f"chunk_{i}/{total_chunks} (pages {start_p}-{end_p})"):
                 qcms = self._extract_all_qcms_batch(
                     full_text, start_p, end_p, config,
-                    prev_page_qcm_numbers=prev_page_qcm_numbers,
-                    cancel_check=cancel_check
+                    prev_page_qcm_numbers=None if compilation else prev_page_qcm_numbers,
+                    cancel_check=cancel_check,
+                    null_missing_numbers=compilation,
                 )
 
             if qcms:
                 qcms = self._stamp_pages(qcms, chunk)
+                if compilation:
+                    qcms = self._fill_missing_numbers(qcms, prev_page_qcm_numbers)
 
                 # Update context: collect valid integer QCM numbers for the next chunk
                 valid_numbers = [
@@ -894,9 +980,11 @@ Return ONLY the JSON array, no markdown, no explanation.
         last = max(prev_numbers) if prev_numbers else 0
         for q in qcms:
             n = q.get("number")
-            if isinstance(n, str) and n.strip().isdigit():
-                n = int(n.strip())
-                q["number"] = n
+            if isinstance(n, str):
+                # '12' / 'QuestionN010' / 'N° 7' -> the digits inside (plan P3)
+                n = extract_int(n)
+                if n is not None:
+                    q["number"] = n
             if isinstance(n, int) and not isinstance(n, bool) and n > 0:
                 last = n
                 continue

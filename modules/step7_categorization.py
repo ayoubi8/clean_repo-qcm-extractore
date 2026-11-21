@@ -115,6 +115,9 @@ class Step7Categorization:
         
         # Also export as XLSX (same folder, same data)
         export_qcms_to_xlsx(categorized_qcms, output_dir / "final_qcms.xlsx")
+        from modules.utils.mbset_export import export_mbset_import
+        from modules.utils.output_naming import pdf_stem_for_context
+        export_mbset_import(categorized_qcms, output_dir, pdf_stem_for_context(self.context))
         
         return {"total": len(categorized_qcms), "file": str(output_path)}
 

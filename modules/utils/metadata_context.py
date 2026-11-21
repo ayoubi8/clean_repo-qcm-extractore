@@ -65,13 +65,14 @@ def normalize_module(value: Optional[str]) -> Optional[str]:
 
 
 def normalize_year(value: Optional[str]) -> Optional[str]:
-    """Apply the year rule: '2025/2026' -> '2025', '2024' stays '2024'."""
+    """Apply the year rule (START year): '2025/2026' -> '2025', '2020-2021' ->
+    '2020', OCR '20.17-2018' -> '2017', '2024' stays '2024'. Anything without a
+    plausible year -> None (never a made-up value)."""
     if not value:
         return None
-    v = str(value).strip()
-    if "/" in v:
-        return v.split("/")[0].strip()
-    return v
+    from modules.utils.exam_papers import parse_year
+    y = parse_year(str(value).strip())
+    return str(y) if y else None
 
 
 def normalize_faculty(value: Optional[str]) -> Optional[str]:

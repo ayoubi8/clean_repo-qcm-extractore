@@ -12,8 +12,10 @@ from modules.document_processor import DocumentProcessor
 from modules.utils.cost_tracker import CostTracker
 from modules.utils.prompt_helper import PromptHelper
 from modules.utils.xlsx_exporter import export_qcms_to_xlsx
+from modules.utils.mbset_export import export_mbset_import
 from modules.utils.output_naming import pdf_stem_for_context, result_xlsx_name
 from modules.utils.qcm_merge import qcm_key, merge_qcm_fields
+from modules.utils import exam_papers
 from modules.model_policy import get_model_pair
 
 class Step6Corrections:
@@ -31,6 +33,39 @@ class Step6Corrections:
         self.cost_tracker = cost_tracker
         self.prompt_helper = PromptHelper()
         self.context = project_context
+
+    # ── Scoped correction matching (plan P6) ────────────────────────────
+    # A bare question number is ambiguous when the document has several
+    # numbering scopes (Partie théorique Q1 / Partie pratique Q1, Normale /
+    # Rattrapage). These helpers route every apply through
+    # exam_papers.apply_scoped_corrections. With one scope they behave
+    # exactly like the old `str(Num)` lookup.
+
+    @staticmethod
+    def _scope_prompt_rule(qcms: List[Dict]) -> str:
+        if not exam_papers.has_multiple_scopes(qcms or []):
+            return ""
+        scopes = sorted({exam_papers.qcm_scope(q) for q in qcms})
+        return ("\nNUMBERING PARTS: this document has several parts that each restart "
+                f"question numbering ({', '.join(scopes)}). When an answer table clearly "
+                "belongs to one part (its title says e.g. \"Corrigé partie pratique\", "
+                "\"Rattrapage\"), prefix its keys with that part's name: "
+                "{\"Pratique:1\": \"AB\"}. Use plain numbers when the part is not stated.\n")
+
+    def _apply_map_scoped(self, qcms: List[Dict], correction_map: Dict,
+                          page: int = None) -> int:
+        entries = exam_papers.entries_from_map(correction_map, page)
+        return self._apply_entries_scoped(qcms, entries)
+
+    @staticmethod
+    def _apply_entries_scoped(qcms: List[Dict], entries: List[Dict]) -> int:
+        stats = exam_papers.apply_scoped_corrections(qcms, entries)
+        if stats["ambiguous"]:
+            print(f"   ⚠️  {stats['ambiguous']} correction(s) NOT applied: the same question "
+                  f"number exists in several parts and the answer table does not say which "
+                  f"(flag correction_ambiguous).")
+        return stats["applied"]
+
     
     def _initialize_text_model(self):
         """
@@ -258,6 +293,7 @@ class Step6Corrections:
             "corrections", corrected_count, pdf_stem_for_context(self.context)
         )
         export_qcms_to_xlsx(corrected_qcms, xlsx_path)
+        export_mbset_import(corrected_qcms, output_dir, pdf_stem_for_context(self.context))
 
         return {"total": len(corrected_qcms), "file": str(output_path), "xlsx_file": str(xlsx_path)}
 
@@ -617,11 +653,13 @@ PAGE {page_num} OCR TEXT:
 
         result: Dict[str, str] = {}
         for key, value in raw.items():
-            question = str(key).strip()
+            label, number = exam_papers.parse_correction_key(key)
             answer = str(value).strip().upper()
-            if not question.isdigit() or not re.fullmatch(r"[A-E]{1,5}", answer):
+            if number is None or not re.fullmatch(r"[A-E]{1,5}", answer):
                 continue
-            result[str(int(question))] = "".join(dict.fromkeys(answer))
+            # 'Pratique:1' keeps its part label (scoped apply); '01' -> '1'.
+            out_key = f"{label}:{number}" if label else number
+            result[out_key] = "".join(dict.fromkeys(answer))
         return result
 
     @staticmethod
@@ -881,8 +919,7 @@ Your task:
   question number associated with its own A-E grid, R:, T:, and SCORE: fields.
 - T: is strong answer-key evidence and must not be ignored. R: is separate
   supporting evidence. OCR variants such as T8: and R8: are possible.
-{guidance_line}
-
+{guidance_line}{self._scope_prompt_rule(qcms)}
 QCM numbers that need corrections (from the extracted question bank):
 {qcm_nums_str}
 
@@ -968,18 +1005,14 @@ DOCUMENT TEXT:
             print("⚠️  Correction extraction remains incomplete after retries; applying only validated entries.")
 
         # ── 7. Apply corrections to QCMs ──────────────────────────────
-        applied = 0
-        for qcm in qcms:
-            qnum = str(qcm.get('Num') or qcm.get('number') or '')
-            if qnum in correction_map:
-                qcm['Correct'] = correction_map[qnum]
-                applied += 1
+        applied = self._apply_map_scoped(qcms, correction_map)
 
         print(f"\n✅ [all_pages] Applied {applied}/{len(qcms)} corrections.")
 
         # Log unmatched corrections for debugging
         qcm_num_set = {str(q.get('Num') or q.get('number') or '') for q in qcms}
-        unmatched = [k for k in correction_map if k not in qcm_num_set]
+        unmatched = [k for k in correction_map
+                     if exam_papers.parse_correction_key(k)[1] not in qcm_num_set]
         if unmatched:
             print(f"   ℹ️  {len(unmatched)} corrections found for questions not in QCM list: {unmatched[:10]}")
 
@@ -1095,6 +1128,9 @@ DOCUMENT TEXT:
 
         # Running correction map accumulated across all pages
         correction_map: Dict[str, str] = {}
+        # Same corrections, but per page: two parts with their own Q1 each
+        # produce two entries instead of one overwritten key (plan P6).
+        correction_entries: List[Dict] = []
 
         # Correction-page passthrough from Step 2: pages the extractor marked
         # as answer-key-only ({"page": X, "correction_page": true}) are scanned
@@ -1148,6 +1184,7 @@ DOCUMENT TEXT:
             if expected_nums and page_map and len(covered_here) >= len(expected_nums):
                 print(f"     ✅ Deterministic pass covered all {len(covered_here)} QCMs — AI skipped for page {pn}.")
                 correction_map.update(page_map)
+                correction_entries.extend(exam_papers.entries_from_map(page_map, pn))
                 continue
 
             # 3) AI pass — DeepSeek with full QCM context + running map + page text
@@ -1200,7 +1237,7 @@ CORRECTIONS FOUND ON PREVIOUS PAGES (running map — do not re-emit unless this 
 {found_so_far}
 
 {("EXTRA GUIDANCE: " + guidance) if guidance else ""}
-
+{self._scope_prompt_rule(qcms)}
 {note}
 
 PAGE {pn} TEXT:
@@ -1242,6 +1279,7 @@ PAGE {pn} TEXT:
                 page_map.update(got)
             if page_map:
                 correction_map.update(page_map)
+                correction_entries.extend(exam_papers.entries_from_map(page_map, pn))
                 print(f"     → Page {pn}: merged {len(page_map)} correction(s). Running total: {len(correction_map)}")
             else:
                 print(f"     → Page {pn}: no corrections found.")
@@ -1267,7 +1305,10 @@ PAGE {pn} TEXT:
             print(f"💾 Standalone correction map saved to: {out_path}")
             return []
 
-        applied = self._apply_corrections_with_fallback(qcms, correction_map)
+        if exam_papers.has_multiple_scopes(qcms):
+            applied = self._apply_entries_scoped(qcms, correction_entries)
+        else:
+            applied = self._apply_corrections_with_fallback(qcms, correction_map)
         print(f"\n✅ Applied {applied}/{len(qcms)} corrections to structured data.")
         return qcms
 
@@ -1366,6 +1407,12 @@ PAGE {pn} TEXT:
         """
         # FIX 2: Normalise all keys to str defensively (belt-and-suspenders)
         str_map: Dict[str, str] = {str(k): str(v) for k, v in correction_map.items()}
+
+        # Several numbering scopes: a bare number names several questions, and
+        # the positional index fallback would be meaningless (plan P6).
+        if exam_papers.has_multiple_scopes(qcms) or any(
+                exam_papers.parse_correction_key(k)[0] for k in str_map):
+            return self._apply_map_scoped(qcms, str_map)
 
         alignment = self._validate_correction_alignment(qcms, str_map)
         alignment_score = alignment.get('score', 0.0)
@@ -1584,15 +1631,12 @@ TEXT:
                 # Support both flat map and legacy {"corrections": {...}}
                 corrections: Dict = raw.get('corrections', raw) if isinstance(raw, dict) else {}
 
-                applied = 0
-                for qcm in qcms:
-                    # FIX 2: str key lookup
-                    q_key = str(qcm.get('Num') or qcm.get('number') or '')
-                    if q_key in corrections:
-                        cleaned = ''.join(re.findall(r'[A-E]', str(corrections[q_key]).upper()))[:5]
-                        if cleaned:
-                            qcm['Correct'] = cleaned
-                            applied += 1
+                cleaned_map = {}
+                for k, v in (corrections or {}).items():
+                    cleaned = ''.join(re.findall(r'[A-E]', str(v).upper()))[:5]
+                    if cleaned:
+                        cleaned_map[str(k)] = cleaned
+                applied = self._apply_map_scoped(qcms, cleaned_map)
 
                 print(f"   ✅ Attempt {attempt+1}: {applied}/{len(qcms)} corrections applied via AI.")
 
@@ -1833,12 +1877,8 @@ Format: {{"10": "ACE", "11": "BD"}}"""
             if match:
                 corrections = json.loads(match.group(0))
                 
-                applied = 0
-                for qcm in qcms:
-                    q_num = str(qcm.get('Num') or qcm.get('number'))
-                    if q_num in corrections:
-                        qcm['Correct'] = corrections[q_num]
-                        applied += 1
+                applied = self._apply_map_scoped(
+                    qcms, {str(k): str(v) for k, v in (corrections or {}).items()})
                 
                 print(f"✅ Successfully linked {applied} corrections.")
             else:
@@ -1992,9 +2032,10 @@ Format: {{"10": "ACE", "11": "BD"}}"""
                 self._manual_entry(uncorrected)
                 # Merge back
                 for q_unc in uncorrected:
-                    key = str(q_unc.get('Num') or q_unc.get('number', ''))
                     for qcm in qcms:
-                        if str(qcm.get('Num') or qcm.get('number', '')) == key:
+                        same = qcm is q_unc or (
+                            q_unc.get('uid') and qcm.get('uid') == q_unc.get('uid'))
+                        if same:
                             qcm['Correct'] = q_unc.get('Correct', '')
                             break
 

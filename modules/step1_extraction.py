@@ -277,4 +277,5 @@ class Step1Extraction:
 7. On normal QCM pages, preserve the existing reading order and table behavior.
 8. Do NOT solve or interpret corrections. Transcribe the page only; do not decide the final answer letters.
 9. Do NOT summarise, skip, or paraphrase any content. Do NOT add commentary — output ONLY the page content.
+10. Exam origin lines such as "• Question N° 32, Sec 01 de l'année 2021-2022" or "Question N° 07, Partie pratique, Rattrapage de l'année 2020-2021" are page content: transcribe each one verbatim on its OWN line, BEFORE the question it introduces. Keep question numbering prefixes ("29-", "30-") and section or chapter titles ("Partie pratique", "Rattrapage") exactly as printed.
 {guidance}"""

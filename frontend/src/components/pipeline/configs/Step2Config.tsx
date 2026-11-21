@@ -1,6 +1,7 @@
 import { usePipelineStore } from '../../../store/pipelineStore'
 import { useStepModels } from '../../../hooks/useStepModels'
 import { useState, useEffect } from 'react'
+import { ExamPaperFields } from './ExamPaperFields'
 
 export function Step2Config() {
   const config = usePipelineStore(s => s.step2Config)
@@ -129,6 +130,9 @@ export function Step2Config() {
           ↺ Reset models to Settings defaults
         </button>
       </div>
+
+      {/* ── Exam document type + paper defaults ── */}
+      <ExamPaperFields value={config} onChange={setConfig} idPrefix="step2" />
 
       {/* ── Extraction Guidance ── */}
       <div className="space-y-2">

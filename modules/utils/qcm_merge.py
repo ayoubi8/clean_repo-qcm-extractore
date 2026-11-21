@@ -79,6 +79,7 @@ def merge_qcm_fields(target: Dict, source: Dict) -> int:
     if not isinstance(target, dict) or not isinstance(source, dict):
         return 0
     changed = 0
+    old_exams, old_number = target.get("Exams"), target.get("Number")
     for field, val in source.items():
         if val is None:
             continue
@@ -93,6 +94,11 @@ def merge_qcm_fields(target: Dict, source: Dict) -> int:
         if str(target.get(field)) != str(new_val):
             target[field] = new_val
             changed += 1
+    # Exam papers (plan §9.5): an edited Exams / Number cell rebuilds the
+    # internal `papers` list so Step 6/exports use the corrected paper.
+    if changed and ("Exams" in source or "Number" in source):
+        from modules.utils.exam_papers import apply_sheet_paper_edits
+        apply_sheet_paper_edits(target, old_exams, old_number)
     return changed
 
 

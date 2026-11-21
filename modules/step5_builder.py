@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Dict, List, Any
 
 from modules.utils.xlsx_exporter import export_qcms_to_xlsx
+from modules.utils.mbset_export import export_mbset_import
 
 from modules.deepseek_client import DeepSeekClient
 from modules.utils.file_manager import FileManager
@@ -85,13 +86,19 @@ class Step5Builder:
             "qcms", len(final_qcms), pdf_stem_for_context(self.context)
         )
         export_qcms_to_xlsx(final_qcms, xlsx_path)
-        
-        return {"total_qcms": len(final_qcms), "output_file": str(output_path), "xlsx_file": str(xlsx_path)}
+        # MBset import workbook (template columns only) + its review report.
+        mbset = export_mbset_import(final_qcms, output_dir, pdf_stem_for_context(self.context)) or {}
+
+        return {"total_qcms": len(final_qcms), "output_file": str(output_path), "xlsx_file": str(xlsx_path),
+                "mbset_import_file": mbset.get("import_file", ""),
+                "mbset_report_file": mbset.get("report_file", "")}
 
     def _map_to_template(self, qcm: Dict, template: Dict) -> Dict:
         """Map extracted fields from Step 3 QCM to the provided template structure."""
-        # Start with a copy of the template
-        new_qcm = template.copy()
+        # Start from the template's COLUMNS only. Its values are examples
+        # (Year 2024, Correct "ABC"...) and must never reach the export when a
+        # QCM lacks that field (plan P9) — a missing value stays empty.
+        new_qcm = {k: None for k in template.keys()}
         
         # Mapping rules: Template Key -> possible keys in extracted QCM
         # This handles common variations in field naming
@@ -169,5 +176,16 @@ class Step5Builder:
         uid_value = qcm.get("uid")
         if uid_value is not None and str(uid_value).strip():
             new_qcm["uid"] = str(uid_value)
+
+        # Exam papers (plan §3/§6): always carried, whatever the template, so
+        # Step 6 can match corrections by scope and the exports can write the
+        # original paper number / session. `page` keeps the reading position.
+        if qcm.get("Number") is not None and new_qcm.get("Number") in (None, ""):
+            new_qcm["Number"] = qcm.get("Number")
+        for key in ("session", "Exams", "scope", "origin_line", "origin_raw",
+                    "review_flags", "papers", "exam_mode", "page"):
+            val = qcm.get(key)
+            if val is not None and val != "" and new_qcm.get(key) in (None, "", []):
+                new_qcm[key] = val
 
         return new_qcm

@@ -2675,6 +2675,17 @@ def _call_step(step_id: str, tracker, context, config: dict, cancel_check=None):
     if step_id == "1" and config.get("model"):
         run_env.setenv("STEP1_MODEL", config["model"])
     if step_id == "2":
+        # Exam papers (plan §7): document type + paper defaults from the Step 2
+        # panel / batch wizard. Step 3 runs in this same run scope, so the
+        # values reach both. Empty -> auto-detect / taken from the document.
+        _mode = str(config.get("exam_mode") or "").strip()
+        if _mode in ("auto", "single_paper", "compilation"):
+            run_env.setenv("EXAM_MODE", _mode)
+        for _key, _env in (("exam_source", "EXAM_SOURCE"), ("exam_period", "EXAM_PERIOD"),
+                           ("exam_year", "EXAM_YEAR")):
+            _val = str(config.get(_key) or "").strip()
+            if _val:
+                run_env.setenv(_env, _val)
         # Visibility: log where the effective models came from. The run
         # payload (Step 2 panel, persisted in the browser) overrides the
         # Settings env whenever non-empty — a stale panel value silently
@@ -4071,6 +4082,18 @@ def _sync_step_from_sheets_svc(name: str, step_id: str, user_id: str,
             write_bytes_file(xlsx_storage_path, xlsx_path.read_bytes())
         except Exception as e:
             print(f"[SYNC{step_id}] xlsx storage upload failed: {e}")
+        # Rebuild the MBset import file from the edited rows (Step 6 only:
+        # Step 2 rows have no paper/Tag fields yet).
+        if step_id == "6":
+            try:
+                from modules.utils.mbset_export import export_mbset_import
+                _mb = export_mbset_import(new_qcms, local_json_dir, pdf_stem) or {}
+                for _k in ("import_file", "report_file"):
+                    if _mb.get(_k):
+                        _p = Path(_mb[_k])
+                        write_bytes_file(f"{user_id}/{name}/{json_folder}/{_p.name}", _p.read_bytes())
+            except Exception as e:
+                print(f"[SYNC{step_id}] MBset import rebuild failed: {e}")
     except Exception as e:
         print(f"[SYNC{step_id}] xlsx rebuild failed: {e}")
 

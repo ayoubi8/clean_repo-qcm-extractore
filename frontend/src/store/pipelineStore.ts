@@ -93,6 +93,10 @@ export const usePipelineStore = create<PipelineStore>()(
         model_fallback: '',
         extraction_guidance: '',
         clinical_case_hints: false,
+        exam_mode: 'auto',
+        exam_source: '',
+        exam_period: '',
+        exam_year: '',
       },
       step3Config: {
         model: '',

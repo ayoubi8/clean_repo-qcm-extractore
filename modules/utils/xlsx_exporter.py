@@ -45,6 +45,15 @@ _PREFERRED_COLUMNS = [
     "Year", "Tag", "Type",
     "uid",
 ]
+# Exam-paper review columns (plan §6 "XLSX exports"): placed after Num / at
+# the right. `Number` = ORIGINAL paper number, `session` = the label written
+# in Tag ("Sec 01 Pratique"), `Exams` = MBset-format summary (review only).
+_PREFERRED_COLUMNS.insert(_PREFERRED_COLUMNS.index("Num") + 1, "Number")
+_PREFERRED_COLUMNS[_PREFERRED_COLUMNS.index("uid"):_PREFERRED_COLUMNS.index("uid")] = [
+    "session", "Exams", "scope", "origin_line", "review_flags",
+]
+# Internal pipeline fields never written as columns.
+_HIDDEN_COLUMNS = {"papers", "exam_mode", "origin_raw", "section_header"}
 
 # Approximate column widths (characters)
 COL_WIDTHS = {
@@ -54,6 +63,8 @@ COL_WIDTHS = {
     "Correct": 10, "Exp": 40,
     "categoryName": 25, "tagSuggere": 15, "subcategoryName": 35,
     "Year": 8, "Tag": 20, "Type": 8,
+    "Number": 8, "session": 16, "Exams": 40, "scope": 14,
+    "origin_line": 40, "review_flags": 28,
 }
 
 
@@ -67,7 +78,8 @@ def _build_columns(qcms: List[Dict]) -> List[str]:
     # Gather all keys present in any QCM
     all_keys: set = set()
     for qcm in qcms:
-        all_keys.update(k for k, v in qcm.items() if v is not None and v != "")
+        all_keys.update(k for k, v in qcm.items()
+                        if v is not None and v != "" and v != [] and k not in _HIDDEN_COLUMNS)
     
     # Preferred columns first (only those that actually appear in data)
     result = [c for c in _PREFERRED_COLUMNS if c in all_keys]

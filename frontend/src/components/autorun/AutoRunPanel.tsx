@@ -100,7 +100,13 @@ export function AutoRunPanel({ onClose }: AutoRunPanelProps) {
           use_folder_batch: false,
           run_config: {
             ...(step2InRange
-              ? { step2: { step3: serializeStep3(pipelineStore.step3Config), ...ccCheckerConfig } }
+              ? { step2: {
+                  step3: serializeStep3(pipelineStore.step3Config), ...ccCheckerConfig,
+                  exam_mode: pipelineStore.step2Config.exam_mode ?? 'auto',
+                  exam_source: pipelineStore.step2Config.exam_source ?? '',
+                  exam_period: pipelineStore.step2Config.exam_period ?? '',
+                  exam_year: pipelineStore.step2Config.exam_year ?? '',
+                } }
               : {}),
             ...(showStep6Pre ? { step6: serializeStep6(pipelineStore.step6Config) } : {}),
           }

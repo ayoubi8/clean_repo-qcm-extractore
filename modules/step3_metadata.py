@@ -11,6 +11,7 @@ from modules.utils.cost_tracker import CostTracker
 from modules.utils.prompt_helper import PromptHelper
 from modules.utils.file_manager import FileManager
 from modules.utils.ai_metadata_detector import AIMetadataDetector
+from modules.utils import exam_papers
 
 class Step3Metadata:
     """Detect or assign metadata (Global, Per-QCM, or Per-Group Cas Clinique) with interactive configuration."""
@@ -826,7 +827,11 @@ DOCUMENT:
                 if src: parts.append(str(src))
                 if yr:  parts.append(str(yr))
                 qcm["tag"] = parts
-                
+
+            # 5. Exam papers (plan §4.4 / D1-D7): paper year/session/number,
+            #    Tag = source + year + session, Exams (review), CC chain rule.
+            self._finalize_exam_papers(qcms, step1_dir, cc_strategy)
+
             self._save_results(q_file.name, qcms)
 
         # ── Print Cas Clinique stats after all pages (sequential mode) ─────────
@@ -843,6 +848,63 @@ DOCUMENT:
         if cc_boundary_queue:
             print(f"[CC-STATE] {len(cc_boundary_queue)} ends_here transition(s) "
                   f"queued for the boundary check")
+
+    def _document_period(self, step1_dir) -> Optional[str]:
+        """Session named in the header of a single-paper exam (EMD1,
+        Rattrapage, Session normale…) — read from the first page only."""
+        try:
+            pages = []
+            for p in Path(step1_dir).glob("page_*.txt"):
+                m = re.search(r"(\d+)", p.name)
+                if m:
+                    pages.append((int(m.group(1)), p))
+            if not pages:
+                return None
+            first = min(pages)[1]
+            return exam_papers.find_period_in_text(first.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def _finalize_exam_papers(self, qcms: List[Dict], step1_dir, cc_strategy: str) -> None:
+        """Fill every QCM's exam papers by precedence (origin line > section
+        header > document header > EXAM_PERIOD config), derive Number / year /
+        session / Tag / Exams, then apply the clinical-case chain rule (D7) to
+        compilations. Never fails the step: on error the QCMs keep today's
+        fields."""
+        try:
+            mode = next((q.get("exam_mode") for q in qcms
+                         if isinstance(q, dict) and q.get("exam_mode")),
+                        exam_papers.MODE_SINGLE)
+            doc_period = None
+            if mode != exam_papers.MODE_COMPILATION:
+                if not hasattr(self, "_doc_period_cache"):
+                    self._doc_period_cache = self._document_period(step1_dir)
+                doc_period = self._doc_period_cache
+            default_period = exam_papers.normalize_period(run_env.getenv("EXAM_PERIOD", "") or "") \
+                or (run_env.getenv("EXAM_PERIOD", "") or "").strip() or None
+            default_source = (run_env.getenv("EXAM_SOURCE", "") or "").strip() or None
+            default_year = (run_env.getenv("EXAM_YEAR", "") or "").strip() or None
+            for q in qcms:
+                if isinstance(q, dict):
+                    # A session typed in the panel beats header auto-detection
+                    # (never an origin line: those papers keep their own).
+                    exam_papers.finalize_papers(q, doc_period=default_period or doc_period,
+                                                default_period=default_period,
+                                                default_source=default_source,
+                                                default_year=default_year)
+            if mode == exam_papers.MODE_COMPILATION and cc_strategy == "CC":
+                ordered = sorted([q for q in qcms if isinstance(q, dict)],
+                                 key=exam_papers.reading_order_key)
+                st = exam_papers.enforce_cas_chain(ordered)
+                print(f"   🔗 [CC-CHAIN] same paper + number+1 rule: kept {st['kept']}, "
+                      f"removed {st['removed']}, extended {st['extended']}, "
+                      f"uncertain {st['uncertain']}")
+            sessions = sorted({q.get("session") for q in qcms
+                               if isinstance(q, dict) and q.get("session")})
+            print(f"   📚 [EXAM-PAPERS] mode={mode} · document period={doc_period} · "
+                  f"sessions={sessions[:8]}{'…' if len(sessions) > 8 else ''}")
+        except Exception as e:
+            print(f"   ⚠️  [EXAM-PAPERS] finalisation skipped: {e}")
 
     def _save_boundary_transitions(self, transitions: List[Dict]) -> None:
         """Phase 5: persist the ends_here transition queue for
@@ -1229,6 +1291,10 @@ case you STILL report it as an anchor (see anchor_text_clean below).
   regardless of where it sits.
 - A lettered answer-choice list — "a- ... b- ... c- ... d- ... e- ..." (with
   or without checkmarks) — always propositions, never a narrative.
+- An exam origin line — "• Question N° 22, Rattrapage de l'année 2023-2024",
+  "Question N° 07, Partie pratique, Sec 01 de l'année 2021-2022" — names the
+  exam a question comes from; never a narrative. An origin line sitting
+  between a narrative and its question does NOT break their link.
 If you are not confident something is a genuine patient narrative by this
 definition, do not report it.
 

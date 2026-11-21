@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useStepModels } from '../../../hooks/useStepModels'
 import { MetaStrategy, MetaFieldConfig, AutoRunBatchConfig, TagEntry } from '../../../types'
 import { TagSelector } from '../../tags/TagSelector'
+import { ExamPaperFields } from '../../pipeline/configs/ExamPaperFields'
 
 /**
  * Auto Run batch — one config for ALL PDFs (plan docs/plans/autorun-batch-plan.md §3.2).
@@ -24,6 +25,10 @@ export interface WizardConfig {
     model_fallback: string
     extraction_guidance: string
     clinical_case_hints: boolean
+    exam_mode: 'auto' | 'single_paper' | 'compilation'
+    exam_source: string
+    exam_period: string
+    exam_year: string
   }
   meta: {
     fields: {
@@ -59,6 +64,10 @@ export function defaultWizardConfig(): WizardConfig {
       model_fallback: '',
       extraction_guidance: '',
       clinical_case_hints: false,
+      exam_mode: 'auto',
+      exam_source: '',
+      exam_period: '',
+      exam_year: '',
     },
     meta: {
       fields: {
@@ -130,6 +139,10 @@ export function buildBatchConfig(c: WizardConfig): AutoRunBatchConfig {
       model_fallback: c.step2.model_fallback,
       extraction_guidance: c.step2.extraction_guidance,
       clinical_case_hints: c.step2.clinical_case_hints,
+      exam_mode: c.step2.exam_mode ?? 'auto',
+      exam_source: c.step2.exam_source ?? '',
+      exam_period: c.step2.exam_period ?? '',
+      exam_year: c.step2.exam_year ?? '',
       step3: serializeMeta(c.meta),
     },
     step6: {
@@ -313,6 +326,13 @@ function Step2Section({ config, onChange, models, loading }: SectionProps) {
           placeholder="Optional rules for the LLM..."
         />
       </div>
+
+      {/* Exam document type + paper defaults (same as the Step 2 panel) */}
+      <ExamPaperFields
+        value={config.step2}
+        onChange={v => onChange({ step2: { ...config.step2, ...v } })}
+        idPrefix="ar-step2"
+      />
 
       {/* Metadata Strategy wizard-local (cycle table like Step3Config) */}
       <div className="space-y-3">

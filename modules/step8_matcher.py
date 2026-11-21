@@ -985,6 +985,24 @@ class Step8Matcher:
 
             # Apply new tag in-memory on ref_qcms (this is the source for _UPDATED.xlsx)
             ref_q["Tag"] = format_tag_list(new_tag_list)
+
+            # Exam papers (plan P10): the reference question keeps every paper
+            # it was printed in — union, never a replacement (a Smart Import
+            # Exams cell REPLACES all papers of the question).
+            try:
+                from modules.utils import exam_papers as _ep
+                src_papers = src_q.get("papers") or _ep.parse_exams(src_q.get("Exams"))
+                ref_papers = ref_q.get("papers") or _ep.parse_exams(ref_q.get("Exams"))
+                if src_papers and ("Exams" in ref_q or ref_papers):
+                    merged_papers, conflicts = _ep.union_papers(ref_papers, src_papers)
+                    ref_q["Exams"] = _ep.format_exams(merged_papers)
+                    if "papers" in ref_q:
+                        ref_q["papers"] = merged_papers
+                    if conflicts:
+                        merge_audit[-1]["paper_conflicts"] = conflicts
+                        print(f"   ⚠️  [STEP8] paper number conflict kept as reference: {conflicts}")
+            except Exception as _pe:
+                print(f"   ⚠️  [STEP8] paper union skipped: {_pe}")
             if "Year" in ref_q and src_year not in (None, "") and not ref_q.get("Year"):
                 try:
                     ref_q["Year"] = int(float(src_year))
