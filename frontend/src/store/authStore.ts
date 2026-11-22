@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { loginUser } from '../lib/api'
+import { clearCache } from '../lib/cache'
 
 interface AuthUser {
   email: string
@@ -71,6 +72,8 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     localStorage.removeItem('qcm_token')
     localStorage.removeItem('qcm_refresh_token')
     localStorage.removeItem('qcm_user')
+    // Another account may log in next: drop every cached response.
+    clearCache()
     set({ user: null, token: null, refreshToken: null })
   },
 

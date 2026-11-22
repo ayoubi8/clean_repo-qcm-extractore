@@ -28,3 +28,23 @@ body {
 .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
 .custom-scrollbar::-webkit-scrollbar-thumb { background: #3d494c; border-radius: 10px; }
 
+/* ── Shell / pipeline / log motion (redesign 2026-11) ───────────────────── */
+@keyframes qe-fade-up   { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+@keyframes qe-pop       { 0% { transform: scale(.6); opacity: 0; } 70% { transform: scale(1.12); } 100% { transform: scale(1); opacity: 1; } }
+@keyframes qe-shimmer   { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+@keyframes qe-ring      { 0% { box-shadow: 0 0 0 0 rgba(76,215,246,.45); } 100% { box-shadow: 0 0 0 8px rgba(76,215,246,0); } }
+@keyframes qe-blink     { 50% { opacity: .35; } }
+
+.qe-fade-up  { animation: qe-fade-up .25s ease-out both; }
+.qe-pop      { animation: qe-pop .35s cubic-bezier(.2,.9,.3,1.3) both; }
+.qe-ring     { animation: qe-ring 1.6s ease-out infinite; }
+.qe-blink    { animation: qe-blink 1.2s ease-in-out infinite; }
+.qe-shimmer  {
+  background-image: linear-gradient(90deg, rgba(76,215,246,.15) 0%, rgba(76,215,246,.9) 50%, rgba(76,215,246,.15) 100%);
+  background-size: 200% 100%;
+  animation: qe-shimmer 1.6s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .qe-fade-up, .qe-pop, .qe-ring, .qe-blink, .qe-shimmer { animation: none !important; }
+}

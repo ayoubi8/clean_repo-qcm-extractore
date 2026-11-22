@@ -1,5 +1,14 @@
 import { Project, DriveFileEntry, AutoRunBatchConfig, BatchManifest, BatchSource, BatchSummary } from "../types"
 import { useAuthStore } from "../store/authStore"
+import { cached, invalidate, setCached } from "./cache"
+
+// Cache keys + lifetimes (lag plan Phase 1, §3.1)
+export const PROJECTS_KEY = "projects"
+export const PROJECTS_TTL_MS = 15_000          // server caches 30 s too
+const STEP_MODELS_KEY = "env:step-models"
+const STEP_MODELS_TTL_MS = 5 * 60_000
+const ENV_TAGS_KEY = "env:tags"
+const ENV_TAGS_TTL_MS = 10 * 60_000
 
 const BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
 
@@ -47,6 +56,16 @@ async function fetchWithRefresh(input: RequestInfo, init?: RequestInit): Promise
  *   window.open(url, '_blank')
  *   // Caller should URL.revokeObjectURL(url) after a delay if desired
  */
+export const BASE_URL: string = BASE
+
+/** Authenticated GET → JSON; throws Error(detail) on a non-2xx answer. */
+export async function authFetchJson<T = any>(url: string): Promise<T> {
+  const res = await fetchWithRefresh(url, { headers: getAuthHeaders() })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) throw new Error((data as any)?.detail || `Request failed (${res.status})`)
+  return data as T
+}
+
 export async function fetchAuthenticatedBlobUrl(url: string): Promise<string> {
   const res = await fetchWithRefresh(url, { headers: getAuthHeaders() })
   if (!res.ok) throw new Error(`Auth fetch failed: ${res.status}`)
@@ -81,7 +100,9 @@ export async function fetchProjects(): Promise<Project[]> {
     const res = await fetchWithRefresh(`${BASE}/projects`, { headers: { ...getAuthHeaders() } })
     if (!res.ok) throw new Error('Failed to fetch projects')
     const data = await res.json()
-    return (data.projects ?? []) as Project[]
+    const list = (data.projects ?? []) as Project[]
+    setCached(PROJECTS_KEY, list)       // every screen sees the newest list
+    return list
   }
   try { return await attempt() }
   catch (e) {
@@ -97,6 +118,12 @@ export async function deleteProject(name: string): Promise<void> {
     headers: { ...getAuthHeaders() }
   })
   if (!res.ok) throw new Error('Failed to delete project')
+  invalidate(PROJECTS_KEY)
+}
+
+/** Project list served from the client cache (fresh ≤ 15 s), one shared request otherwise. */
+export function fetchProjectsCached(force = false): Promise<Project[]> {
+  return cached(PROJECTS_KEY, fetchProjects, PROJECTS_TTL_MS, force)
 }
 
 // POST /projects
@@ -112,6 +139,7 @@ export async function createProject(payload: {
     body: JSON.stringify(payload),
   })
   if (!res.ok) throw new Error('Failed to create project')
+  invalidate(PROJECTS_KEY)
   return res.json()
 }
 
@@ -132,6 +160,7 @@ export async function importPdfFromDrive(
     const errData = await res.json().catch(() => ({}))
     throw new Error(errData.detail || 'Drive import failed')
   }
+  invalidate(PROJECTS_KEY)
   return res.json()
 }
 
@@ -163,6 +192,7 @@ export async function uploadProjectPdf(
 
       xhr.onload = () => {
         if (xhr.status >= 200 && xhr.status < 300) {
+          invalidate(PROJECTS_KEY)   // pdf_path changed
           resolve(JSON.parse(xhr.responseText))
         } else {
           const err = Object.assign(
@@ -228,6 +258,37 @@ export async function stopStep(projectName: string, stepId: number, mode: 'stop'
 }
 
 // GET /projects/{name}/steps/{stepId}/status
+// GET /projects/{name}/overview — project row + every step status, one call
+// (lag plan Phase 3; replaces one /steps/{id}/status per step).
+export interface ProjectOverview {
+  name: string
+  project: Project | null
+  steps: Record<string, { status: any; output_exists: boolean }>
+}
+export const overviewKey = (name: string) => `project:${name}`
+export async function fetchProjectOverview(projectName: string): Promise<ProjectOverview> {
+  const res = await fetchWithRefresh(`${BASE}/projects/${encodeURIComponent(projectName)}/overview`, {
+    headers: { ...getAuthHeaders() }
+  })
+  if (!res.ok) throw new Error('Failed to load project overview')
+  const data = (await res.json()) as ProjectOverview
+  setCached(overviewKey(projectName), data)
+  return data
+}
+
+// POST /projects/{name}/steps/{step}/open-sheets — upload a workbook to the
+// user's Google Drive as a Sheet. Returns {url} or {auth_url} (sign-in needed).
+export async function openInGoogleSheets(projectName: string, stepId: string | number, filename: string): Promise<{ url?: string; auth_url?: string }> {
+  const res = await fetchWithRefresh(`${BASE}/projects/${encodeURIComponent(projectName)}/steps/${stepId}/open-sheets`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+    body: JSON.stringify({ filename }),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) throw new Error(data.detail || 'Upload to Google Sheets failed')
+  return data
+}
+
 export async function getStepStatus(projectName: string, stepId: number): Promise<{ status: any, output_exists: boolean }> {
   const res = await fetchWithRefresh(`${BASE}/projects/${encodeURIComponent(projectName)}/steps/${stepId}/status`, {
     headers: { ...getAuthHeaders() }
@@ -258,6 +319,8 @@ export function connectLogStream(
   const ws = new WebSocket(
     `${wsBase}/ws/log/${encodeURIComponent(projectName)}/${stepId}?token=${encodeURIComponent(token)}`
   )
+  const streamKey = `${projectName}|${stepId}`
+  openStreams.add(streamKey)
 
   ws.onmessage = (event) => {
     try {
@@ -274,8 +337,18 @@ export function connectLogStream(
     }
   }
 
-  ws.onclose = onClose
+  ws.onclose = () => {
+    openStreams.delete(streamKey)
+    onClose()
+  }
   return ws
+}
+
+// Log streams open in this tab. A stream outlives the page that opened it;
+// the project page reconnects only when none is open (e.g. after a refresh).
+const openStreams = new Set<string>()
+export function isStreaming(projectName: string, stepId: number): boolean {
+  return openStreams.has(`${projectName}|${stepId}`)
 }
 
 // ---------------------------------------------------------------------------
@@ -533,6 +606,7 @@ export async function saveEnvKeys(keys: any): Promise<{ updated: string[] }> {
     body: JSON.stringify(keys),
   })
   if (!res.ok) throw new Error('Failed to save environment keys')
+  invalidate(STEP_MODELS_KEY)          // models / feature flags may have changed
   return res.json()
 }
 
@@ -557,12 +631,32 @@ export async function fetchWeeklyCosts(): Promise<Record<string, any>> {
 }
 
 // GET /env/step-models
-export async function fetchStepModels(): Promise<any> {
+async function fetchStepModelsRaw(): Promise<any> {
   const res = await fetchWithRefresh(`${BASE}/env/step-models`, {
     headers: { ...getAuthHeaders() }
   })
   if (!res.ok) throw new Error('Failed to fetch step models')
   return res.json()
+}
+
+/** Step models + feature flags. Cached 5 min and shared: the launcher, the
+ *  outputs cache and every step panel used to fetch it separately (lag plan L5). */
+export function fetchStepModels(force = false): Promise<any> {
+  return cached(STEP_MODELS_KEY, fetchStepModelsRaw, STEP_MODELS_TTL_MS, force)
+}
+
+// GET /bootstrap — user + step models/flags + tag vocabulary in ONE request
+// (lag plan Phase 4). Seeds the step-models and tags cache entries; an older
+// backend without /bootstrap falls back to /env/step-models.
+export async function fetchBootstrap(): Promise<void> {
+  const res = await fetchWithRefresh(`${BASE}/bootstrap`, { headers: { ...getAuthHeaders() } })
+  if (!res.ok) {
+    await fetchStepModels()
+    return
+  }
+  const data = await res.json()
+  if (data?.step_models) setCached(STEP_MODELS_KEY, data.step_models)
+  if (data?.tags) setCached(ENV_TAGS_KEY, data.tags)
 }
 
 // ── Tags (tags-search-session-preserve-plan) ───────────────────────────────
@@ -573,9 +667,12 @@ export interface EnvTags {
 }
 
 // GET /env/tags — region vocabulary + the user's saved module tags
-export async function fetchEnvTags(): Promise<EnvTags> {
-  const res = await fetchWithRefresh(`${BASE}/env/tags`, { headers: { ...getAuthHeaders() } })
-  return res.json()
+export function fetchEnvTags(): Promise<EnvTags> {
+  return cached(ENV_TAGS_KEY, async () => {
+    const res = await fetchWithRefresh(`${BASE}/env/tags`, { headers: { ...getAuthHeaders() } })
+    if (!res.ok) throw new Error('Failed to load tags')
+    return res.json() as Promise<EnvTags>
+  }, ENV_TAGS_TTL_MS)
 }
 
 // POST /tags/modules/{name} — persist a module tag for reuse
@@ -585,6 +682,7 @@ export async function addModuleTag(name: string): Promise<void> {
     headers: { ...getAuthHeaders() },
   })
   if (!res.ok) throw new Error('Failed to save the module tag')
+  invalidate(ENV_TAGS_KEY)
 }
 
 // DELETE /tags/modules/{name}
@@ -594,6 +692,7 @@ export async function deleteModuleTag(name: string): Promise<void> {
     headers: { ...getAuthHeaders() },
   })
   if (!res.ok) throw new Error('Failed to delete the module tag')
+  invalidate(ENV_TAGS_KEY)
 }
 
 // GET /projects/{name}/steps/{step_id}/output

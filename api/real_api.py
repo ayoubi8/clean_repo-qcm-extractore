@@ -30,6 +30,7 @@ load_dotenv(override=False)
 sys.path.insert(0, "/app")
 
 from job_manager import job_manager, job_project
+from output_paths import safe_output_path, safe_history_path, step_folder  # S1 path safety
 from modules.utils import run_env
 from log_capture import LogCapture
 import step_cache
@@ -65,6 +66,9 @@ from storage_client import (
 
 app = FastAPI(title="QCM Extractor API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+# Lag plan Phase 0 / B2: Server-Timing header + [SLOW] request log.
+from server_timing import ServerTimingMiddleware
+app.add_middleware(ServerTimingMiddleware)
 
 @app.on_event("startup")
 async def _startup():
@@ -928,6 +932,8 @@ def google_oauth_callback(code: str, state: str = ""):
     # Token saved — redirect back to frontend to retry the upload via /open-sheets
     frontend_url = os.environ.get("FRONTEND_URL", "https://qcm-extractor-frontend.vercel.app")
     from urllib.parse import quote as _url_quote
+    # /pipeline works with every frontend version: the new one redirects it
+    # to /projects/{project}/steps/{step} (lag plan Phase 3) keeping the query.
     return RedirectResponse(
         f"{frontend_url}/pipeline"
         f"?sheets_pending=1"
@@ -2920,6 +2926,38 @@ def get_step_status(name: str, step_id: str, user: dict = Depends(get_current_us
                    output_exists=result["output_exists"])
     return result
 
+# Lag plan Phase 3 — the steps the UI shows as rows.
+OVERVIEW_STEPS = ("1", "2", "6", "7", "8")
+
+
+def _status_or_idle(name: str, step_id: str, user: dict) -> dict:
+    try:
+        return get_step_status(name, step_id, user)
+    except Exception as e:  # one broken probe must not hide the other steps
+        print(f"[OVERVIEW] status {name}/{step_id} failed: {e}")
+        return {"status": "idle", "output_exists": False, "error": str(e)}
+
+
+@app.get("/projects/{name}/overview")
+def get_project_overview(name: str, user: dict = Depends(get_current_user)):
+    """Project row + every step's status in ONE request (lag plan Phase 3).
+
+    Replaces one GET /steps/{id}/status per step when a project page opens.
+    Each step uses exactly the get_step_status logic (memory -> step_cache ->
+    SQL -> Storage), probed in parallel. `project` is null when the project
+    is not in the caller's list (e.g. an admin viewing another user's).
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    try:
+        project = next((p for p in list_projects(user["id"]) if p.get("name") == name), None)
+    except Exception as e:
+        print(f"[OVERVIEW] list_projects failed: {e}")
+        project = None
+    with ThreadPoolExecutor(max_workers=len(OVERVIEW_STEPS)) as pool:
+        statuses = list(pool.map(lambda s: _status_or_idle(name, s, user), OVERVIEW_STEPS))
+    return {"name": name, "project": project, "steps": dict(zip(OVERVIEW_STEPS, statuses))}
+
+
 @app.websocket("/ws/log/{project}/{step_id}")
 async def ws_log(websocket: WebSocket, project: str, step_id: str, token: str = ""):
     # FIX-09: Validate the JWT token passed as a query param.
@@ -3270,6 +3308,20 @@ def delete_module_tag(name: str, user: dict = Depends(get_current_user)):
         print(f"[TAGS] module_tags delete failed: {e}")
     return {"deleted": True}
 
+@app.get("/bootstrap")
+def get_bootstrap(user: dict = Depends(get_current_user)):
+    """Everything the app needs once per login, in one request (lag plan
+    Phase 4): the user, step models + feature flags (/env/step-models) and
+    the tag vocabulary (/env/tags). The old endpoints stay."""
+    out = {"user": get_me(user)}
+    for key, fn in (("step_models", get_step_models), ("tags", get_env_tags)):
+        try:
+            out[key] = fn(user)
+        except Exception as e:
+            print(f"[BOOTSTRAP] {key} failed: {e}")
+            out[key] = None
+    return out
+
 # --- Batch Config + Template Endpoints ---
 
 @app.get("/config/batch")
@@ -3398,22 +3450,8 @@ def badge_from_row(sql_row: dict) -> str:
 @app.delete("/projects/{name}/steps/{step_id}/output/{filename:path}")
 def delete_step_output_file(name: str, step_id: str, filename: str, user: dict = Depends(get_current_user)):
     """Delete one current-step result from local disk and Supabase Storage."""
-    folder_map = {
-        "1": "step1_extraction", "1.5": "step1_extraction", "1.6": "step1_extraction",
-        "2": "step2_qcm", "3": "step3_metadata", "4": "step4_format",
-        "5": "step5_json", "6": "step6_corrections", "7": "step7_categories", "8": "step8_matches",
-    }
-    folder_name = folder_map.get(step_id, f"step{step_id}")
+    file_path, storage_path = safe_output_path(user["id"], name, step_id, filename)  # S1
     relative = Path(filename)
-    if relative.is_absolute() or ".." in relative.parts or not filename.strip():
-        raise HTTPException(status_code=400, detail="Invalid output filename")
-
-    step_dir = Path(f"/app/output/{user['id']}/{name}/{folder_name}")
-    file_path = step_dir / relative
-    try:
-        file_path.resolve().relative_to(step_dir.resolve())
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid output filename")
 
     deleted_local = False
     if file_path.exists():
@@ -3422,7 +3460,6 @@ def delete_step_output_file(name: str, step_id: str, filename: str, user: dict =
         file_path.unlink()
         deleted_local = True
 
-    storage_path = f"{user['id']}/{name}/{folder_name}/{relative.as_posix()}"
     if not deleted_local:
         try:
             if not file_exists(storage_path):
@@ -3460,13 +3497,8 @@ def delete_step_output_file(name: str, step_id: str, filename: str, user: dict =
 
 @app.get("/projects/{name}/steps/{step_id}/output/{filename:path}")
 def get_step_file_content(name: str, step_id: str, filename: str, user: dict = Depends(get_current_user)):
-    _SFMAP = {
-        "1": "step1_extraction", "1.5": "step1_extraction", "1.6": "step1_extraction",
-        "2": "step2_qcm", "3": "step3_metadata", "4": "step4_format",
-        "5": "step5_json", "6": "step6_corrections", "7": "step7_categories", "8": "step8_matches",
-    }
-    folder_name = _SFMAP.get(step_id, f"step{step_id}")
-    file_path = Path(f"/app/output/{user['id']}/{name}/{folder_name}") / filename
+    # S1: resolved + checked — a "../" filename can never leave this project.
+    file_path, storage_path = safe_output_path(user["id"], name, step_id, filename)
 
     ext = Path(filename).suffix.lower()
 
@@ -3475,14 +3507,11 @@ def get_step_file_content(name: str, step_id: str, filename: str, user: dict = D
     # from Storage via _stream_file_from_storage which ALSO caches the
     # bytes locally so the next read is a hit.
     if file_path.exists() and file_path.is_file():
-        if not str(file_path).startswith(f"/app/output/{user['id']}/{name}"):
-            raise HTTPException(status_code=403, detail="Access denied")
         if ext in (".txt", ".json", ".yaml", ".yml", ".md"):
             return {"content": file_path.read_text(encoding="utf-8")}
         return {"binary": True, "size": file_path.stat().st_size}
 
     # Fallback: read from Supabase Storage (and cache locally).
-    storage_path = f"{user['id']}/{name}/{folder_name}/{filename}"
     data = _stream_file_from_storage(storage_path, file_path)
     if data is None:
         raise HTTPException(status_code=404, detail="File not found")
@@ -3504,18 +3533,11 @@ def view_step_file(name: str, step_id: str, filename: str, user: dict = Depends(
     the local cache from Storage before issuing the redirect, so the next
     caller hits the FS directly.
     """
-    _SFMAP = {
-        "1": "step1_extraction", "1.5": "step1_extraction", "1.6": "step1_extraction",
-        "2": "step2_qcm", "3": "step3_metadata", "4": "step4_format",
-        "5": "step5_json", "6": "step6_corrections", "7": "step7_categories", "8": "step8_matches",
-    }
-    folder_name = _SFMAP.get(step_id, f"step{step_id}")
-    file_path = Path(f"/app/output/{user['id']}/{name}/{folder_name}") / filename
+    file_path, storage_path = safe_output_path(user["id"], name, step_id, filename)  # S1
     if file_path.exists() and file_path.is_file():
         mime_type, _ = mimetypes.guess_type(str(file_path))
         return FileResponse(path=str(file_path), media_type=mime_type or "text/plain")
     # Storage path; warm the cache best-effort then redirect to the signed URL.
-    storage_path = f"{user['id']}/{name}/{folder_name}/{filename}"
     try:
         _stream_file_from_storage(storage_path, file_path)
     except Exception:
@@ -3532,20 +3554,13 @@ def view_step_file(name: str, step_id: str, filename: str, user: dict = Depends(
 
 @app.get("/projects/{name}/steps/{step_id}/download/{filename:path}")
 def download_step_file(name: str, step_id: str, filename: str, user: dict = Depends(get_current_user)):
-    _SFMAP = {
-        "1": "step1_extraction", "1.5": "step1_extraction", "1.6": "step1_extraction",
-        "2": "step2_qcm", "3": "step3_metadata", "4": "step4_format",
-        "5": "step5_json", "6": "step6_corrections", "7": "step7_categories", "8": "step8_matches",
-    }
-    folder_name = _SFMAP.get(step_id, f"step{step_id}")
-    file_path = Path(f"/app/output/{user['id']}/{name}/{folder_name}") / filename
+    file_path, storage_path = safe_output_path(user["id"], name, step_id, filename)  # S1
     if file_path.exists() and file_path.is_file():
         mime_type, _ = mimetypes.guess_type(str(file_path))
         return FileResponse(path=str(file_path), media_type=mime_type or "application/octet-stream",
                             filename=file_path.name,
                             headers={"Content-Disposition": f'attachment; filename="{file_path.name}"'})
     # Storage path; warm the cache best-effort then redirect to the signed URL.
-    storage_path = f"{user['id']}/{name}/{folder_name}/{filename}"
     try:
         _stream_file_from_storage(storage_path, file_path)
     except Exception:
@@ -3636,18 +3651,7 @@ def get_history_file(name: str, step_id: str, run_id: str, filename: str, user: 
     PERSISTENCE_FIX_PLAN PR-3: warms the local cache from Storage on a miss
     so subsequent reads of the same history file are local.
     """
-    _SFMAP = {
-        "1": "step1_extraction", "1.5": "step1_extraction", "1.6": "step1_extraction",
-        "2": "step2_qcm", "3": "step3_metadata", "4": "step4_format",
-        "5": "step5_json", "6": "step6_corrections", "7": "step7_categories", "8": "step8_matches",
-    }
-    folder_name = _SFMAP.get(step_id, f"step{step_id}")
-    if run_id == "current":
-        local_path = Path(f"/app/output/{user['id']}/{name}/{folder_name}") / filename
-        storage_path = f"{user['id']}/{name}/{folder_name}/{filename}"
-    else:
-        local_path = Path(f"/app/output/{user['id']}/{name}/_history/step{step_id}/{run_id}") / filename
-        storage_path = f"{user['id']}/{name}/_history/step{step_id}/{run_id}/{filename}"
+    local_path, storage_path = safe_history_path(user["id"], name, step_id, run_id, filename)  # S1
     if local_path.exists():
         mime_type, _ = mimetypes.guess_type(str(local_path))
         return FileResponse(str(local_path), media_type=mime_type or "application/octet-stream")
@@ -3665,25 +3669,207 @@ def get_history_file(name: str, step_id: str, run_id: str, filename: str, user: 
             return FileResponse(str(local_path), media_type=mime_type or "application/octet-stream")
         raise HTTPException(status_code=404, detail="File not found")
 
+# ── Results (plan frontend-routes-and-switch-lag §11, Phase R) ─────────────
+# Thin HTTP layer over api/results.py: the server shapes the data (counts,
+# paged + filtered QCM rows, chunked previews, xlsx tables) so the browser
+# never downloads a whole result file to show a few rows.
+import hashlib as _hashlib
+import results as _results
+from fastapi.responses import JSONResponse as _JSONResponse, Response as _Response
+from output_paths import STEP_FOLDERS as _STEP_FOLDERS
+
+
+def _check_step(step_id: str) -> str:
+    sid = str(step_id)
+    if sid not in _STEP_FOLDERS:
+        raise HTTPException(status_code=404, detail=f"Unknown step {sid}")
+    return sid
+
+
+def _step_files(name: str, step_id: str, user: dict) -> list:
+    try:
+        return get_step_output_files(name, step_id, user).get("files", [])
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[RESULTS] listing {name}/{step_id} failed: {e}")
+        return []
+
+
+def _cached_parse(uid: str, name: str, step_id: str, rel: str, parser, tag: str):
+    """Parse one output file once per version (local stat or content hash)."""
+    file_path, storage_path = safe_output_path(uid, name, step_id, rel)  # S1
+    if file_path.exists() and file_path.is_file():
+        st = file_path.stat()
+        key = f"{tag}|{storage_path}|{st.st_size}|{st.st_mtime_ns}"
+        return _results.qcm_cache.get_or_load(key, lambda: parser(file_path.read_bytes()))
+    data = _stream_file_from_storage(storage_path, file_path)
+    if data is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    key = f"{tag}|{storage_path}|{len(data)}|{_hashlib.md5(data).hexdigest()}"
+    return _results.qcm_cache.get_or_load(key, lambda: parser(data))
+
+
+def _output_bytes(uid: str, name: str, step_id: str, rel: str) -> bytes:
+    file_path, storage_path = safe_output_path(uid, name, step_id, rel)  # S1
+    if file_path.exists() and file_path.is_file():
+        return file_path.read_bytes()
+    data = _stream_file_from_storage(storage_path, file_path)
+    if data is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    return data
+
+
+def _mbset_counts(uid: str, name: str, step_id: str, import_rel, report_rel) -> dict:
+    out = {"step": step_id, "import_file": import_rel, "report_file": report_rel}
+    if import_rel:
+        out["rows"] = _cached_parse(uid, name, step_id, import_rel,
+                                    lambda b: _results.xlsx_row_count(b, "Questions"), "mb-import")
+    if report_rel:
+        out["rejected"] = _cached_parse(uid, name, step_id, report_rel,
+                                        lambda b: _results.xlsx_row_count(b, "rejected"), "mb-rejected")
+        out["to_review"] = _cached_parse(uid, name, step_id, report_rel,
+                                         lambda b: _results.xlsx_row_count(b, "review"), "mb-review")
+    return out
+
+
+@app.get("/projects/{name}/results")
+def get_project_results(name: str, request: Request, user: dict = Depends(get_current_user)):
+    """Project results summary: per step its status, result files (workbook,
+    MBset files, result JSON), older workbook copies and the number of working
+    files; plus QCM counters from the newest stage and MBset row counts.
+    ETag: an unchanged summary answers 304 (the browser reuses its copy)."""
+    from concurrent.futures import ThreadPoolExecutor
+    uid = user["id"]
+
+    def one(sid: str):
+        files = _step_files(name, sid, user)
+        split = _results.split_step_files(files)
+        split.pop("_intermediate", None)
+        return sid, {**_status_or_idle(name, sid, user), **split,
+                     "qcm_json": _results.find_qcm_json(sid, files)}
+
+    with ThreadPoolExecutor(max_workers=len(OVERVIEW_STEPS)) as pool:
+        steps = dict(pool.map(one, OVERVIEW_STEPS))
+
+    summary = None
+    src = next((s for s in _results.QCM_STEP_PRIORITY if steps.get(s, {}).get("qcm_json")), None)
+    if src:
+        rel = steps[src]["qcm_json"]
+        try:
+            qcms = _cached_parse(uid, name, src, rel, _results.parse_qcms, "qcms")
+            summary = {"step": src, "file": rel, **_results.counters(qcms)}
+        except Exception as e:
+            summary = {"step": src, "file": rel, "error": str(e)}
+
+    mbset = None
+    for sid in ("7", "6", "2"):
+        res = steps.get(sid, {}).get("results", [])
+        imp = next((r["name"] for r in res if r["kind"] == "mbset_import"), None)
+        rep = next((r["name"] for r in res if r["kind"] == "mbset_report"), None)
+        if imp or rep:
+            try:
+                mbset = _mbset_counts(uid, name, sid, imp, rep)
+            except Exception as e:
+                mbset = {"step": sid, "import_file": imp, "report_file": rep, "error": str(e)}
+            break
+
+    body = {"name": name, "steps": steps, "summary": summary, "mbset": mbset,
+            "flag_labels": _results.FLAG_LABELS}
+    etag = '"' + _hashlib.sha1(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()[:24] + '"'
+    if request.headers.get("if-none-match") == etag:
+        return _Response(status_code=304, headers={"ETag": etag})
+    return _JSONResponse(body, headers={"ETag": etag, "Cache-Control": "private, no-cache"})
+
+
+@app.get("/projects/{name}/results/qcms")
+def get_result_qcms(name: str, step: str = "", filter: str = "", flag: str = "",
+                    session: str = "", q: str = "", page: int = 1, size: int = 50,
+                    user: dict = Depends(get_current_user)):
+    """Paged, normalised QCM rows, filtered on the server
+    (filter = needs_review | no_answer | has_case; flag; session; text q)."""
+    for sid in ([_check_step(step)] if step else list(_results.QCM_STEP_PRIORITY)):
+        rel = _results.find_qcm_json(sid, _step_files(name, sid, user))
+        if not rel:
+            continue
+        qcms = _cached_parse(user["id"], name, sid, rel, _results.parse_qcms, "qcms")
+        return {"step": sid, "file": rel,
+                **_results.query_rows(qcms, filter=filter, flag=flag, session=session,
+                                      q=q, page=page, size=size)}
+    return {"step": step or None, "file": None, "total": 0, "page": 1, "size": size, "rows": []}
+
+
+@app.get("/projects/{name}/results/{step_id}/files")
+def get_result_files(name: str, step_id: str, folder: str = "", q: str = "",
+                     page: int = 1, size: int = 100, user: dict = Depends(get_current_user)):
+    """A step's working files (not results), grouped by folder and paged."""
+    sid = _check_step(step_id)
+    split = _results.split_step_files(_step_files(name, sid, user))
+    return _results.page_files(split["_intermediate"] + split["older"],
+                               folder=folder, q=q, page=page, size=size)
+
+
+_TEXT_EXT = (".txt", ".json", ".md", ".yaml", ".yml", ".csv", ".log")
+
+
+@app.get("/projects/{name}/results/{step_id}/preview")
+def get_result_preview(name: str, step_id: str, path: str, offset: int = 0,
+                       limit: int = _results.TEXT_CHUNK, user: dict = Depends(get_current_user)):
+    """Text preview in chunks (64 KB default) with the total size."""
+    sid = _check_step(step_id)
+    if not path.lower().endswith(_TEXT_EXT):
+        raise HTTPException(status_code=415, detail="No text preview for this file type")
+    return _results.text_chunk(_output_bytes(user["id"], name, sid, path), offset, limit)
+
+
+@app.get("/projects/{name}/results/{step_id}/table")
+def get_result_table(name: str, step_id: str, path: str, sheet: str = "",
+                     page: int = 1, size: int = 100, user: dict = Depends(get_current_user)):
+    """xlsx preview: header + paged rows (no Google account needed)."""
+    sid = _check_step(step_id)
+    if not path.lower().endswith(".xlsx"):
+        raise HTTPException(status_code=415, detail="Table preview is for .xlsx files")
+    raw = _output_bytes(user["id"], name, sid, path)
+    try:
+        return _results.xlsx_table(raw, sheet=sheet, page=page, size=size)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Could not read workbook: {e}")
+
+
+@app.get("/projects/{name}/results/{step_id}/history")
+def get_result_history(name: str, step_id: str, user: dict = Depends(get_current_user)):
+    """Past runs only (the current output is already on the page), newest first."""
+    sid = _check_step(step_id)
+    runs = get_step_output_history(name, sid, user).get("runs", [])
+    out = []
+    for r in runs:
+        if r.get("run_id") == "current":
+            continue
+        files = [f for f in (r.get("files") or []) if not _results.basename(f.get("name", "")).startswith("_")]
+        out.append({
+            "run_id": r.get("run_id"),
+            "label": r.get("label") or r.get("run_id"),
+            "file_count": len(files),
+            "total_bytes": sum(int(f.get("size_bytes") or 0) for f in files),
+            "results": [f for f in files if _results.classify(f.get("name", "")) != "intermediate"],
+        })
+    return {"runs": out}
+
+
 @app.post("/projects/{name}/steps/{step_id}/open-sheets")
 def open_in_google_sheets(name: str, step_id: str, body: dict, user: dict = Depends(get_current_user)):
     """Upload XLSX to Google Sheets — resolves file from local FS or Supabase Storage."""
     filename = body.get("filename", "")
     print(f"[SHEETS] Request: project={name}, step={step_id}, file={filename}, user={user['id']}")
-    _SFMAP = {
-        "1": "step1_extraction", "1.5": "step1_extraction", "1.6": "step1_extraction",
-        "2": "step2_qcm", "3": "step3_metadata", "4": "step4_format",
-        "5": "step5_json", "6": "step6_corrections", "7": "step7_categories", "8": "step8_matches",
-    }
-    folder = _SFMAP.get(step_id, f"step{step_id}")
-    file_path = Path(f"/app/output/{user['id']}/{name}/{folder}") / filename
+    folder = step_folder(step_id)
+    file_path, _sheet_storage_path = safe_output_path(user["id"], name, step_id, filename)  # S1
 
     # If not local, download from Supabase to a temp file
     if not file_path.exists():
         print(f"[SHEETS] File not local, downloading from Supabase...")
         import tempfile
         # Use raw path segments (supabase-py handles any required escaping internally)
-        storage_path = f"{user['id']}/{name}/{folder}/{filename}"
+        storage_path = _sheet_storage_path
         print(f"[SHEETS] Supabase path: {storage_path}")
         try:
             data = read_bytes_file(storage_path)

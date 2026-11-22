@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAppStore } from '../../store/appStore'
+import { projectUrl } from '../../lib/routes'
 import { Project, TagEntry } from '../../types'
 import { formatRelative } from '../../lib/format'
 import { filterBySearchTags } from '../../lib/tags'
@@ -78,7 +79,7 @@ export function RecentProjectsList({ projects, loading }: RecentProjectsListProp
             <div
               key={proj.name}
               id={`recent-project-${proj.name}`}
-              onClick={() => { setActiveProject(proj); navigate('/pipeline') }}
+              onClick={() => { setActiveProject(proj); navigate(projectUrl(proj.name)) }}
               className="flex items-center justify-between p-4 rounded-xl
                          bg-surface-container-low hover:bg-surface-container-highest/50
                          border border-outline-variant/5 hover:border-primary/20

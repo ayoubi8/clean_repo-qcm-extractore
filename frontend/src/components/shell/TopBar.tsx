@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { useAppStore } from '../../store/appStore'
 import { CostSummaryPanel } from '../cost/CostSummaryPanel'
 
@@ -32,10 +33,11 @@ export function TopBar() {
   const [showCosts, setShowCosts] = useState(false)
   const activeProject = useAppStore((s) => s.activeProject)
   const pipelineStatus = useAppStore((s) => s.pipelineStatus)
-  const setActiveProject = useAppStore((s) => s.setActiveProject)
+  const navigate = useNavigate()
+  const sidebarCollapsed = useAppStore((s) => s.sidebarCollapsed ?? false)
 
   return (
-    <header className="fixed top-0 right-0 left-64 h-16 z-30 flex items-center justify-between px-8 bg-surface/60 backdrop-blur-xl border-b border-outline-variant/10">
+    <header className={`fixed top-0 right-0 transition-[left] duration-300 ${sidebarCollapsed ? 'left-[76px]' : 'left-64'} h-16 z-30 flex items-center justify-between px-8 bg-surface/60 backdrop-blur-xl border-b border-outline-variant/10`}>
       {/* Left: project name + status chip */}
       <div className="flex items-center gap-4">
         <span className="text-sm font-bold text-on-surface tracking-tight" id="active-project-name">
@@ -48,7 +50,7 @@ export function TopBar() {
       <div className="flex items-center gap-6">
         <button 
           id="btn-switch-project"
-          onClick={() => setActiveProject(null)}
+          onClick={() => navigate('/projects')}
           className="text-xs font-semibold text-primary hover:text-primary-fixed transition-colors underline underline-offset-4"
         >
           Switch Project

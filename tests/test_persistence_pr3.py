@@ -160,7 +160,10 @@ def _test_view_step_file_local_hit_no_storage():
         def exists(self): return True
         def is_file(self): return True
         def stat(self): return MagicMock(st_size=100)
+    # File paths are built in api/output_paths.py (S1 path safety) — patch it too.
+    import output_paths as _op
     real_api.Path = HitPath
+    _op.Path = HitPath
     real_api.mimetypes = MagicMock()
     real_api.mimetypes.guess_type = MagicMock(return_value=("application/vnd.openxmlformats", None))
     real_api.FileResponse = MagicMock(return_value="LOCAL_FILE")
@@ -171,6 +174,7 @@ def _test_view_step_file_local_hit_no_storage():
         out = real_api.view_step_file("proj", "8", "step8_matches.xlsx", {"id": "uid"})
     finally:
         real_api.Path = orig_path
+        _op.Path = orig_path
     assert out == "LOCAL_FILE", out
     real_api._stream_file_from_storage.assert_not_called()
     real_api.get_signed_url.assert_not_called()
@@ -202,7 +206,10 @@ def _test_download_step_file_storage_signed_url_unavailable_serves_local():
         def stat(self): return MagicMock(st_size=50)
         @property
         def name(self): return "step8_matches.xlsx"
+    # File paths are built in api/output_paths.py (S1 path safety) — patch it too.
+    import output_paths as _op
     real_api.Path = HitPath2
+    _op.Path = HitPath2
     real_api._stream_file_from_storage = MagicMock(return_value=b"PK")
     real_api.get_signed_url = MagicMock(side_effect=RuntimeError("no signed url"))
     real_api.mimetypes = MagicMock()
@@ -215,6 +222,7 @@ def _test_download_step_file_storage_signed_url_unavailable_serves_local():
         out = real_api.download_step_file("proj", "8", "step8_matches.xlsx", {"id": "uid"})
     finally:
         real_api.Path = orig_path
+        _op.Path = orig_path
     assert out == "LOCAL_FALLBACK", out
     real_api.FileResponse.assert_called_once()
     real_api.RedirectResponse.assert_not_called()

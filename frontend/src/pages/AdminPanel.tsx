@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuthStore } from '../store/authStore'
 import { useAppStore } from '../store/appStore'
+import { projectUrl } from '../lib/routes'
 import {
   fetchAdminUsers,
   fetchAdminStats,
@@ -128,7 +129,7 @@ export function AdminPanel() {
           {activeTab === 'stats' && <StatsTab stats={stats} />}
           {activeTab === 'projects' && <ProjectsTab users={users} onSelectProject={(p) => {
             setActiveProject(p)
-            navigate('/pipeline')
+            navigate(projectUrl(p.name))
           }} />}
         </div>
       </main>

@@ -325,4 +325,7 @@ export interface AppState {
   setPipelineStatus: (s: 'idle' | 'running') => void;
   setLauncherOpen: (v: boolean) => void;
   closeLauncherRestoringSession?: () => void;
+  // Shell redesign: collapsible sidebar (persisted)
+  sidebarCollapsed?: boolean;
+  setSidebarCollapsed?: (v: boolean) => void;
 }

@@ -5,6 +5,8 @@ import { StepId, StepStatus, StepState, LogLine, Step1Config, Step2Config, Step3
 interface PipelineStore {
   steps: StepState[]
   activeStepId: StepId | null
+  /** Project the `steps` statuses belong to (lag plan Phase 3). */
+  statusProject: string | null
   logLines: LogLine[]
 
   // configs
@@ -26,6 +28,8 @@ interface PipelineStore {
   setStepStatus: (id: StepId, s: StepStatus) => void
   setStepOutputExists: (id: StepId, exists: boolean) => void
   setActiveStep: (id: StepId) => void
+  /** Another project opened: forget the previous project's step statuses. */
+  resetStepStates: (project: string) => void
   appendLog: (line: LogLine) => void
   clearLog: () => void
   raiseCcAlert: (project: string, text: string) => void
@@ -68,6 +72,8 @@ export function isCcBoundaryDisagreement(text: unknown): boolean {
 //   it fires as an invisible cascade after Step 2 succeeds
 //   (see modules/post_step2_metadata.py). The `3` StepId still exists for status
 //   polling, but the UI shows only one row.
+export const MAX_LOG_LINES = 5000
+
 const INITIAL_STEPS: StepState[] = [
   { id: 1, label: 'Step 1 · Text Extraction', status: 'idle', outputExists: false },
   { id: 2, label: 'Step 2 · QCM Extraction + Metadata', status: 'idle', outputExists: false },
@@ -81,6 +87,7 @@ export const usePipelineStore = create<PipelineStore>()(
     (set) => ({
       steps: INITIAL_STEPS,
       activeStepId: 1,
+      statusProject: null,
       logLines: [],
 
       step1Config: {
@@ -152,7 +159,15 @@ export const usePipelineStore = create<PipelineStore>()(
         steps: state.steps.map(st => st.id === id ? { ...st, outputExists: exists } : st)
       })),
       setActiveStep: (id) => set({ activeStepId: id }),
-      appendLog: (line) => set((state) => ({ logLines: [...state.logLines, line] })),
+      resetStepStates: (project) => set({ steps: INITIAL_STEPS, statusProject: project }),
+      // Capped so a long run (tens of thousands of lines) never slows the UI.
+      appendLog: (line) => set((state) => {
+        const next = state.logLines.length >= MAX_LOG_LINES
+          ? state.logLines.slice(state.logLines.length - MAX_LOG_LINES + 1)
+          : state.logLines.slice()
+        next.push(line)
+        return { logLines: next }
+      }),
       clearLog: () => set({ logLines: [] }),
       raiseCcAlert: (project, text) => set((state) => ({
         ccAlerts: {

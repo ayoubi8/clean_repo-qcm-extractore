@@ -1,8 +1,9 @@
 ﻿import { useState, useEffect } from 'react'
 import { retryBatchPdf, fetchAuthenticatedBlobUrl } from '../../lib/api'
 import { useBatchStore } from '../../store/batchStore'
-import { useOutputsCache, ensureStepOutput, reloadAfterSync, removeCachedFile } from '../../store/outputsCache'
-import { StepFileRow, StepFileMeta } from './StepFileRow'
+import { useOutputsCache, ensureStepOutput, reloadAfterSync } from '../../store/outputsCache'
+import type { ResultFile } from '../../lib/results'
+import { ResultFileRow } from '../results/ResultFileRow'
 
 /**
  * Auto Run batch — expand-in-place detail (resolved Q5).
@@ -47,7 +48,7 @@ export function BatchDetailPanel({ batchId, projectName, projectState, errorStep
   const [pdfLoading, setPdfLoading] = useState(false)
   const canRetry = projectState === 'error' || projectState === 'cancelled'
 
-  const filesFor = (stepId: string): StepFileMeta[] =>
+  const filesFor = (stepId: string): ResultFile[] =>
     entries[`${projectName}|${stepId}`]?.files ?? []
 
   const predates = (stepId: string): boolean => {
@@ -170,13 +171,11 @@ export function BatchDetailPanel({ batchId, projectName, projectState, errorStep
               ) : (
                 <div className="space-y-2">
                   {files.map(f => (
-                    <StepFileRow
+                    <ResultFileRow
                       key={`${step.id}/${f.name}`}
-                      projectName={projectName}
-                      stepId={step.id}
+                      project={projectName}
+                      step={step.id}
                       file={f}
-                      onDeleted={() => removeCachedFile(projectName, step.id, f.name)}
-                      onSynced={() => reloadAfterSync(projectName, step.id)}
                     />
                   ))}
                 </div>

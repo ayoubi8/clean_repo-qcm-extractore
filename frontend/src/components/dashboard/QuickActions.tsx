@@ -1,5 +1,6 @@
 import { useNavigate } from 'react-router-dom'
 import { useAppStore } from '../../store/appStore'
+import { projectUrl } from '../../lib/routes'
 
 interface ActionButtonProps {
   icon: string
@@ -35,7 +36,6 @@ function ActionButton({ icon, label, onClick, disabled, variant, id }: ActionBut
 
 export function QuickActions() {
   const activeProject = useAppStore(s => s.activeProject)
-  const setLauncherOpen = useAppStore(s => s.setLauncherOpen)
   const navigate = useNavigate()
 
   return (
@@ -49,7 +49,7 @@ export function QuickActions() {
         id="dash-action-pipeline"
         icon="account_tree"
         label="Open Pipeline"
-        onClick={() => navigate('/pipeline')}
+        onClick={() => activeProject && navigate(projectUrl(activeProject.name))}
         disabled={!activeProject}
         variant="primary"
       />
@@ -59,7 +59,7 @@ export function QuickActions() {
         id="dash-action-new"
         icon="add_circle"
         label="New Project"
-        onClick={() => setLauncherOpen(true)}
+        onClick={() => navigate('/projects/new')}
         variant="secondary"
       />
 

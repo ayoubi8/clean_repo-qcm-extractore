@@ -9,6 +9,8 @@ export const useAppStore = create<AppState>()(
       pipelineStatus: 'idle',
       isLauncherOpen: true,
       lastActiveProject: null,
+      sidebarCollapsed: false,
+      setSidebarCollapsed: (v: boolean) => set({ sidebarCollapsed: v }),
       setActiveProject: (p: Project | null) => {
         if (p) {
           // lastActiveProject keeps the most recent REAL session so closing
@@ -38,6 +40,7 @@ export const useAppStore = create<AppState>()(
         activeProject: state.activeProject,
         isLauncherOpen: state.isLauncherOpen,
         lastActiveProject: state.lastActiveProject,
+        sidebarCollapsed: state.sidebarCollapsed,
       }),
     }
   )

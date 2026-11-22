@@ -8,7 +8,7 @@ import { Step8Config } from './configs/Step8Config'
 import { StepRunOnly } from './configs/StepRunOnly'
 import { runStep, stopStep, connectLogStream, getStepStatus } from '../../lib/api'
 import { useAppStore } from '../../store/appStore'
-import { OutputViewer } from './OutputViewer'
+import { StepResultsCard } from '../results/StepResultsCard'
 import { useStepHistory } from '../../hooks/useStepHistory'
 
 // Steps 3, 4 & 5 are intentionally absent:
@@ -276,7 +276,7 @@ export function ConfigPanel() {
         )}
 
         {activeProject && (
-          <OutputViewer projectName={activeProject.name} stepId={activeStep.id.toString()} />
+          <StepResultsCard project={activeProject.name} stepId={activeStep.id.toString()} />
         )}
       </div>
     </section>

@@ -299,7 +299,11 @@ def revoke_all_refresh_tokens(user_id: str):
 # FastAPI Dependencies
 # ---------------------------------------------------------------------------
 
-async def get_current_user(authorization: str = Header(None)) -> dict:
+# Plain `def` on purpose (lag plan B1): on a cache miss find_user_by_id makes a
+# BLOCKING Supabase call. As `async def` it ran on the event loop and froze
+# every request and log WebSocket for that round-trip; FastAPI runs a sync
+# dependency in its thread pool instead.
+def get_current_user(authorization: str = Header(None)) -> dict:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

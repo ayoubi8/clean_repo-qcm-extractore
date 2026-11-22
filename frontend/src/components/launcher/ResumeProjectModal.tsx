@@ -1,5 +1,7 @@
-import { useState, useEffect } from 'react'
-import { fetchProjects, deleteProject } from '../../lib/api'
+import { useState, useMemo } from 'react'
+import { fetchProjects, deleteProject, PROJECTS_KEY, PROJECTS_TTL_MS } from '../../lib/api'
+import { useCached } from '../../lib/cache'
+import { useAppStore } from '../../store/appStore'
 import { Project, TagEntry } from '../../types'
 import { formatRelative } from '../../lib/format'
 import { BatchHistoryList } from '../batch/BatchHistoryList'
@@ -10,13 +12,25 @@ import { filterBySearchTags } from '../../lib/tags'
 interface ResumeProjectModalProps {
   onSuccess: (project: Project) => void
   onOpenBatch: (batchId: string) => void
+  /** Show the "Recent batches" block above the projects (launcher look). */
+  showBatches?: boolean
+  /** Full-page list (the /projects page) instead of the 320px box. */
+  fullHeight?: boolean
 }
 
-export function ResumeProjectModal({ onSuccess, onOpenBatch }: ResumeProjectModalProps) {
-  const [projects, setProjects] = useState<Project[]>([])
+export function ResumeProjectModal({ onSuccess, onOpenBatch, showBatches = true, fullHeight = false }: ResumeProjectModalProps) {
+  // Cached list (lag plan Phase 1): renders instantly from the last result,
+  // refreshes in the background when older than 15 s.
+  const { data, loading, error: loadError, setData } = useCached<Project[]>(PROJECTS_KEY, fetchProjects, PROJECTS_TTL_MS)
+  const projects = useMemo(() => {
+    const ts = (p: Project) => p.last_modified ? new Date(p.last_modified).getTime() : 0
+    return [...(data ?? [])].sort((a, b) => ts(b) - ts(a))
+  }, [data])
+  const activeName = useAppStore(s => s.activeProject?.name)
+  const setActiveProject = useAppStore(s => s.setActiveProject)
   const [selected, setSelected] = useState<Project | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const [actionError, setError] = useState<string | null>(null)
+  const error = actionError ?? (loadError && !data ? 'Failed to load existing projects.' : null)
   const [deletingName, setDeletingName] = useState<string | null>(null)
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
   // Tags & Search plan — one filter drives projects + batch history rows
@@ -24,24 +38,6 @@ export function ResumeProjectModal({ onSuccess, onOpenBatch }: ResumeProjectModa
   const [activeTags, setActiveTags] = useState<TagEntry[]>([])
 
   const visibleProjects = filterBySearchTags(projects, query, activeTags)
-
-  useEffect(() => {
-    load()
-  }, [])
-
-  async function load() {
-    setLoading(true)
-    setError(null)
-    try {
-      const data = await fetchProjects()
-      const ts = (p: Project) => p.last_modified ? new Date(p.last_modified).getTime() : 0
-      setProjects([...data].sort((a, b) => ts(b) - ts(a)))
-    } catch (e) {
-      setError('Failed to load existing projects.')
-    } finally {
-      setLoading(false)
-    }
-  }
 
   async function handleDelete(name: string, e: React.MouseEvent) {
     e.stopPropagation() // don't select the row
@@ -55,7 +51,8 @@ export function ResumeProjectModal({ onSuccess, onOpenBatch }: ResumeProjectModa
     setConfirmDelete(null)
     try {
       await deleteProject(name)
-      setProjects(prev => prev.filter(p => p.name !== name))
+      setData((data ?? []).filter(p => p.name !== name))
+      if (activeName === name) setActiveProject(null)   // it no longer exists
       if (selected?.name === name) setSelected(null)
     } catch {
       setError(`Failed to delete "${name}".`)
@@ -98,7 +95,7 @@ export function ResumeProjectModal({ onSuccess, onOpenBatch }: ResumeProjectModa
     return (
       <div className="space-y-6">
         <SearchBar {...searchProps0} />
-        <BatchHistoryList onOpenBatch={onOpenBatch} query={query} activeTags={activeTags} />
+        {showBatches && <BatchHistoryList onOpenBatch={onOpenBatch} query={query} activeTags={activeTags} />}
         <div className="text-center py-8 text-outline">
           <span className="material-symbols-outlined text-5xl block mb-4 opacity-20">folder_off</span>
           <p className="text-sm font-bold text-on-surface">No existing projects found.</p>
@@ -113,7 +110,7 @@ export function ResumeProjectModal({ onSuccess, onOpenBatch }: ResumeProjectModa
   return (
     <div className="space-y-6">
       <SearchBar {...searchProps} />
-      <BatchHistoryList onOpenBatch={onOpenBatch} query={query} activeTags={activeTags} />
+      {showBatches && <BatchHistoryList onOpenBatch={onOpenBatch} query={query} activeTags={activeTags} />}
       {emptyFiltered ? (
         <div className="text-center py-8 text-outline">
           <span className="material-symbols-outlined text-5xl block mb-4 opacity-20">search_off</span>
@@ -121,7 +118,7 @@ export function ResumeProjectModal({ onSuccess, onOpenBatch }: ResumeProjectModa
           <p className="text-xs mt-1">Try a different name or clear the tag filters.</p>
         </div>
       ) : (
-      <div className="space-y-2 max-h-[320px] overflow-y-auto pr-2 custom-scrollbar">
+      <div className={`space-y-2 overflow-y-auto pr-2 custom-scrollbar ${fullHeight ? 'max-h-[calc(100vh-360px)] min-h-[200px]' : 'max-h-[320px]'}`}>
         {visibleProjects.map((project) => {
           const isSelected = selected?.name === project.name
           const isDeleting = deletingName === project.name
