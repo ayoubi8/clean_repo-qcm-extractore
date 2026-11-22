@@ -73,6 +73,49 @@ export async function fetchAuthenticatedBlobUrl(url: string): Promise<string> {
   return URL.createObjectURL(blob)
 }
 
+// POST /results/download — several projects' result files as one zip.
+export type ZipFiles = 'xlsx' | 'results' | 'all'
+export async function downloadResultsZip(body: { projects: string[]; steps: string[]; files: ZipFiles; name: string }): Promise<number> {
+  const res = await fetchWithRefresh(`${BASE}/results/download`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error((err as any).detail || `Download failed (${res.status})`)
+  }
+  const count = Number(res.headers.get('X-File-Count') || 0)
+  const blob = await res.blob()
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `${body.name.replace(/[^A-Za-z0-9._-]+/g, '_') || 'results'}.zip`
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 30000)
+  return count
+}
+
+// POST /costs/rebuild — repair old cost rows ({apply:false} = report only).
+export interface CostRebuildReport {
+  applied: boolean
+  total_before: number
+  total_after: number
+  projects: { project: string; before: number; after: number; source: string; action: string }[]
+}
+export async function rebuildCosts(apply: boolean): Promise<CostRebuildReport> {
+  const res = await fetchWithRefresh(`${BASE}/costs/rebuild`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+    body: JSON.stringify({ apply }),
+  })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) throw new Error((data as any).detail || 'Cost repair failed')
+  return data as CostRebuildReport
+}
+
 /**
  * Fetch a protected URL with auth headers and trigger a browser download.
  */

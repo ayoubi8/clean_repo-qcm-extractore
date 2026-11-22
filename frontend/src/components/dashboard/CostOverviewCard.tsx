@@ -6,6 +6,17 @@ interface CostOverviewCardProps {
   activeProject: Project | null
 }
 
+/** Per-model bars when the cost file gives models; per-step bars otherwise
+ *  (costs read from the SQL table have no model breakdown). */
+function breakdown(summary: CostSummary): [string, { cost: number }][] {
+  const models = Object.entries(summary.per_model ?? {}).filter(([, d]) => (d?.cost ?? 0) > 0)
+  if (models.length > 0) return models
+  return Object.entries(summary.per_step ?? {})
+    .filter(([, d]) => (d?.total_cost ?? 0) > 0)
+    .sort(([a], [b]) => parseFloat(a) - parseFloat(b))
+    .map(([step, d]) => [/^\d/.test(step) ? `Step ${step}` : step, { cost: d.total_cost }])
+}
+
 export function CostOverviewCard({ summary, loading, activeProject }: CostOverviewCardProps) {
   if (loading) {
     return (
@@ -38,8 +49,8 @@ export function CostOverviewCard({ summary, loading, activeProject }: CostOvervi
 
       {/* Per-model mini bars */}
       <div className="flex-1 overflow-y-auto custom-scrollbar pr-2 space-y-4">
-        {summary && Object.entries(summary.per_model).length > 0 ? (
-          Object.entries(summary.per_model).map(([model, data]) => {
+        {summary && breakdown(summary).length > 0 ? (
+          breakdown(summary).map(([model, data]) => {
             const pct = summary.total_cost > 0
               ? (data.cost / summary.total_cost) * 100 : 0
             return (

@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { fetchCosts, saveCosts, fetchAllCosts, AllCosts } from '../../lib/api'
+import { fetchCosts, saveCosts, fetchAllCosts, AllCosts, rebuildCosts, CostRebuildReport } from '../../lib/api'
 import { CostSummary, ModelCost, StepCost } from '../../types'
 import { useAppStore } from '../../store/appStore'
 
@@ -14,10 +14,22 @@ function CostModelRow({ model, data }: { model: string, data: ModelCost }) {
   )
 }
 
+const STEP_NAMES: Record<string, string> = {
+  '1': 'Step 1 · Text extraction', '1.5': 'Step 1.5 · Text merge', '1.6': 'Step 1.6 · Text fix',
+  '2': 'Step 2 · QCM extraction', '3': 'Step 3 · Metadata (in Step 2)', '4': 'Step 4 · Format',
+  '5': 'Step 5 · Build', '6': 'Step 6 · Corrections', '7': 'Step 7 · Categorization', '8': 'Step 8 · Matching',
+}
+
+function stepOrder(a: string, b: string) {
+  const na = parseFloat(a), nb = parseFloat(b)
+  if (isNaN(na) || isNaN(nb)) return a.localeCompare(b)
+  return na - nb
+}
+
 function CostStepRow({ step, data }: { step: string, data: StepCost }) {
   return (
     <div className="flex items-center gap-4 py-3 border-b border-outline-variant/10 text-sm">
-      <span className="flex-1 font-bold text-on-surface truncate capitalize">{step}</span>
+      <span className="flex-1 font-bold text-on-surface truncate">{STEP_NAMES[step] ?? step}</span>
       <span className="w-16 font-mono text-on-surface-variant text-[11px] text-right">{data.call_count}</span>
       <span className="w-28 font-mono text-on-surface-variant text-[11px] text-right">{(data.total_tokens.prompt + data.total_tokens.completion).toLocaleString()}</span>
       <span className="w-20 font-mono text-primary font-bold text-right">${data.total_cost.toFixed(4)}</span>
@@ -156,7 +168,7 @@ export function CostSummaryPanel({ onClose }: { onClose: () => void }) {
                   <span className="w-28 text-right">Tokens</span>
                   <span className="w-20 text-right">Cost</span>
                 </div>
-                {Object.entries(summary.per_step ?? {}).map(([step, data]) => (
+                {Object.entries(summary.per_step ?? {}).sort(([a], [b]) => stepOrder(a, b)).map(([step, data]) => (
                   <CostStepRow key={step} step={step} data={data} />
                 ))}
               </section>
@@ -211,6 +223,7 @@ export function CostSummaryPanel({ onClose }: { onClose: () => void }) {
               <p className="text-outline text-[11px] text-center">
                 Select a project to see its per-step / per-model breakdown.
               </p>
+              <CostRepair onDone={async () => { try { setAllSummary(await fetchAllCosts()) } catch { /* keep */ } }} />
             </>
           ) : (
             <div className="text-center py-10 text-outline">
@@ -248,5 +261,81 @@ export function CostSummaryPanel({ onClose }: { onClose: () => void }) {
         )}
       </div>
     </>
+  )
+}
+
+
+/**
+ * Repair cost history: cost rows saved before 2026-11-23 were mostly $0 and
+ * re-runs were counted twice. Rebuilds them from the per-call logs or the
+ * project's cost file. Shows what would change first, then applies.
+ */
+function CostRepair({ onDone }: { onDone: () => void | Promise<void> }) {
+  const [report, setReport] = useState<CostRebuildReport | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const changes = report?.projects.filter(p => p.action !== 'unchanged') ?? []
+
+  const run = async (apply: boolean) => {
+    setBusy(true)
+    setError(null)
+    try {
+      const r = await rebuildCosts(apply)
+      setReport(r)
+      if (apply) await onDone()
+    } catch (e: any) {
+      setError(e?.message || 'Repair failed')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="p-4 rounded-xl border border-outline-variant/15 bg-surface-container-low space-y-3">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <p className="text-xs font-bold text-on-surface">Repair cost history</p>
+          <p className="text-[11px] text-outline">Older runs were saved as $0 or counted twice. Recalculate them from the AI call logs.</p>
+        </div>
+        <button
+          onClick={() => { void run(false) }}
+          disabled={busy}
+          className="shrink-0 h-9 px-3 rounded-lg border border-outline-variant/20 text-[11px] font-bold text-on-surface-variant hover:text-primary hover:border-primary/30 disabled:opacity-40"
+        >
+          {busy && !report?.applied ? 'Checking…' : 'Check'}
+        </button>
+      </div>
+      {error && <p className="text-[11px] text-error">{error}</p>}
+      {report && (
+        report.applied ? (
+          <p className="text-[11px] text-primary font-bold">
+            Done: {changes.length} project{changes.length === 1 ? '' : 's'} rebuilt · total ${report.total_before.toFixed(2)} → ${report.total_after.toFixed(2)}
+          </p>
+        ) : changes.length === 0 ? (
+          <p className="text-[11px] text-outline">Nothing to repair — the saved costs match the call logs.</p>
+        ) : (
+          <div className="space-y-2">
+            <p className="text-[11px] text-on-surface-variant">
+              {changes.length} project{changes.length === 1 ? '' : 's'} would change · total ${report.total_before.toFixed(2)} → ${report.total_after.toFixed(2)}
+            </p>
+            <div className="max-h-40 overflow-y-auto custom-scrollbar text-[10px] font-mono text-outline space-y-0.5">
+              {changes.map(p => (
+                <div key={p.project} className="flex justify-between gap-2">
+                  <span className="truncate">{p.project}</span>
+                  <span className="shrink-0">${p.before.toFixed(4)} → ${p.after.toFixed(4)}</span>
+                </div>
+              ))}
+            </div>
+            <button
+              onClick={() => { void run(true) }}
+              disabled={busy}
+              className="h-9 px-4 rounded-lg bg-primary text-on-primary text-[11px] font-black disabled:opacity-40"
+            >
+              {busy ? 'Repairing…' : 'Apply repair'}
+            </button>
+          </div>
+        )
+      )}
+    </div>
   )
 }

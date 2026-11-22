@@ -11,6 +11,7 @@ import { stepUrl } from '../lib/routes'
 import { ResultFileRow, Pager, useSheetsAutoSync } from '../components/results/ResultFileRow'
 import { useRefreshResultsOnRunEnd } from '../hooks/useResultsLive'
 import { toast } from '../components/ui/Toaster'
+import { DownloadResultsButton } from '../components/results/DownloadResultsDialog'
 
 /**
  * /projects/:name/outputs — Results page (lag plan Phase R, §11.3).
@@ -51,6 +52,8 @@ export function ResultsPage() {
           <h1 className="text-2xl font-black tracking-tight text-on-surface mt-1">Results</h1>
           <p className="text-sm text-outline truncate">{name}</p>
         </div>
+        <div className="flex items-center gap-2">
+        <DownloadResultsButton projects={[{ name }]} zipName={`${name}_results`} />
         <button
           onClick={() => { void refresh() }}
           disabled={refreshing}
@@ -59,6 +62,7 @@ export function ResultsPage() {
           <span className={`material-symbols-outlined text-[18px] ${refreshing ? 'animate-spin' : ''}`}>refresh</span>
           Refresh
         </button>
+        </div>
       </div>
 
       {loading && !data ? (

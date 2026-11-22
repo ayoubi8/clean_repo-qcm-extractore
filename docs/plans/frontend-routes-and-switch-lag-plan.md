@@ -231,6 +231,8 @@ B1-B3 remove most of the visible lag; B4 removes it during heavy runs.
   background refresh, invalidation) instead of adding TanStack Query.
 - Tests: `tests/test_results_and_overview.py` (14).
 - Deploy order: backend first (new endpoints), then the frontend.
+- Open items: [open-items-2026-11.md](open-items-2026-11.md).
+  Phase 5 plan: [phase5-step-runner-process-plan.md](phase5-step-runner-process-plan.md).
 
 ---
 

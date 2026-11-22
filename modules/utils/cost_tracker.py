@@ -1,7 +1,55 @@
 import json
 import threading
-from typing import Dict, List
+from typing import Dict, List, Optional
 from datetime import datetime
+
+
+def cost_step_bucket(key: str) -> Optional[str]:
+    """Tracker call key -> the pipeline step it belongs to.
+
+    Modules log calls under detailed keys ("step2_batch_p3-5",
+    "step6_all_pages_scan", "cc_checker"...). Cost rows and summaries are
+    per step: "1", "1.5", "1.6", "2", "3" (metadata cascade inside Step 2),
+    "4", "5", "6", "7", "8". None = unknown key (caller decides).
+    """
+    k = str(key or "").lower()
+    if k.startswith("step1_5"):
+        return "1.5"
+    if k.startswith("step1_6"):
+        return "1.6"
+    for n in ("1", "2", "3", "4", "5", "6", "7", "8"):
+        if k == f"step{n}" or k.startswith(f"step{n}_"):
+            return n
+    if k in ("cc_checker", "ai_metadata_detect") or k.startswith(("cc_", "hint", "cas_")):
+        return "3"
+    return None
+
+
+# Which cost buckets a run of each step may produce (Step 2 runs the
+# metadata cascade = Step 3/4/5 inside its own run).
+RUN_BUCKETS = {
+    "1": {"1"}, "1.5": {"1.5"}, "1.6": {"1.6"}, "2": {"2", "3", "4", "5"},
+    "3": {"3"}, "4": {"4"}, "5": {"5"}, "6": {"6"}, "7": {"7"}, "8": {"8"},
+}
+
+
+def bucket_calls(calls: List[Dict], run_step: str) -> Dict[str, Dict]:
+    """Sum calls per step bucket -> {step: {cost, tokens, calls}}.
+    Unknown keys count for `run_step`; buckets another step owns are dropped
+    (protects against a parallel run of another step of the same project)."""
+    allowed = RUN_BUCKETS.get(str(run_step), {str(run_step)})
+    out: Dict[str, Dict] = {}
+    for c in calls or []:
+        b = cost_step_bucket(c.get("step", "")) or str(run_step)
+        if b not in allowed:
+            continue
+        slot = out.setdefault(b, {"cost": 0.0, "tokens": 0, "calls": 0})
+        t = c.get("tokens") or {}
+        slot["cost"] += float(c.get("cost") or 0)
+        slot["tokens"] += int(t.get("prompt", t.get("prompt_tokens", 0)) or 0) + \
+            int(t.get("completion", t.get("completion_tokens", 0)) or 0)
+        slot["calls"] += 1
+    return out
 
 # Shared by every tracker: log_api_call does read-modify-write on dicts and is
 # called from parallel workers (Step 1 page pool, parallel Step 2, CC checker).
@@ -56,6 +104,33 @@ class CostTracker:
                 }
             }
     
+    # ── per-run deltas (cost recording + child-process runs) ──────────────
+    def snapshot(self) -> Dict[str, int]:
+        """Call count per key — pass to calls_since() after the run."""
+        with _LOG_LOCK:
+            return {k: len(v) for k, v in self.steps.items()}
+
+    def calls_since(self, snap: Optional[Dict[str, int]]) -> List[Dict]:
+        """Every call logged after `snap`, each tagged with its key."""
+        snap = snap or {}
+        with _LOG_LOCK:
+            out = []
+            for k, calls in self.steps.items():
+                for c in calls[snap.get(k, 0):]:
+                    out.append({"step": k, **c})
+            return out
+
+    def merge_calls(self, calls: List[Dict]) -> None:
+        """Add calls recorded elsewhere (a child process) to this tracker."""
+        for c in calls or []:
+            c = dict(c)
+            step = c.pop("step", "unknown")
+            with _LOG_LOCK:
+                self._log_api_call_unlocked(step, c.get("model", "unknown"),
+                                            c.get("tokens") or {}, float(c.get("cost") or 0))
+                if c.get("timestamp"):
+                    self.steps[step][-1]["timestamp"] = c["timestamp"]
+
     def get_step_summary(self, step: str) -> Dict:
         """Get cost summary for a specific step"""
         if step not in self.steps:

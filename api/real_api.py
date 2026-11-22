@@ -36,6 +36,7 @@ from log_capture import LogCapture
 import step_cache
 from autorun_batch import (batch_enabled as autorun_batch_enabled,
                            max_batch_files as autorun_max_batch_files,
+                           batch_concurrency as autorun_batch_concurrency,
                            new_batch_id as autorun_new_batch_id,
                            run_batch_task as autorun_run_batch_task,
                            retry_project as autorun_retry_project,
@@ -330,6 +331,23 @@ async def startup_event():
             print(f"[STARTUP] ⚠️ tokens/pdf backfill failed: {e}")
 
     threading.Thread(target=_background_init, daemon=True, name="startup-backfill").start()
+
+    # Phase 5.0: measure how long the event loop is blocked (GET /debug/loop-lag).
+    try:
+        import loop_lag
+        loop_lag.start()
+    except Exception as e:
+        print(f"[STARTUP] loop-lag probe not started: {e}")
+
+
+@app.get("/debug/loop-lag")
+def debug_loop_lag(admin: dict = Depends(require_admin)):
+    """Event-loop lag over the last minute + the step runner state (Phase 5)."""
+    import loop_lag
+    import step_process
+    return {**loop_lag.stats(), "step_runner": step_process.runner_mode(),
+            "step_processes_running": step_process.running_processes(),
+            "max_step_processes": step_process.max_processes()}
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -1475,32 +1493,50 @@ def _record_step_result(
         print(f"[PERSIST] _record_step_result failed for step {step_id}: {e}")
 
 
-def _record_step_costs(user_id: str, project: str, step_id: str, tracker) -> None:
-    """Insert per-step cost rows into the `costs` SQL table.
+def _record_step_costs(user_id: str, project: str, step_id: str, calls: list) -> None:
+    """Insert this run's cost rows into the `costs` SQL table.
 
-    Reads the in-memory tracker's per-step summaries (so we get the cost
-    of the run we just executed, even on a fresh container where the
-    `total_costs.json` blob is the only long-term record). Idempotent
-    enough: re-runs insert fresh rows with a new recorded_at timestamp,
-    which is the desired behaviour (we want a per-run cost trace).
+    `calls` = the AI calls made during THIS run (tracker.calls_since(snap)).
+    One row per step bucket (a Step 2 run also produces Step 3 rows for its
+    metadata cascade). Before 2026-11-23 this inserted the tracker's running
+    total under the exact key "step{N}" — most modules log under other keys
+    ("step2_batch_p3-5", "step6_all_pages_scan", "cc_checker"), so most steps
+    were saved as $0 and re-runs counted earlier runs again.
     """
     try:
+        from modules.utils.cost_tracker import bucket_calls
+        buckets = bucket_calls(calls, str(step_id))
+        if not buckets:
+            return
         project_id = _resolve_project_id(user_id, project)
-        if not project_id or not tracker:
+        if not project_id:
             return
-        sb = get_supabase()
-        step_key = f"step{step_id.replace('.', '_')}" if "." in step_id else f"step{step_id}"
-        summary = tracker.get_step_summary(step_key) if hasattr(tracker, "get_step_summary") else None
-        if not summary:
-            return
-        sb.table("costs").insert({
-            "project_id": project_id,
-            "step_number": str(step_id),
-            "cost_usd": float(summary.get("total_cost", 0) or 0),
-            "tokens": int(sum((summary.get("total_tokens") or {}).values())),
-        }).execute()
+        rows = [{"project_id": project_id, "step_number": sid,
+                 "cost_usd": round(b["cost"], 6), "tokens": int(b["tokens"])}
+                for sid, b in buckets.items() if b["calls"]]
+        if rows:
+            get_supabase().table("costs").insert(rows).execute()
     except Exception as e:
         print(f"[PERSIST] _record_step_costs failed for step {step_id}: {e}")
+
+
+def _ensure_tracker_history(user_id: str, project: str, tracker) -> None:
+    """A fresh container has an empty tracker and no local total_costs.json:
+    pull the cost file from Storage first, so saving after this run keeps the
+    project's whole history instead of overwriting it with one run."""
+    try:
+        if tracker is None or getattr(tracker, "steps", None):
+            return
+        local = Path(f"/app/output/{user_id}/{project}/total_costs.json")
+        if not local.exists():
+            key = f"{user_id}/{project}/total_costs.json"
+            if not file_exists(key):
+                return
+            local.parent.mkdir(parents=True, exist_ok=True)
+            local.write_text(read_file(key), encoding="utf-8")
+        tracker.load(str(local))
+    except Exception as e:
+        print(f"[COSTS] history restore skipped for {project}: {e}")
 
 
 # --- PERSISTENCE_FIX_PLAN PR-2: SQL-first read helpers -----------------
@@ -2239,24 +2275,14 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
     def log_callback(line: dict):
         job_manager.append_log(_jp, step_id, line)
 
-    def _run_with_capture():
-        # ContextVars do not propagate into run_in_executor worker threads —
-        # set the call context HERE (inside the worker) so every AI call made
-        # by the step is tagged with project/run/step.
-        try:
-            _t_set_call_context(user_id, project, _tele_run_id, str(step_id))
-        except Exception:
-            pass
-        with LogCapture(log_callback):
-            _call_step(
-                step_id,
-                tracker,
-                context,
-                config,
-                cancel_check=cancel_check,
-            )
+    # Costs of THIS run only (snapshot taken right before the core starts).
+    _cost_snap = None
 
     try:
+        # Restart-proof cost history: an empty tracker on a fresh container
+        # reloads the project's cost file from Storage before adding to it.
+        await _loop0.run_in_executor(None, _ensure_tracker_history, user_id, project, tracker)
+
         _STEP_FOLDER_MAP = {
             "1": "step1_extraction", "1.5": "step1_extraction", "1.6": "step1_extraction",
             "2": "step2_qcm", "3": "step3_metadata", "4": "step4_format",
@@ -2348,85 +2374,79 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
         # overwrite a successful step status with a false "error" badge. ---
         step_succeeded = False
         step_outcome = "error"
+        auto_build_folders: list = []
 
-        try:
-            await loop.run_in_executor(None, run_env.bind(_run_with_capture))
+        # Phase 5: the CPU-heavy middle (_call_step + Step 2's metadata
+        # cascade) runs through step_process — in a worker thread
+        # (STEP_RUNNER=thread, the old behaviour) or in its own child process
+        # (STEP_RUNNER=process). Both report the same events, handled here.
+        def _ts():
+            return datetime.now().strftime("%H:%M:%S")
 
-            if job_manager.should_stop(_jp, step_id):
+        def _on_core_event(ev: dict):
+            nonlocal step_succeeded, step_outcome, auto_build_folders
+            kind = ev.get("type")
+            if kind == "costs":
+                # Child process: its AI calls join the API's tracker so the
+                # cost file and the SQL rows see them.
+                tracker.merge_calls(ev.get("calls") or [])
+            elif kind == "error":
+                job_manager.set_error(_jp, step_id)
+                step_outcome = "error"
+                log_callback({"ts": _ts(), "type": "error", "text": f"❌ Step {step_id} failed: {ev.get('error')}"})
+            elif kind == "stopped" or (kind == "step_ok" and cancel_check()):
                 step_outcome = job_manager.get_stop_mode(_jp, step_id)
                 job_manager.set_stopped(_jp, step_id, step_outcome)
-                log_callback({
-                    "ts": datetime.now().strftime("%H:%M:%S"),
-                    "type": "warn",
-                    "text": f"⏸ Step {step_id} {step_outcome}. Partial outputs were preserved; resume to continue.",
-                })
-                return
+                log_callback({"ts": _ts(), "type": "warn",
+                              "text": f"⏸ Step {step_id} {step_outcome}. Partial outputs were preserved; resume to continue."})
+            elif kind == "step_ok":
+                step_succeeded = True
+                step_outcome = "success"
+                # Step 2: set_done only AFTER the cascade — the WebSocket log
+                # stream closes on "done" and would cut the cascade's lines.
+                if step_id != "2":
+                    job_manager.set_done(_jp, step_id)
+                log_callback({"ts": _ts(), "type": "ok", "text": f"\u2705 Step {step_id} completed successfully."})
+            elif kind == "cascade":
+                # POST-STEP-2 AUTO-ENRICH (Step 3 metadata + Step 4/5 build).
+                # Its failure never flips Step 2's success.
+                res = ev.get("result") or {}
+                rstatus = res.get("status")
+                if rstatus == "ok":
+                    total = res.get("build", {}).get("step5", {}).get("total_qcms", 0)
+                    log_callback({"ts": _ts(), "type": "ok", "text": f"⚡ Auto-enrich (Step 3 + build) completed: {total} QCMs merged."})
+                    job_manager.set_done(_jp, "3")
+                    job_manager.set_done(_jp, "4")
+                    job_manager.set_done(_jp, "5")
+                    auto_build_folders = ["step3_metadata", "step4_format", "step5_json"]
+                    for _sid in ("3", "4", "5"):
+                        try:
+                            _b, _s = _compute_step_badge(project, user_id, _sid)
+                            _record_step_history(project, user_id, _sid, _step_start_time.get(f"{_jp}-{_sid}", time.time()), _b, _s)
+                        except Exception as _be:
+                            print(f"[POST-STEP-2] badge record failed for {_sid}: {_be}")
+                elif rstatus == "no_qcms":
+                    log_callback({"ts": _ts(), "type": "warn", "text": "ℹ️ Auto-enrich skipped: no accepted QCMs after Step 2."})
+                else:
+                    log_callback({"ts": _ts(), "type": "warn", "text": f"⚠️ Auto-enrich (Step 3 + build) reported: {res}. You can re-run Step 2 to retry."})
+            elif kind == "cascade_error":
+                log_callback({"ts": _ts(), "type": "warn", "text": f"⚠️ Auto-enrich (Step 3 + build) failed: {ev.get('error')}. You can re-run Step 2 to retry."})
 
-            step_succeeded = True
-            step_outcome = "success"
-            # Defer set_done for Step 2 until AFTER the cascade (Step 3 + build)
-            # completes. The WebSocket log stream (ws_log) closes as soon as it
-            # sees status=="done" — if we set_done here, the WS would close
-            # before the cascade's log lines ("⚡ Auto-enrich...") reach the
-            # frontend. For Step 2, set_done is called at the end of the
-            # cascade block below (in its finally). For all other steps,
-            # set_done is called here as before.
-            if step_id != "2":
+        try:
+            import step_process
+            _cost_snap = tracker.snapshot()
+            await step_process.run_core(
+                {"step_id": str(step_id), "user_id": user_id, "project": project,
+                 "config": config, "run_id": _tele_run_id,
+                 "overlay": dict(run_env.current_overlay() or {})},
+                tracker=tracker, context=context, should_stop=cancel_check,
+                on_log=log_callback, on_event=_on_core_event,
+            )
+            if step_id == "2" and step_succeeded:
+                # Now the WS stream may close: every cascade line was pushed.
                 job_manager.set_done(_jp, step_id)
-            log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "ok", "text": f"\u2705 Step {step_id} completed successfully."})
-
-            # POST-STEP-2 AUTO-ENRICH: after Step 2 succeeds, invisibly run
-            # the old Step 3 (metadata) + the Step 4/5 auto-build
-            # (run_post_step3_build) as a single backend cascade. Step 3 is
-            # no longer an independently-triggered step (see Q5→5b in
-            # MERGE_STEP2_STEP3_REPORT.md); its trigger moved inside Step 2's
-            # task. Failure here MUST NOT flip Step 2's success status — the
-            # user can still re-run Step 2 to retry the whole cascade.
-            auto_build_folders: list = []
-            if step_id == "2":
-                # Route cascade prints (hint / cas-split / Step 3 / checker /
-                # build, incl. [CASCADE-TRACE] + [CC-CHECK] progress lines) to
-                # execution_log via the same capture used for step output.
-                # Without this, only the explicit log_callback lines below
-                # reach the WS stream and the cascade looks silent in the UI.
-                with LogCapture(log_callback):
-                    try:
-                        from modules.post_step2_metadata import run_post_step2_metadata
-                        step3_cfg = config.get("step3", config.get("step3_config", {}))
-                        res = await loop.run_in_executor(
-                            None,
-                            run_env.bind(lambda: _cascade_with_telemetry(
-                                tracker, context, user_id, project,
-                                step3_cfg, cancel_check, step_id, _tele_run_id,
-                            ))
-                        )
-                        rstatus = res.get("status")
-                        if rstatus == "ok":
-                            total = res.get("build", {}).get("step5", {}).get("total_qcms", 0)
-                            log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "ok", "text": f"⚡ Auto-enrich (Step 3 + build) completed: {total} QCMs merged."})
-                            job_manager.set_done(_jp, "3")
-                            job_manager.set_done(_jp, "4")
-                            job_manager.set_done(_jp, "5")
-                            auto_build_folders = ["step3_metadata", "step4_format", "step5_json"]
-                            # Record success badges for the hidden steps so history matches reality
-                            for _sid in ("3", "4", "5"):
-                                try:
-                                    _b, _s = _compute_step_badge(project, user_id, _sid)
-                                    _record_step_history(project, user_id, _sid, _step_start_time.get(f"{_jp}-{_sid}", time.time()), _b, _s)
-                                except Exception as _be:
-                                    print(f"[POST-STEP-2] badge record failed for {_sid}: {_be}")
-                        elif rstatus == "no_qcms":
-                            log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "warn", "text": "ℹ️ Auto-enrich skipped: no accepted QCMs after Step 2."})
-                        else:
-                            log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "warn", "text": f"⚠️ Auto-enrich (Step 3 + build) reported: {res}. You can re-run Step 2 to retry."})
-                    except Exception as abe:
-                        import traceback
-                        traceback.print_exc()
-                        log_callback({"ts": datetime.now().strftime("%H:%M:%S"), "type": "warn", "text": f"⚠️ Auto-enrich (Step 3 + build) failed: {str(abe)}. You can re-run Step 2 to retry."})
-                    finally:
-                        # Now mark Step 2 as done — the WS log stream will see
-                        # "done" and close AFTER pushing all cascade log lines.
-                        job_manager.set_done(_jp, step_id)
+            if step_outcome in ("stopped", "cancelled"):
+                return
 
         except asyncio.CancelledError:
             # Cancel-mode hard-cancel interrupts the pending awaits here.
@@ -2540,7 +2560,8 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
                 except Exception as _sr:
                     print(f"[POST-STEP] step_results record failed for step {step_id}: {_sr}")
                 try:
-                    _record_step_costs(user_id, project, step_id, tracker)
+                    _record_step_costs(user_id, project, step_id,
+                                       tracker.calls_since(_cost_snap) if _cost_snap is not None else [])
                 except Exception as _sc:
                     print(f"[POST-STEP] costs record failed for step {step_id}: {_sc}")
             except Exception as be:
@@ -3034,35 +3055,89 @@ def _cost_summary_from_rows(sql_rows: list) -> dict:
     }
 
 
+def _summary_from_cost_file(data: dict) -> dict:
+    """total_costs.json -> the summary shape, with per_step grouped by
+    pipeline step ("1", "2", "3"...) instead of raw call keys."""
+    from modules.utils.cost_tracker import cost_step_bucket
+    data = data or {}
+    per_step: dict = {}
+
+    def add(key, cost, prompt, completion, calls):
+        sid = cost_step_bucket(key) or str(key)
+        slot = per_step.setdefault(sid, {"total_cost": 0.0, "call_count": 0,
+                                         "total_tokens": {"prompt": 0, "completion": 0}})
+        slot["total_cost"] += float(cost or 0)
+        slot["call_count"] += int(calls or 0)
+        slot["total_tokens"]["prompt"] += int(prompt or 0)
+        slot["total_tokens"]["completion"] += int(completion or 0)
+
+    if isinstance(data.get("steps"), dict):
+        for key, calls in data["steps"].items():
+            for c in calls or []:
+                t = c.get("tokens") or {}
+                add(key, c.get("cost"), t.get("prompt", t.get("prompt_tokens", 0)),
+                    t.get("completion", t.get("completion_tokens", 0)), 1)
+        per_model = data.get("models") or {}
+    else:
+        s = data.get("summary", data)
+        for key, v in (s.get("per_step") or {}).items():
+            tk = v.get("total_tokens") or {}
+            add(key, v.get("total_cost"), tk.get("prompt"), tk.get("completion"), v.get("call_count"))
+        per_model = s.get("per_model") or {}
+    total_cost = sum(v["total_cost"] for v in per_step.values())
+    total_tokens = sum(v["total_tokens"]["prompt"] + v["total_tokens"]["completion"] for v in per_step.values())
+    if not per_step:   # very old files: only totals
+        s = data.get("summary", data)
+        total_cost = float(s.get("total_cost") or 0)
+        total_tokens = int(s.get("total_tokens") or 0)
+    return {"per_model": per_model, "per_step": per_step,
+            "total_cost": total_cost, "total_tokens": total_tokens}
+
+
+def _project_cost_summary(uid: str, name: str, allow_tracker: bool = True) -> dict:
+    """The ONE cost summary used by every page (project panel, dashboard,
+    batch view): SQL `costs` rows when they hold a real amount, else the
+    project's cost file (Storage, then local), else the live tracker.
+    SQL rows written before the 2026-11-23 fix are often $0 — in that case
+    the cost file (which logs every call) is the better source."""
+    sql_summary = None
+    try:
+        rows = _all_cost_rows(uid, name)
+        if rows:
+            sql_summary = _cost_summary_from_rows(rows)
+            if sql_summary["total_cost"] > 0:
+                return sql_summary
+    except Exception as e:
+        print(f"[COSTS] SQL rows failed ({name}): {e}")
+    data = None
+    try:
+        key = f"{uid}/{name}/total_costs.json"
+        if file_exists(key):
+            data = json.loads(read_file(key))
+    except Exception:
+        data = None
+    if data is None:
+        local = Path(f"/app/output/{uid}/{name}/total_costs.json")
+        if local.exists():
+            try:
+                data = json.loads(local.read_text(encoding="utf-8"))
+            except Exception:
+                data = None
+    if data:
+        file_summary = _summary_from_cost_file(data)
+        if file_summary["total_cost"] > 0 or not sql_summary:
+            return file_summary
+    if sql_summary:
+        return sql_summary
+    if allow_tracker:
+        return _summary_from_cost_file({"steps": get_or_create(name, uid)["tracker"].steps,
+                                        "models": get_or_create(name, uid)["tracker"].models})
+    return {"per_model": {}, "per_step": {}, "total_cost": 0.0, "total_tokens": 0}
+
+
 @app.get("/projects/{name}/costs")
 def get_project_costs(name: str, user: dict = Depends(get_current_user)):
-    # PERSISTENCE_FIX_PLAN PR-2: SQL costs table first (one round-trip,
-    # restart-proof). Reconstructs the summary shape the frontend expects
-    # from total_costs.json. per_model is left empty because the SQL costs
-    # table doesn't track per-model granularity (the blob does).
-    sql_rows = _all_cost_rows(user["id"], name)
-    if sql_rows:
-        return _cost_summary_from_rows(sql_rows)
-
-    # Fallback: Storage blob → local FS → in-memory tracker (existing path).
-    storage_path = f"{user['id']}/{name}/total_costs.json"
-    try:
-        if file_exists(storage_path):
-            data = json.loads(read_file(storage_path))
-            return data.get("summary", data)
-    except Exception:
-        pass
-    # Fallback to local filesystem
-    cost_file = Path(f"/app/output/{user['id']}/{name}/total_costs.json")
-    if cost_file.exists():
-        try:
-            data = json.loads(cost_file.read_text())
-            return data.get("summary", data)
-        except Exception:
-            pass
-    # Last resort: live in-memory tracker
-    ctx_data = get_or_create(name, user["id"])
-    return ctx_data["tracker"].get_total_summary()
+    return _project_cost_summary(user["id"], name)
 
 @app.post("/projects/{name}/costs/save")
 def save_project_costs(name: str, user: dict = Depends(get_current_user)):
@@ -3081,7 +3156,122 @@ def save_project_costs(name: str, user: dict = Depends(get_current_user)):
 
 @app.get("/costs/weekly")
 def get_all_weekly_costs(user: dict = Depends(get_current_user)):
+    """Cost per week ("%Y-W%U") from the SQL `costs` rows (recorded_at), so
+    the chart survives container restarts. Local cost files are the fallback."""
+    try:
+        sb = get_supabase()
+        res = sb.table("projects").select("id,name").eq("user_id", get_db_user_id(user)).limit(500).execute()
+        names = {r["id"]: r.get("name", "") for r in (getattr(res, "data", None) or []) if r.get("id")}
+        weeks: dict = {}
+        ids = list(names)
+        for i in range(0, len(ids), 200):
+            cr = sb.table("costs").select("project_id,cost_usd,recorded_at") \
+                .in_("project_id", ids[i:i + 200]).execute()
+            for c in (getattr(cr, "data", None) or []):
+                try:
+                    when = datetime.fromisoformat(str(c.get("recorded_at")).replace("Z", "+00:00"))
+                except Exception:
+                    continue
+                wk = when.strftime("%Y-W%U")
+                slot = weeks.setdefault(wk, {"cost": 0.0, "projects": []})
+                slot["cost"] = round(slot["cost"] + float(c.get("cost_usd") or 0), 6)
+                nm = names.get(c.get("project_id"), "")
+                if nm and nm not in slot["projects"]:
+                    slot["projects"].append(nm)
+        if weeks:
+            return dict(sorted(weeks.items()))
+    except Exception as e:
+        print(f"[COSTS-WEEKLY] SQL path failed: {e} — local files")
     return get_weekly_costs(user["id"])
+
+
+@app.post("/costs/rebuild")
+def rebuild_cost_rows(body: dict = None, user: dict = Depends(get_current_user)):
+    """Repair the SQL `costs` rows of the caller's projects (rows written
+    before the 2026-11-23 fix: mostly $0, re-runs double counted).
+
+    Sources per project: the per-call telemetry table `step_call_logs`
+    (cost of every AI call) and the project's cost file (every call the
+    tracker logged). The one with the larger total wins; rows are rebuilt
+    per step and per day. `{"apply": false}` (default) only reports.
+    """
+    from modules.utils.cost_tracker import cost_step_bucket
+    apply = bool((body or {}).get("apply"))
+    sb = get_supabase()
+    uid = user["id"]
+    res = sb.table("projects").select("id,name").eq("user_id", get_db_user_id(user)).limit(500).execute()
+    report = []
+    cascade_subs = {"hint", "cas_split", "step3", "cc_checker", "build", "metadata"}
+
+    def add(rows, sid, day_ts, cost, tokens):
+        key = (sid, str(day_ts)[:10])
+        slot = rows.setdefault(key, {"cost": 0.0, "tokens": 0, "last": str(day_ts)})
+        slot["cost"] += float(cost or 0)
+        slot["tokens"] += int(tokens or 0)
+        slot["last"] = max(slot["last"], str(day_ts))
+
+    for prow in (getattr(res, "data", None) or []):
+        pid, name = prow.get("id"), prow.get("name", "")
+        if not pid:
+            continue
+        before = sum(float(r.get("cost_usd") or 0) for r in _all_cost_rows(uid, name))
+        from_calls: dict = {}
+        try:
+            start = 0
+            while True:
+                cr = sb.table("step_call_logs").select(
+                    "step_number,sub_step,cost_usd,prompt_tokens,completion_tokens,created_at") \
+                    .eq("project_id", pid).eq("kind", "ai_call").range(start, start + 999).execute()
+                batch = getattr(cr, "data", None) or []
+                for c in batch:
+                    if c.get("cost_usd") is None:
+                        continue
+                    sid = str(c.get("step_number") or "")
+                    if sid == "2" and str(c.get("sub_step") or "") in cascade_subs:
+                        sid = "3"
+                    add(from_calls, sid, c.get("created_at") or "", c.get("cost_usd"),
+                        (c.get("prompt_tokens") or 0) + (c.get("completion_tokens") or 0))
+                if len(batch) < 1000:
+                    break
+                start += 1000
+        except Exception as e:
+            print(f"[COSTS-REBUILD] step_call_logs unavailable for {name}: {e}")
+        from_file: dict = {}
+        try:
+            key = f"{uid}/{name}/total_costs.json"
+            data = json.loads(read_file(key)) if file_exists(key) else {}
+            for k, calls in (data.get("steps") or {}).items():
+                for c in calls or []:
+                    t = c.get("tokens") or {}
+                    add(from_file, cost_step_bucket(k) or "unknown", c.get("timestamp") or "",
+                        c.get("cost"), (t.get("prompt") or 0) + (t.get("completion") or 0))
+        except Exception as e:
+            print(f"[COSTS-REBUILD] cost file unreadable for {name}: {e}")
+        t_calls = sum(v["cost"] for v in from_calls.values())
+        t_file = sum(v["cost"] for v in from_file.values())
+        chosen, src = (from_calls, "call_logs") if t_calls >= t_file else (from_file, "cost_file")
+        t_new = max(t_calls, t_file)
+        entry = {"project": name, "before": round(before, 6), "from_call_logs": round(t_calls, 6),
+                 "from_cost_file": round(t_file, 6), "after": round(t_new, 6), "source": src}
+        if t_new <= 0 or abs(t_new - before) < 1e-6:
+            entry["action"] = "unchanged"
+        elif apply:
+            try:
+                sb.table("costs").delete().eq("project_id", pid).execute()
+                rows = [{"project_id": pid, "step_number": sid, "cost_usd": round(v["cost"], 6),
+                         "tokens": v["tokens"], **({"recorded_at": v["last"]} if v["last"] else {})}
+                        for (sid, _day), v in chosen.items() if v["cost"] > 0 or v["tokens"] > 0]
+                if rows:
+                    sb.table("costs").insert(rows).execute()
+                entry["action"] = "rebuilt"
+            except Exception as e:
+                entry["action"] = f"failed: {e}"
+        else:
+            entry["action"] = "would rebuild"
+        report.append(entry)
+    return {"applied": apply, "projects": report,
+            "total_before": round(sum(r["before"] for r in report), 6),
+            "total_after": round(sum(r["after"] if r["action"] != "unchanged" else r["before"] for r in report), 6)}
 
 
 @app.get("/costs/all")
@@ -3264,6 +3454,10 @@ def get_step_models(user: dict = Depends(get_current_user)):
         "features": {
             "autorun_batch": autorun_batch_enabled(),
             "step_cache_ttl": step_cache.ttl_seconds(),
+            # Auto Run limits the wizard shows (MAX_AUTORUN_BATCH_FILES /
+            # AUTORUN_BATCH_CONCURRENCY).
+            "autorun_max_files": autorun_max_batch_files(),
+            "autorun_concurrency": autorun_batch_concurrency(),
         },
     }
 
@@ -3780,6 +3974,66 @@ def get_project_results(name: str, request: Request, user: dict = Depends(get_cu
     if request.headers.get("if-none-match") == etag:
         return _Response(status_code=304, headers={"ETag": etag})
     return _JSONResponse(body, headers={"ETag": etag, "Cache-Control": "private, no-cache"})
+
+
+@app.post("/results/download")
+def download_results_zip(body: dict, user: dict = Depends(get_current_user)):
+    """Several projects' result files in ONE zip (Results page + batch view).
+
+    body: {"projects": [names], "steps": ["6"], "files": "xlsx" | "results" | "all",
+           "name": "zip file name"}
+      xlsx    = the result workbooks of each step (newest workbook + MBset files)
+      results = every result file (workbooks, MBset files, result JSON)
+      all     = every output file, working files included
+    Layout inside the zip: <project>/step<N>/<file>.
+    """
+    import tempfile
+    import zipfile
+    from starlette.background import BackgroundTask
+
+    projects = [str(p) for p in (body or {}).get("projects") or [] if str(p).strip()][:50]
+    steps = [str(s) for s in (body or {}).get("steps") or ["6"] if str(s) in _STEP_FOLDERS]
+    mode = str((body or {}).get("files") or "xlsx")
+    if mode not in ("xlsx", "results", "all"):
+        raise HTTPException(status_code=400, detail="files must be xlsx, results or all")
+    if not projects or not steps:
+        raise HTTPException(status_code=400, detail="Choose at least one project and one step.")
+    uid = user["id"]
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    tmp.close()
+    count, missing = 0, []
+    try:
+        with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as zf:
+            for proj in projects:
+                for sid in steps:
+                    files = _step_files(proj, sid, user)
+                    if mode == "all":
+                        names = [f["name"] for f in files if _results.classify(f.get("name", "")) != "internal"]
+                    else:
+                        res = _results.split_step_files(files)["results"]
+                        names = [r["name"] for r in res
+                                 if mode == "results" or r["name"].lower().endswith(".xlsx")]
+                    for n in names:
+                        try:
+                            data = _output_bytes(uid, proj, sid, n)
+                        except HTTPException:
+                            missing.append(f"{proj}/step{sid}/{n}")
+                            continue
+                        zf.writestr(f"{proj}/step{sid}/{n}", data)
+                        count += 1
+            if missing:
+                zf.writestr("_missing.txt", "Listed but not found:\n" + "\n".join(missing))
+    except Exception:
+        os.unlink(tmp.name)
+        raise
+    if count == 0:
+        os.unlink(tmp.name)
+        raise HTTPException(status_code=404, detail="No file matches this selection yet.")
+    label = re.sub(r"[^A-Za-z0-9._-]+", "_", str((body or {}).get("name") or "results")).strip("._") or "results"
+    return FileResponse(tmp.name, media_type="application/zip", filename=f"{label}.zip",
+                        headers={"Content-Disposition": f'attachment; filename="{label}.zip"',
+                                 "X-File-Count": str(count)},
+                        background=BackgroundTask(os.unlink, tmp.name))
 
 
 @app.get("/projects/{name}/results/qcms")
@@ -4822,27 +5076,11 @@ def autorun_batch_costs(batch_id: str, user: dict = Depends(get_current_user)):
         nm = p.get("name", "")
         if not nm:
             continue
-        summary = None
         try:
-            sql_rows = _all_cost_rows(uid, nm)
-            if sql_rows:
-                summary = _cost_summary_from_rows(sql_rows)
+            summary = _project_cost_summary(uid, nm, allow_tracker=False)
         except Exception as e:
-            print(f"[AUTORUN-BATCH] cost rows failed ({nm}): {e}")
-        if summary is None:
-            try:
-                if file_exists(f"{uid}/{nm}/total_costs.json"):
-                    data = json.loads(read_file(f"{uid}/{nm}/total_costs.json"))
-                    summary = data.get("summary", data)
-            except Exception:
-                summary = None
-        if not summary:
-            cost_file = Path(f"/app/output/{uid}/{nm}/total_costs.json")
-            if cost_file.exists():
-                try:
-                    summary = (json.loads(cost_file.read_text()) or {}).get("summary", {})
-                except Exception:
-                    summary = None
+            print(f"[AUTORUN-BATCH] cost summary failed ({nm}): {e}")
+            summary = None
         cost = float((summary or {}).get("total_cost") or 0)
         tokens = int((summary or {}).get("total_tokens") or 0)
         projects[nm] = {"cost": cost, "tokens": tokens}

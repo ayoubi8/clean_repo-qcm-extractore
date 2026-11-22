@@ -2,6 +2,7 @@
 import { useNavigate, useParams } from 'react-router-dom'
 import { useBatchStore, batchActive } from '../store/batchStore'
 import { resumeBatch, fetchBatchCosts, BatchCosts } from '../lib/api'
+import { DownloadResultsButton } from '../components/results/DownloadResultsDialog'
 import { BatchFolderCard } from '../components/batch/BatchFolderCard'
 import { BatchDetailPanel } from '../components/batch/BatchDetailPanel'
 
@@ -120,6 +121,13 @@ export function BatchView() {
           >
             <span className="material-symbols-outlined text-[20px]">{expandedAll ? 'collapse_all' : 'expand_all'}</span>
           </button>
+        )}
+        {manifest && manifest.projects.length > 0 && (
+          <DownloadResultsButton
+            projects={manifest.projects.map((p) => ({ name: p.name, note: p.state }))}
+            zipName={`batch_${batchId}`}
+            label="Download results"
+          />
         )}
         {costs && costs.total.cost > 0 && (
           <span

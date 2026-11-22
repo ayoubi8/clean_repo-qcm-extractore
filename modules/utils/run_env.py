@@ -51,6 +51,12 @@ def setenv(key: str, value: str) -> None:
         ov[key] = value
 
 
+def current_overlay() -> Optional[dict]:
+    """The active run's overlay (None outside a run) — handed to a child
+    process so it runs with the same key / model settings."""
+    return _overlay.get()
+
+
 def in_run_scope() -> bool:
     return _overlay.get() is not None
 

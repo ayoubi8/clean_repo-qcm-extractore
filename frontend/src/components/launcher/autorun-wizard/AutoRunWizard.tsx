@@ -1,18 +1,32 @@
 ﻿import { useState, useEffect, useRef, ChangeEvent } from 'react'
-import { scanDriveFolder, runBatch, createProject, uploadProjectPdf, fetchProjects } from '../../../lib/api'
+import { scanDriveFolder, runBatch, createProject, uploadProjectPdf, fetchProjects, fetchStepModels } from '../../../lib/api'
+import { peek } from '../../../lib/cache'
 import { BatchHistoryList } from '../../batch/BatchHistoryList'
 import { defaultWizardConfig, buildBatchConfig, WizardConfig, BatchConfigForm } from './BatchConfigForm'
 import { WizardFileEntry, Project, TagEntry } from '../../../types'
 import { hasRegionSelection } from '../../tags/TagSelector'
 
 /**
- * Auto Run wizard (plan docs/plans/autorun-batch-plan.md Â§3.2):
- *   source â†’ files â†’ config â†’ starting
- * Runs steps 1 â†’ 2 â†’ 6 on every PDF (parallel 5-at-a-time, sequential per PDF;
- * engine: phases/Â§4.2). Steps 7â€“8 are excluded by design (resolved Q6/Q7).
+ * Auto Run wizard (plan docs/plans/autorun-batch-plan.md §3.2):
+ *   source → files → config → starting
+ * Runs steps 1 → 2 → 6 on every PDF (parallel 5-at-a-time, sequential per PDF;
+ * engine: phases/§4.2). Steps 7–8 are excluded by design (resolved Q6/Q7).
  */
 
-const MAX_FILES = 10 // matches MAX_AUTORUN_BATCH_FILES (resolved Q11)
+/** Batch limits from the server (MAX_AUTORUN_BATCH_FILES / AUTORUN_BATCH_CONCURRENCY),
+ *  read from the cached /env/step-models feature flags; 20 / 5 until known. */
+function useAutorunLimits(): { maxFiles: number; concurrency: number } {
+  const read = () => {
+    const f = peek<any>('env:step-models')?.features ?? {}
+    return {
+      maxFiles: Number(f.autorun_max_files) > 0 ? Number(f.autorun_max_files) : 20,
+      concurrency: Number(f.autorun_concurrency) > 0 ? Number(f.autorun_concurrency) : 5,
+    }
+  }
+  const [limits, setLimits] = useState(read)
+  useEffect(() => { fetchStepModels().then(() => setLimits(read())).catch(() => {}) }, [])
+  return limits
+}
 
 type Stage = 'source' | 'files' | 'config' | 'starting'
 
@@ -52,6 +66,7 @@ function makeArNamer(taken: Set<string>) {
 }
 
 export function AutoRunWizard({ onStarted }: { onStarted: (batchId: string) => void }) {
+  const { maxFiles: MAX_FILES, concurrency: PARALLEL } = useAutorunLimits()
   const [stage, setStage] = useState<Stage>('source')
   const [mode, setMode] = useState<'drive' | 'folder'>('drive')
   const [folderLink, setFolderLink] = useState('')
@@ -174,7 +189,7 @@ export function AutoRunWizard({ onStarted }: { onStarted: (batchId: string) => v
           }
         })
         if (names.length === 0) {
-          setError('No files uploaded â€” nothing to run.')
+          setError('No files uploaded — nothing to run.')
           setStarting(false)
           return
         }
@@ -229,7 +244,7 @@ export function AutoRunWizard({ onStarted }: { onStarted: (batchId: string) => v
     <div className="space-y-5">
       {stepper}
 
-      {/* â”€â”€ Stage 1 Â· Source â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+      {/* ── Stage 1 · Source ─────────────────────────────────────────── */}
       {stage === 'source' && (
         <div className="space-y-5 animate-in fade-in duration-300">
           <BatchHistoryList onOpenBatch={onStarted} />
@@ -262,16 +277,16 @@ export function AutoRunWizard({ onStarted }: { onStarted: (batchId: string) => v
                 type="url"
                 value={folderLink}
                 onChange={(e) => setFolderLink(e.target.value)}
-                placeholder="https://drive.google.com/drive/folders/â€¦"
+                placeholder="https://drive.google.com/drive/folders/…"
                 className="w-full bg-surface-container-lowest border border-outline-variant/20 rounded-xl px-4 py-3 text-sm focus:border-primary outline-none transition-all"
               />
               <p className="text-[10px] text-outline leading-tight">
-                The folder must be shared as <span className="font-bold text-outline/80">"Anyone with the link â†’ Viewer"</span> â€” top-level PDFs only.
+                The folder must be shared as <span className="font-bold text-outline/80">"Anyone with the link → Viewer"</span> — top-level PDFs only.
               </p>
             </div>
           ) : (
             <p className="text-[10px] text-outline">
-              All PDFs at the top level of the selected folder are uploaded (up to {MAX_FILES}).
+              All PDFs at the top level of the selected folder are uploaded (up to {MAX_FILES}). {PARALLEL} run at the same time; the next one starts as soon as one finishes.
             </p>
           )}
 
@@ -284,7 +299,7 @@ export function AutoRunWizard({ onStarted }: { onStarted: (batchId: string) => v
             {scanning ? (
               <>
                 <span className="material-symbols-outlined animate-spin text-sm">progress_activity</span>
-                Scanning folderâ€¦
+                Scanning folder…
               </>
             ) : (
               <>
@@ -305,7 +320,7 @@ export function AutoRunWizard({ onStarted }: { onStarted: (batchId: string) => v
         </div>
       )}
 
-      {/* â”€â”€ Stage 2 Â· Found files â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+      {/* ── Stage 2 · Found files ────────────────────────────────────── */}
       {stage === 'files' && (
         <div className="space-y-4 animate-in fade-in duration-300">
           {folderName && (
@@ -317,7 +332,7 @@ export function AutoRunWizard({ onStarted }: { onStarted: (batchId: string) => v
           {folderTotal > entries.length && (
             <div className="p-3 rounded-lg bg-secondary-container/10 border border-secondary/30 text-secondary text-[11px] font-bold flex items-start gap-2">
               <span className="material-symbols-outlined text-base mt-0.5">info</span>
-              Folder has {folderTotal} PDFs â€” a batch runs at most {MAX_FILES}. Showing the first {entries.length}.
+              Folder has {folderTotal} PDFs — a batch runs at most {MAX_FILES}. Showing the first {entries.length}.
             </div>
           )}
 
@@ -385,7 +400,7 @@ export function AutoRunWizard({ onStarted }: { onStarted: (batchId: string) => v
         </div>
       )}
 
-      {/* â”€â”€ Stage 3 Â· Config â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+      {/* ── Stage 3 · Config ─────────────────────────────────────────── */}
       {stage === 'config' && (
         <div className="space-y-5 animate-in fade-in duration-300">
           <BatchConfigForm config={config} onChange={updateConfig} tags={tags} onTagsChange={setTags} />
@@ -407,7 +422,7 @@ export function AutoRunWizard({ onStarted }: { onStarted: (batchId: string) => v
               {starting ? (
                 <>
                   <span className="material-symbols-outlined animate-spin">progress_activity</span>
-                  {mode === 'folder' && uploadTotal > 0 ? `Uploading ${uploadDone}/${uploadTotal}` : 'Startingâ€¦'}
+                  {mode === 'folder' && uploadTotal > 0 ? `Uploading ${uploadDone}/${uploadTotal}` : 'Starting…'}
                 </>
               ) : (
                 <>
@@ -420,11 +435,11 @@ export function AutoRunWizard({ onStarted }: { onStarted: (batchId: string) => v
         </div>
       )}
 
-      {/* â”€â”€ Starting progress â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
+      {/* ── Starting progress ────────────────────────────────────────── */}
       {stage === 'config' && starting && mode === 'folder' && uploadTotal > 0 && (
         <div className="space-y-2 animate-in fade-in duration-200">
           <div className="flex items-center justify-between text-xs text-outline">
-            <span>Uploading PDFs (3 at a time)â€¦</span>
+            <span>Uploading PDFs (3 at a time)…</span>
             <span className="font-bold text-primary">{uploadDone}/{uploadTotal}</span>
           </div>
           <div className="w-full h-2 bg-surface-container-low rounded-full overflow-hidden">
@@ -438,7 +453,7 @@ export function AutoRunWizard({ onStarted }: { onStarted: (batchId: string) => v
       {stage === 'config' && starting && mode === 'drive' && (
         <div className="space-y-2 animate-in fade-in duration-200">
           <div className="flex items-center justify-between text-xs text-outline">
-            <span>Registering the batchâ€¦</span>
+            <span>Registering the batch…</span>
             <span className="inline-flex items-center gap-1 text-primary font-bold">
               <span className="material-symbols-outlined animate-spin text-[14px]">progress_activity</span>
               working
@@ -454,7 +469,7 @@ export function AutoRunWizard({ onStarted }: { onStarted: (batchId: string) => v
       {Object.keys(rowErrors).length > 0 && (
         <div className="p-3 rounded-lg bg-error-container/10 border border-error/20 space-y-1">
           {Object.entries(rowErrors).map(([k, msg]) => (
-            <p key={k} className="text-[10px] text-error font-medium truncate">âš  {msg}</p>
+            <p key={k} className="text-[10px] text-error font-medium truncate">⚠ {msg}</p>
           ))}
         </div>
       )}

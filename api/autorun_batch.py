@@ -64,8 +64,10 @@ def batch_concurrency() -> int:
 
 
 def max_batch_files() -> int:
-    """Batch cap (resolved Q11: 10 PDFs maximum per batch)."""
-    return max(1, _env_int("MAX_AUTORUN_BATCH_FILES", 10))
+    """Batch cap: 20 PDFs per batch (was 10, resolved Q11). They still run
+    AUTORUN_BATCH_CONCURRENCY (5) at a time; the next one starts as soon as
+    one finishes (the batch semaphore)."""
+    return max(1, _env_int("MAX_AUTORUN_BATCH_FILES", 20))
 
 
 # ---------------------------------------------------------------------------
