@@ -90,7 +90,7 @@ def core_sequence(spec: Dict, tracker, context, cancel_check: Callable[[], bool]
             _call_step(step_id, tracker, context, config, cancel_check=cancel_check)
     except Exception as e:
         traceback.print_exc()
-        emit({"type": "error", "error": str(e)})
+        emit({"type": "error", "error": f"{type(e).__name__}: {e}", "trace": _trace_tail()})
         return
 
     if cancel_check():
@@ -108,6 +108,13 @@ def core_sequence(spec: Dict, tracker, context, cancel_check: Callable[[], bool]
             except Exception as e:
                 traceback.print_exc()
                 emit({"type": "cascade_error", "error": str(e)})
+
+
+def _trace_tail(frames: int = 3) -> str:
+    """Last frames of the current exception, compact (for the UI log)."""
+    tb = traceback.format_exc().strip().splitlines()
+    keep = [l.strip() for l in tb if l.strip().startswith("File ")][-frames:]
+    return " ← ".join(reversed(keep))[:600]
 
 
 def _resolve(path: Optional[str]) -> Callable:
@@ -128,6 +135,10 @@ def _child_entry(spec: Dict, conn, stop_evt) -> None:
             pass
 
     try:
+        try:
+            mp.current_process()._config["daemon"] = False
+        except Exception:
+            pass
         overlay = spec.get("overlay") or {}
         # This process serves ONE run: its config can live in os.environ too
         # (modules that read os.environ directly see the user's key/models).

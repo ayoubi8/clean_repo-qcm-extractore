@@ -232,3 +232,27 @@ def test_results_zip(monkeypatch, tmp_path):
     with pytest.raises(HTTPException) as e:
         api.download_results_zip({"projects": ["../u2"], "steps": ["6"], "files": "xlsx"}, user)
     assert e.value.status_code in (400, 404)
+
+
+def test_child_may_use_a_pool():
+    # Step 8 (step8_matcher) uses multiprocessing.Pool inside the step.
+    logs, events, _ = _run("pool_core", "process")
+    assert logs[-1]["text"] == "pool total 14"
+    assert "step_ok" in [e["type"] for e in events]
+
+
+def test_error_names_the_exception():
+    _, events, _ = _run("raise_core", "thread")
+    err = next(e for e in events if e["type"] == "error")
+    assert err["error"].startswith("RuntimeError") or "boom" in err["error"]
+
+
+def test_batch_failure_reason():
+    from autorun_batch import failure_reason
+    lines = [{"type": "info", "text": "working"},
+             {"type": "warn", "text": "careful"},
+             {"type": "error", "text": "❌ Step 6 failed: OpenRouterFatalError: 402 credits"},
+             {"type": "info", "text": "upload done"}]
+    assert failure_reason(lines) == "❌ Step 6 failed: OpenRouterFatalError: 402 credits"
+    assert failure_reason([{"type": "warn", "text": "only a warning"}]) == "only a warning"
+    assert failure_reason([]) is None

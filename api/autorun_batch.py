@@ -257,6 +257,16 @@ def _record_step(uid: str, batch_id: str, project_name: str, sid: str, state: st
     _mutate_manifest(uid, batch_id, _apply)
 
 
+def failure_reason(log_lines: list) -> Optional[str]:
+    """The most useful line of a failed step's log for the batch card: the
+    last error line (its text up to 300 chars), else the last warning."""
+    for wanted in ("error", "warn"):
+        for line in reversed(log_lines or []):
+            if isinstance(line, dict) and line.get("type") == wanted and str(line.get("text", "")).strip():
+                return str(line["text"]).strip()[:300]
+    return None
+
+
 def _record_skipped_steps(uid: str, batch_id: str, project_name: str, sids: list) -> None:
     """Pre-entry steps (already done by an earlier run/retry pass) → "skipped".
 
@@ -631,8 +641,10 @@ async def _run_one_project(uid: str, project_name: str, config: dict, batch_id: 
                         raise
                     status = job_manager.get_status(job_project(uid, project_name), sid)
                     if status in ("error", "stopped", "cancelled"):
-                        _record_step(uid, batch_id, project_name, sid, status)
-                        _mutate_project(uid, batch_id, project_name, "error", error_step=sid)
+                        reason = failure_reason(job_manager.get_logs(job_project(uid, project_name), sid))
+                        _record_step(uid, batch_id, project_name, sid, status, error_message=reason)
+                        _mutate_project(uid, batch_id, project_name, "error", error_step=sid,
+                                        error_message=reason)
                         return
                     _record_step(uid, batch_id, project_name, sid, "done")
                 _mutate_project(uid, batch_id, project_name, "done")

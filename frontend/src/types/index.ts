@@ -68,6 +68,8 @@ export interface BatchProjectEntry {
   name: string
   state: BatchProjectState
   error_step?: string
+  /** Why the failed step stopped (last error line of its log). */
+  error_message?: string
   current_step?: string
   drive_file_id?: string
   pdf_display_name?: string

@@ -75,7 +75,7 @@ class Step7Categorization:
             q_text = qcm.get("Text") or qcm.get("text", "")
             
             # 1. Determine Domain
-            domain = self._normalize_domain(qcm.get("domain", qcm.get("tagSuggere", "")))
+            domain = self._normalize_domain(qcm.get("domain") or qcm.get("tagSuggere") or "")
             
             print(f"  [{i}/{len(qcms)}] Q{q_num} ({domain})...", end=" ")
             
@@ -122,7 +122,7 @@ class Step7Categorization:
         return {"total": len(categorized_qcms), "file": str(output_path)}
 
     def _normalize_domain(self, domain: str) -> str:
-        d = domain.lower().strip()
+        d = str(domain or "").lower().strip()   # Step 5 may write tagSuggere: null
         if "chir" in d: return "chirurgie"
         if "bio" in d: return "biologie"
         return "medecine" # Default

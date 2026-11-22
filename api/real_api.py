@@ -2393,6 +2393,8 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
             elif kind == "error":
                 job_manager.set_error(_jp, step_id)
                 step_outcome = "error"
+                if ev.get("trace"):
+                    log_callback({"ts": _ts(), "type": "info", "text": f"   at {ev['trace']}"})
                 log_callback({"ts": _ts(), "type": "error", "text": f"❌ Step {step_id} failed: {ev.get('error')}"})
             elif kind == "stopped" or (kind == "step_ok" and cancel_check()):
                 step_outcome = job_manager.get_stop_mode(_jp, step_id)

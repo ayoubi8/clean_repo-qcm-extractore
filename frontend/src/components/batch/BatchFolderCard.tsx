@@ -121,6 +121,11 @@ export function BatchFolderCard({ project, steps, cost, selected, onClick }: Bat
           </span>
         )}
       </div>
+      {(state === 'error' || state === 'cancelled') && project.error_message && (
+        <p className="text-[10px] text-error/90 font-mono leading-snug line-clamp-2 break-words" title={project.error_message}>
+          {project.error_message}
+        </p>
+      )}
     </button>
   )
 }

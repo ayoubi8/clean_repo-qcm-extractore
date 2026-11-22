@@ -221,7 +221,8 @@ class Step6Corrections:
         # ── END PHASE 1 BLOCK ──────────────────────────────────────────────
 
         # Count how many still need corrections
-        uncorrected_count = sum(1 for q in qcms if not q.get('Correct', '').strip())
+        # `or ''`: Step 5 writes "Correct": null for unanswered QCMs.
+        uncorrected_count = sum(1 for q in qcms if not str(q.get('Correct') or '').strip())
         print(f"\n📊 Status: {len(qcms) - uncorrected_count} already corrected, {uncorrected_count} still need corrections.")
 
         # Select correction source
@@ -1896,8 +1897,8 @@ Format: {{"10": "ACE", "11": "BD"}}"""
         Returns (corrected: List[Dict], uncorrected: List[Dict]).
         Prints a summary table.
         """
-        corrected = [q for q in qcms if q.get('Correct', '').strip()]
-        uncorrected = [q for q in qcms if not q.get('Correct', '').strip()]
+        corrected = [q for q in qcms if str(q.get('Correct') or '').strip()]
+        uncorrected = [q for q in qcms if not str(q.get('Correct') or '').strip()]
 
         print(f"\n📊 Correction Coverage:")
         print(f"   ✅ Corrected  : {len(corrected)} / {len(qcms)}")

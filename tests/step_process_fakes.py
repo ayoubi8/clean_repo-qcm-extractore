@@ -48,3 +48,15 @@ def import_api_core(spec, tracker, context, cancel_check, emit):
     from real_api import _call_step, _cascade_with_telemetry  # noqa: F401
     emit({"type": "log", "line": {"text": f"real_api imported in {(_t.monotonic() - t0):.1f}s"}})
     emit({"type": "step_ok"})
+
+
+def _square(x):
+    return x * x
+
+
+def pool_core(spec, tracker, context, cancel_check, emit):
+    from multiprocessing import Pool
+    with Pool(2) as pool:
+        total = sum(pool.map(_square, [1, 2, 3]))
+    emit({"type": "log", "line": {"text": f"pool total {total}"}})
+    emit({"type": "step_ok"})
