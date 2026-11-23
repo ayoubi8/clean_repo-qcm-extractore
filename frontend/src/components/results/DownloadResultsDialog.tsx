@@ -84,8 +84,8 @@ function DownloadResultsDialog({ projects, zipName, onClose }: {
     <>
       <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[80]" onClick={() => !busy && onClose()} />
       <div role="dialog" aria-label="Download results"
-        className="fixed z-[90] left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-[min(560px,calc(100vw-32px))] max-h-[calc(100vh-48px)] flex flex-col rounded-2xl bg-surface-container border border-outline-variant/15 shadow-2xl qe-pop">
-        <div className="flex items-center justify-between px-6 h-16 border-b border-outline-variant/10 shrink-0">
+        className="fixed z-[90] inset-4 m-auto h-fit max-w-[560px] max-h-[calc(100dvh-32px)] flex flex-col overflow-hidden rounded-2xl bg-surface-container border border-outline-variant/15 shadow-2xl qe-fade-up">
+        <div className="flex items-center justify-between px-5 h-14 border-b border-outline-variant/10 shrink-0">
           <h2 className="text-sm font-black text-on-surface">Download results</h2>
           <button onClick={onClose} disabled={busy} aria-label="Close"
             className="w-8 h-8 rounded-full hover:bg-surface-container-highest flex items-center justify-center text-outline">
@@ -93,7 +93,7 @@ function DownloadResultsDialog({ projects, zipName, onClose }: {
           </button>
         </div>
 
-        <div className="p-6 space-y-6 overflow-y-auto custom-scrollbar">
+        <div className="flex-1 min-h-0 p-5 space-y-5 overflow-y-auto custom-scrollbar">
           <section className="space-y-2">
             <div className="flex items-center justify-between">
               <p className="text-[10px] font-black uppercase tracking-[0.2em] text-outline">Steps</p>
@@ -138,7 +138,7 @@ function DownloadResultsDialog({ projects, zipName, onClose }: {
                   <button onClick={() => setSelected([])} className="text-outline hover:text-on-surface">None</button>
                 </div>
               </div>
-              <div className="max-h-56 overflow-y-auto custom-scrollbar space-y-1 pr-1">
+              <div className="max-h-40 overflow-y-auto custom-scrollbar space-y-1 pr-1">
                 {projects.map((p) => (
                   <label key={p.name} className="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-surface-container-high cursor-pointer">
                     <input type="checkbox" checked={selected.includes(p.name)}
@@ -152,12 +152,12 @@ function DownloadResultsDialog({ projects, zipName, onClose }: {
           )}
         </div>
 
-        <div className="px-6 py-4 border-t border-outline-variant/10 flex items-center justify-between gap-3 shrink-0">
-          <p className="text-[11px] text-outline">One .zip · a folder per PDF and per step</p>
+        <div className="px-5 py-3 border-t border-outline-variant/10 bg-surface-container flex items-center justify-between gap-3 shrink-0">
+          <p className="hidden sm:block text-[11px] text-outline">One .zip · a folder per PDF and per step</p>
           <button
             onClick={() => { void go() }}
             disabled={busy || steps.length === 0 || selected.length === 0}
-            className="flex items-center gap-2 h-10 px-5 rounded-xl bg-primary text-on-primary text-xs font-black disabled:opacity-40"
+            className="ml-auto shrink-0 flex items-center gap-2 h-10 px-5 rounded-xl bg-primary text-on-primary text-xs font-black disabled:opacity-40"
           >
             <span className={`material-symbols-outlined text-[18px] ${busy ? 'animate-spin' : ''}`}>{busy ? 'progress_activity' : 'download'}</span>
             {busy ? 'Preparing zip…' : 'Download .zip'}
