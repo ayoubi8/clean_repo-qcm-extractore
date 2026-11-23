@@ -332,6 +332,18 @@ export async function openInGoogleSheets(projectName: string, stepId: string | n
   return data
 }
 
+// POST /auth/google/disconnect — forget the saved Google account
+export async function disconnectGoogle(): Promise<void> {
+  const res = await fetchWithRefresh(`${BASE}/auth/google/disconnect`, {
+    method: 'POST',
+    headers: { ...getAuthHeaders() },
+  })
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+    throw new Error(data.detail || 'Could not disconnect the Google account.')
+  }
+}
+
 export async function getStepStatus(projectName: string, stepId: number): Promise<{ status: any, output_exists: boolean }> {
   const res = await fetchWithRefresh(`${BASE}/projects/${encodeURIComponent(projectName)}/steps/${stepId}/status`, {
     headers: { ...getAuthHeaders() }
@@ -540,6 +552,19 @@ export async function retryBatchPdf(batchId: string, project: string): Promise<{
   if (!res.ok) {
     const errData = await res.json().catch(() => ({}))
     throw new Error(errData.detail || 'Retry failed')
+  }
+  return res.json()
+}
+
+// POST /autorun/batches/{id}/retry-failed — every failed PDF, from its failed step
+export async function retryFailedBatchPdfs(batchId: string): Promise<{ queued: string[]; skipped: { project: string; reason: string }[] }> {
+  const res = await fetchWithRefresh(`${BASE}/autorun/batches/${encodeURIComponent(batchId)}/retry-failed`, {
+    method: 'POST',
+    headers: { ...getAuthHeaders() },
+  })
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}))
+    throw new Error(errData.detail === 'nothing-to-retry' ? 'No failed files to retry.' : (errData.detail || 'Retry failed'))
   }
   return res.json()
 }

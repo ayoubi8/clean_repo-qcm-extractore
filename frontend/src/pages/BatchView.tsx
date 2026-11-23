@@ -1,7 +1,9 @@
 ﻿import { useEffect, useReducer, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { useBatchStore, batchActive } from '../store/batchStore'
-import { resumeBatch, fetchBatchCosts, BatchCosts } from '../lib/api'
+import { resumeBatch, retryFailedBatchPdfs, fetchBatchCosts, BatchCosts } from '../lib/api'
+import { reloadAfterSync } from '../store/outputsCache'
+import { toast } from '../components/ui/Toaster'
 import { DownloadResultsButton } from '../components/results/DownloadResultsDialog'
 import { BatchFolderCard } from '../components/batch/BatchFolderCard'
 import { BatchDetailPanel } from '../components/batch/BatchDetailPanel'
@@ -58,6 +60,7 @@ export function BatchView() {
   const reconnecting = !!error && !!manifest
   const interrupted = manifest?.state === 'interrupted'
   const [resuming, setResuming] = useState(false)
+  const [retryingFailed, setRetryingFailed] = useState(false)
   const expandedAll = expandedProject === 'ALL'
 
   // Batch costs: one aggregate request per project-set/state change (not per poll)
@@ -85,6 +88,24 @@ export function BatchView() {
       alert(e?.message || 'Could not resume this batch')
     } finally {
       setResuming(false)
+    }
+  }
+
+  const failedCount = manifest?.projects.filter(p => p.state === 'error' || p.state === 'cancelled').length ?? 0
+  const handleRetryFailed = async () => {
+    if (retryingFailed || !batchId) return
+    setRetryingFailed(true)
+    try {
+      const { queued, skipped } = await retryFailedBatchPdfs(batchId)
+      toast.success(`Retrying ${queued.length} failed file${queued.length === 1 ? '' : 's'}`
+        + (skipped.length ? ` (${skipped.length} busy, skipped)` : ''))
+      // A retry re-activates the batch; polling stops on terminal manifests.
+      useBatchStore.getState().startPolling(batchId)
+      queued.forEach(name => ['1', '2', '6'].forEach(step => void reloadAfterSync(name, step)))
+    } catch (e: any) {
+      toast.error(e?.message || 'Could not retry the failed files')
+    } finally {
+      setRetryingFailed(false)
     }
   }
 
@@ -120,6 +141,20 @@ export function BatchView() {
             className="w-10 h-10 rounded-full hover:bg-surface-container-highest flex items-center justify-center text-outline hover:text-primary transition-colors shrink-0"
           >
             <span className="material-symbols-outlined text-[20px]">{expandedAll ? 'collapse_all' : 'expand_all'}</span>
+          </button>
+        )}
+        {failedCount > 0 && (
+          <button
+            id="btn-retry-failed"
+            onClick={handleRetryFailed}
+            disabled={retryingFailed}
+            title="Re-run every failed file from its failed step. Finished steps are not repeated."
+            className="shrink-0 px-3 py-2 rounded-xl bg-error-container/10 border border-error/30 text-error text-[10px] font-black uppercase tracking-widest hover:bg-error-container/20 disabled:opacity-40 inline-flex items-center gap-1.5 transition-all"
+          >
+            <span className={`material-symbols-outlined text-[14px] ${retryingFailed ? 'animate-spin' : ''}`}>
+              {retryingFailed ? 'progress_activity' : 'refresh'}
+            </span>
+            {retryingFailed ? 'Starting…' : `Retry failed (${failedCount})`}
           </button>
         )}
         {manifest && manifest.projects.length > 0 && (

@@ -1,5 +1,5 @@
 import {
-  BASE_URL, deleteStepOutput, downloadAuthenticatedFile, fetchAuthenticatedBlobUrl,
+  BASE_URL, deleteStepOutput, disconnectGoogle, downloadAuthenticatedFile, fetchAuthenticatedBlobUrl,
   openInGoogleSheets, syncFromSheets,
 } from './api'
 import { fileUrl, forgetFile, refreshResults } from './results'
@@ -40,16 +40,49 @@ export async function openWorkbookInSheets(project: string, step: string, filena
     if (msg === 'NOT_AUTHORIZED') {
       // No Google token yet: send the new tab through Google sign-in; it
       // comes back to /projects/:name/steps/:id?sheets_pending=1 and finishes.
-      const jwt = localStorage.getItem('qcm_token') || ''
-      const url = `${BASE_URL}/auth/google?project=${encodeURIComponent(project)}&step=${step}`
-        + `&filename=${encodeURIComponent(filename)}&token=${encodeURIComponent(jwt)}`
+      const url = googleAuthUrl(project, step, filename)
       if (tab) tab.location.href = url
       else window.open(url, '_blank')
       return
     }
     tab?.close()
-    toast.error(`Google Sheets: ${msg || 'upload failed'}`)
+    showSheetsError(msg, project, step, filename)
   }
+}
+
+function googleAuthUrl(project: string, step: string, filename: string): string {
+  const jwt = localStorage.getItem('qcm_token') || ''
+  return `${BASE_URL}/auth/google?project=${encodeURIComponent(project)}&step=${encodeURIComponent(step)}`
+    + `&filename=${encodeURIComponent(filename)}&token=${encodeURIComponent(jwt)}`
+}
+
+/** Sheets failure toast. A full Drive gets its way out instead of Google's raw error. */
+export function showSheetsError(message: string | undefined, project: string, step: string, filename: string): void {
+  if (message !== 'DRIVE_QUOTA_EXCEEDED') {
+    toast.error(`Google Sheets: ${message || 'upload failed'}`)
+    return
+  }
+  toast.error('Your Google Drive is full, so this workbook could not be opened in Sheets.', 20000, [
+    { label: 'Download xlsx', onClick: () => { void downloadFile(project, step, filename) } },
+    { label: 'Open Drive storage', onClick: () => { window.open('https://drive.google.com/drive/quota', '_blank', 'noopener') } },
+    {
+      label: 'Use another Google account',
+      onClick: () => {
+        // Open inside the click so the popup blocker allows it.
+        const tab = window.open('about:blank', '_blank')
+        disconnectGoogle()
+          .then(() => {
+            const url = googleAuthUrl(project, step, filename)
+            if (tab) tab.location.href = url
+            else window.open(url, '_blank')
+          })
+          .catch((e: any) => {
+            tab?.close()
+            toast.error(e?.message || 'Could not disconnect the Google account.')
+          })
+      },
+    },
+  ])
 }
 
 export async function openFileInTab(project: string, step: string, filename: string, runId?: string): Promise<void> {

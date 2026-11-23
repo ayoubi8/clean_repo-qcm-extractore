@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAppStore } from '../../store/appStore'
+import { outputsUrl } from '../../lib/routes'
 import { CostSummaryPanel } from '../cost/CostSummaryPanel'
 
 function PipelineStatusChip({ status }: { status: 'idle' | 'running' }) {
@@ -48,7 +49,18 @@ export function TopBar() {
 
       {/* Right: Switch Project button + notifications stub */}
       <div className="flex items-center gap-6">
-        <button 
+        {activeProject && (
+          <button
+            id="btn-open-results"
+            onClick={() => navigate(outputsUrl(activeProject.name))}
+            className="flex items-center gap-2 px-4 py-1.5 rounded-lg text-xs font-black uppercase tracking-widest border border-outline-variant/20 text-on-surface-variant hover:text-primary hover:border-primary/30 transition-colors"
+          >
+            <span className="material-symbols-outlined text-[18px]">fact_check</span>
+            Results
+          </button>
+        )}
+
+        <button
           id="btn-switch-project"
           onClick={() => navigate('/projects')}
           className="text-xs font-semibold text-primary hover:text-primary-fixed transition-colors underline underline-offset-4"

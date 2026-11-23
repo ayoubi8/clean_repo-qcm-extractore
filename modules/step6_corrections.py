@@ -14,7 +14,7 @@ from modules.utils.prompt_helper import PromptHelper
 from modules.utils.xlsx_exporter import export_qcms_to_xlsx
 from modules.utils.mbset_export import export_mbset_import
 from modules.utils.output_naming import pdf_stem_for_context, result_xlsx_name
-from modules.utils.qcm_merge import qcm_key, merge_qcm_fields
+from modules.utils.qcm_merge import qcm_key, merge_qcm_fields, has_answer
 from modules.utils import exam_papers
 from modules.model_policy import get_model_pair
 
@@ -176,7 +176,7 @@ class Step6Corrections:
                     if key:
                         existing_map[key] = q
                 already_corrected_count = sum(
-                    1 for q in existing_data if str(q.get('Correct', '')).strip()
+                    1 for q in existing_data if has_answer(q.get('Correct'))
                 )
                 # ── Full-field merge (not just Correct): corrected_qcms.json also
                 # receives the user's Google-Sheets edits propagated by
@@ -221,8 +221,8 @@ class Step6Corrections:
         # ── END PHASE 1 BLOCK ──────────────────────────────────────────────
 
         # Count how many still need corrections
-        # `or ''`: Step 5 writes "Correct": null for unanswered QCMs.
-        uncorrected_count = sum(1 for q in qcms if not str(q.get('Correct') or '').strip())
+        # Step 5 writes "Correct": null for unanswered QCMs.
+        uncorrected_count = sum(1 for q in qcms if not has_answer(q.get('Correct')))
         print(f"\n📊 Status: {len(qcms) - uncorrected_count} already corrected, {uncorrected_count} still need corrections.")
 
         # Select correction source
@@ -246,6 +246,16 @@ class Step6Corrections:
             print("  5. Manual Entry (Interactive per QCM)")
             print("  6. By Page (Process pages one-by-one, detect gaps)")
             choice = input("Choice [2-6]: ").strip()
+
+        # The page-based sources read Step 1's text. Without it they would find
+        # nothing and the run would look successful with no answers applied.
+        if auto_mode and choice in ("auto_detect", "2") and qcms:
+            pages_dir = (self.context.get_path("step1_extraction", "accepted") if self.context
+                         else Path("output/step1_extraction/accepted"))
+            if not any(pages_dir.glob("page_*.txt")):
+                raise RuntimeError(
+                    "Step 1 page text is missing, so no corrections could be read. "
+                    "Re-run Step 1 for this PDF, then Step 6.")
 
         corrected_qcms = []
         if choice == "auto_detect":
@@ -287,16 +297,23 @@ class Step6Corrections:
 
         print(f"\n✅ corrected_qcms.json saved with {len(corrected_qcms)} entries.")
 
-        corrected_count = sum(
-            1 for qcm in corrected_qcms if str(qcm.get("Correct", "")).strip()
-        )
+        corrected_count = sum(1 for qcm in corrected_qcms if has_answer(qcm.get("Correct")))
         xlsx_path = output_dir / result_xlsx_name(
             "corrections", corrected_count, pdf_stem_for_context(self.context)
         )
         export_qcms_to_xlsx(corrected_qcms, xlsx_path)
         export_mbset_import(corrected_qcms, output_dir, pdf_stem_for_context(self.context))
 
-        return {"total": len(corrected_qcms), "file": str(output_path), "xlsx_file": str(xlsx_path)}
+        print(f"📊 Corrections: {corrected_count}/{len(corrected_qcms)} QCMs have an answer.")
+        if auto_mode and corrected_qcms and corrected_count == 0:
+            raise RuntimeError(
+                f"No corrections found for any of the {len(corrected_qcms)} QCMs "
+                f"(source: {config.get('source') if config else 'unknown'}). "
+                "Check the correction source or page.")
+
+        return {"total": len(corrected_qcms), "corrected": corrected_count,
+                "missing": len(corrected_qcms) - corrected_count,
+                "file": str(output_path), "xlsx_file": str(xlsx_path)}
 
     def _create_standalone_correction_map(self, auto_mode: bool = False, config: Dict = None) -> Dict:
         """
@@ -1162,14 +1179,32 @@ DOCUMENT TEXT:
             dropped = [p for p in corr_pages if p not in valid]
             if dropped:
                 print(f"[STEP6] ⚠️ correction pages {dropped} are outside the scanned set — ignored.")
-            scan_order = sorted(valid_corr) + [p for p in all_pages if p not in set(valid_corr)]
             print(f"⚡ Step 2 marked {len(valid_corr)} answer-key page(s) {valid_corr} — "
-                  "scanned first; remaining pages in normal order.")
+                  "scanned first.")
         else:
-            scan_order = list(all_pages)
+            valid_corr = []
+
+        # Likely answer-key pages (and their neighbours, for tables split across
+        # a page break) are always scanned. The other pages are only scanned
+        # while some QCM still has no answer.
+        likely = set(valid_corr) | {pn for pn in all_pages
+                                    if self._score_correction_page(page_texts[pn]) >= threshold}
+        if include_neighbors:
+            likely |= {n for pn in likely for n in (pn - 1, pn + 1) if n in page_texts}
+        priority = sorted(valid_corr) + [p for p in all_pages if p in likely and p not in set(valid_corr)]
+        scan_order = priority + [p for p in all_pages if p not in likely]
+        # Several numbering scopes: a bare number can't prove a QCM is covered.
+        can_stop_early = bool(likely) and not exam_papers.has_multiple_scopes(qcms)
+        scan_expected = {str(q.get("Num") or q.get("number")) for q in qcms
+                         if str(q.get("Num") or q.get("number", "")).isdigit()}
 
         from modules.utils import call_logger as _telemetry
-        for pn in scan_order:
+        for scan_idx, pn in enumerate(scan_order):
+            if (can_stop_early and scan_idx >= len(priority) and scan_expected
+                    and scan_expected <= set(correction_map)):
+                print(f"\n   ⏭️  All {len(scan_expected)} QCMs answered — "
+                      f"skipping the last {len(scan_order) - scan_idx} page(s).")
+                break
             _telemetry.set_item_ref(
                 f"correction_page_{pn}" if pn in set(corr_pages) else f"page_{pn}")
             text = page_texts.get(pn, "")

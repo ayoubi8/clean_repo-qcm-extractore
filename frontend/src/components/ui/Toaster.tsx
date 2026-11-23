@@ -7,11 +7,12 @@ import { create } from 'zustand'
  */
 
 type Kind = 'success' | 'error' | 'info'
-interface Toast { id: number; kind: Kind; text: string }
+export interface ToastAction { label: string; onClick: () => void }
+interface Toast { id: number; kind: Kind; text: string; actions?: ToastAction[] }
 
 interface ToastStore {
   toasts: Toast[]
-  push: (kind: Kind, text: string, ms?: number) => void
+  push: (kind: Kind, text: string, ms?: number, actions?: ToastAction[]) => void
   dismiss: (id: number) => void
 }
 
@@ -19,9 +20,9 @@ let nextId = 1
 
 const useToastStore = create<ToastStore>((set, get) => ({
   toasts: [],
-  push: (kind, text, ms) => {
+  push: (kind, text, ms, actions) => {
     const id = nextId++
-    set({ toasts: [...get().toasts.slice(-3), { id, kind, text }] })
+    set({ toasts: [...get().toasts.slice(-3), { id, kind, text, actions }] })
     setTimeout(() => get().dismiss(id), ms ?? (kind === 'error' ? 7000 : 3500))
   },
   dismiss: (id) => set({ toasts: get().toasts.filter((t) => t.id !== id) }),
@@ -29,7 +30,7 @@ const useToastStore = create<ToastStore>((set, get) => ({
 
 export const toast = {
   success: (text: string, ms?: number) => useToastStore.getState().push('success', text, ms),
-  error: (text: string, ms?: number) => useToastStore.getState().push('error', text, ms),
+  error: (text: string, ms?: number, actions?: ToastAction[]) => useToastStore.getState().push('error', text, ms, actions),
   info: (text: string, ms?: number) => useToastStore.getState().push('info', text, ms),
 }
 
@@ -56,7 +57,22 @@ export function Toaster() {
           className={`flex items-start gap-2 px-4 py-3 rounded-xl border shadow-lg backdrop-blur text-xs font-bold qe-pop ${STYLE[t.kind].box}`}
         >
           <span className="material-symbols-outlined text-[16px] shrink-0">{STYLE[t.kind].icon}</span>
-          <span className="flex-1 break-words">{t.text}</span>
+          <div className="flex-1 min-w-0">
+            <span className="break-words">{t.text}</span>
+            {t.actions && t.actions.length > 0 && (
+              <div className="flex flex-wrap gap-x-3 gap-y-1 mt-2">
+                {t.actions.map((a) => (
+                  <button
+                    key={a.label}
+                    onClick={() => { dismiss(t.id); a.onClick() }}
+                    className="underline underline-offset-2 hover:opacity-80"
+                  >
+                    {a.label}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
           <button onClick={() => dismiss(t.id)} aria-label="Dismiss" className="opacity-60 hover:opacity-100">
             <span className="material-symbols-outlined text-[14px]">close</span>
           </button>

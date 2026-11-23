@@ -6,7 +6,8 @@ import { ConfigPanel } from '../components/pipeline/ConfigPanel'
 import { TerminalLog } from '../components/pipeline/TerminalLog'
 import { AutoRunPanel } from '../components/autorun/AutoRunPanel'
 import { openInGoogleSheets } from '../lib/api'
-import { autorunUrl, outputsUrl, stepUrl, toUiStep } from '../lib/routes'
+import { showSheetsError } from '../lib/fileActions'
+import { stepUrl, toUiStep } from '../lib/routes'
 import { useAppStore } from '../store/appStore'
 import { usePipelineStore } from '../store/pipelineStore'
 import { useToast } from '../components/ui/Toaster'
@@ -37,7 +38,7 @@ function useSheetsReturn(project: string) {
         if (res.url) window.location.href = res.url
         else toast.error('Google Sheets upload succeeded but no URL was returned.')
       })
-      .catch((err) => toast.error(`Google Sheets error: ${err?.message || 'Unknown error'}`))
+      .catch((err) => showSheetsError(err?.message, project, step, filename))
   }, [params, project, setParams, toast])
 }
 
@@ -63,25 +64,6 @@ export function ProjectWorkspace({ autorun = false }: { autorun?: boolean }) {
 
   return (
     <div className="flex flex-col h-[calc(100vh-64px)] overflow-hidden relative">
-      <div className="h-14 bg-surface-container-low border-b border-outline-variant/10 flex items-center justify-end gap-2 px-6 shrink-0">
-        <button
-          id="btn-open-results"
-          onClick={() => navigate(outputsUrl(name))}
-          className="flex items-center gap-2 px-4 py-1.5 rounded-lg text-xs font-black uppercase tracking-widest border border-outline-variant/20 text-on-surface-variant hover:text-primary hover:border-primary/30 transition-colors"
-        >
-          <span className="material-symbols-outlined text-[18px]">fact_check</span>
-          Results
-        </button>
-        <button
-          id="btn-open-autorun"
-          onClick={() => navigate(autorunUrl(name))}
-          className="flex items-center gap-2 px-4 py-1.5 bg-secondary-container text-on-secondary-container rounded-lg text-xs font-black uppercase tracking-widest hover:opacity-90 transition-opacity shadow-sm"
-        >
-          <span className="material-symbols-outlined text-[18px]">play_circle</span>
-          Auto Run
-        </button>
-      </div>
-
       <div className="flex flex-1 overflow-hidden">
         <StepList />
         <ConfigPanel />

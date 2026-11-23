@@ -149,6 +149,11 @@ def delete_prefix(prefix: str) -> None:
     _recursive_delete(prefix.rstrip("/"), sb)
 
 
+def delete_file(storage_path: str) -> None:
+    """Delete one object (delete_prefix only removes what is listed UNDER a path)."""
+    get_supabase().storage.from_(BUCKET).remove([storage_path])
+
+
 def _recursive_delete(prefix: str, sb) -> None:
     """Depth-first recursive delete of all objects under prefix."""
     try:

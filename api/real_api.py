@@ -46,6 +46,9 @@ from autorun_batch import (batch_enabled as autorun_batch_enabled,
                            existing_project_names as autorun_existing_names,
                            list_user_batches as autorun_list_batches,
                            resume_batch as autorun_resume_batch,
+                           retry_failed_projects as autorun_retry_failed,
+                           note_manual_step as autorun_note_manual_step,
+                           failure_reason as autorun_failure_reason,
                            _project_busy as autorun_project_busy)
 from project_manager import (get_or_create, list_projects, step_output_exists,
                               get_weekly_costs, invalidate_projects_cache,
@@ -901,10 +904,31 @@ def start_google_auth(
     auth_url, _ = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
-        prompt="consent",
+        prompt="select_account consent",   # lets the user pick another Google account
         state=f"{project}||{step}||{filename}||{user_id}"
     )
     return RedirectResponse(auth_url)
+
+@app.post("/auth/google/disconnect")
+def disconnect_google(user: dict = Depends(get_current_user)):
+    """Forget this user's saved Google token so another account can be connected."""
+    from storage_client import delete_file
+    failed = False
+    for uid in {str(user["id"]), str(get_db_user_id(user))}:
+        try:
+            delete_file(f"{uid}/.google_token.pickle")
+        except Exception as e:
+            failed = True
+            print(f"[GOOGLE] token delete failed in Storage: {e}")
+        try:
+            Path(f"/app/output/{uid}/.google_token.pickle").unlink(missing_ok=True)
+        except OSError as e:
+            failed = True
+            print(f"[GOOGLE] local token delete failed: {e}")
+    if failed:
+        raise HTTPException(status_code=500, detail="Could not disconnect the Google account.")
+    return {"disconnected": True}
+
 
 @app.get("/oauth2callback")
 def google_oauth_callback(code: str, state: str = ""):
@@ -1374,7 +1398,9 @@ def _compute_step_badge(project: str, user_id: str, step_id: str) -> tuple[str, 
             for f in (qcm_dir.rglob("*.json") if qcm_dir.exists() else []):
                 try:
                     data = json.loads(f.read_text())
-                    qcms = len(data) if isinstance(data, list) else 0
+                    if not isinstance(data, list):
+                        continue          # e.g. correction_pages.json: not a QCM page
+                    qcms = len(data)
                     total_qcms += qcms
                     if qcms == 0: empty_pages += 1
                 except: pass
@@ -1385,7 +1411,15 @@ def _compute_step_badge(project: str, user_id: str, step_id: str) -> tuple[str, 
             merged_count = len(json.loads(merged.read_text())) if merged.exists() else 0
             stats = {"merged_qcms": merged_count}
             badge = "error" if merged_count == 0 else "success"
-        elif step_id in ("3", "4", "6", "7", "1.5", "1.6"):
+        elif step_id == "6":
+            from modules.utils.qcm_merge import has_answer
+            corrected_path = Path(f"/app/output/{user_id}/{project}/step6_corrections/corrected_qcms.json")
+            rows = json.loads(corrected_path.read_text(encoding="utf-8")) if corrected_path.exists() else []
+            total = len(rows) if isinstance(rows, list) else 0
+            corrected = sum(1 for q in rows if isinstance(q, dict) and has_answer(q.get("Correct"))) if total else 0
+            stats = {"corrected": corrected, "total": total}
+            badge = "error" if corrected == 0 else ("warning" if corrected < total else "success")
+        elif step_id in ("3", "4", "7", "1.5", "1.6"):
             badge = "success"
         # step 8: no badge
     except Exception:
@@ -1926,19 +1960,27 @@ def _upload_step_folder_to_storage(user_id: str, project: str, folder_name: str,
     local_dir = Path(f"/app/output/{user_id}/{project}/{folder_name}")
     if not local_dir.exists():
         return 0, 0
-    uploaded = 0
-    failed = 0
-    for f in local_dir.rglob("*"):
-        if not f.is_file():
-            continue
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _upload_one(f: Path) -> bool:
         rel = str(f.relative_to(local_dir)).replace("\\", "/")
         storage_path = f"{storage_prefix}/{rel}"
         try:
             write_bytes_file(storage_path, f.read_bytes())
-            uploaded += 1
+            return True
         except Exception as e:
             print(f"[STORAGE] upload failed {storage_path}: {e}")
-            failed += 1
+            return False
+
+    files = [f for f in local_dir.rglob("*") if f.is_file()]
+    try:
+        workers = max(1, int(os.environ.get("STORAGE_UPLOAD_WORKERS", "4")))
+    except ValueError:
+        workers = 4
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(_upload_one, files))
+    uploaded = sum(results)
+    failed = len(results) - uploaded
     summary = f"[STORAGE] uploaded {uploaded} file(s) for {storage_prefix}"
     if failed:
         summary += f", {failed} FAILED"
@@ -1959,7 +2001,10 @@ STEP_INPUT_DEPENDENCIES = {
     # post_step3_build.py which uses context.get_path() — same local-FS-first
     # logic. If local FS is empty, the auto-build will fail with "no QCMs"
     # which is fine because Step 3 itself wouldn't have produced anything.
-    "6":         [("step5_json", None), ("step6_corrections", None)],  # Step 6 reads merged_qcms.json + its own prior corrections
+    # Step 6 reads merged_qcms.json, its own prior corrections, Step 1's page
+    # text (the answer key) and Step 2's correction_pages.json marker.
+    "6":         [("step5_json", None), ("step6_corrections", None),
+                  ("step1_extraction", "accepted"), ("step2_qcm", "accepted")],
     "7":         [("step6_corrections", None), ("step5_json", None)],  # Step 7 reads ROOT corrected_qcms.json (CLOUD_SYNC F10)
     "8":         [("step5_json", None), ("step7_categories", None),    # ROOT final_qcms.json (CLOUD_SYNC F10)
                   ("step6_corrections", None)],
@@ -2200,6 +2245,16 @@ async def run_step(name: str, step_id: str, body: dict, user: dict = Depends(get
     task = asyncio.ensure_future(_run_step_task(name, user["id"], step_id, body))
     job_manager.set_running(_jp, step_id, task)
     _job_user_ids[job_manager.key(_jp, step_id)] = user["id"]
+
+    # A manual re-run of a batch PDF's step keeps its batch card truthful.
+    def _sync_batch_card(_t):
+        status = job_manager.get_status(_jp, step_id)
+        reason = autorun_failure_reason(job_manager.get_logs(_jp, step_id)) if status != "done" else None
+        fut = asyncio.get_event_loop().run_in_executor(
+            None, autorun_note_manual_step, user["id"], name, str(step_id), status, reason)
+        fut.add_done_callback(lambda f: f.cancelled() or (f.exception() and print(
+            f"[AUTORUN-BATCH] batch card update failed ({name}/{step_id}): {f.exception()}")))
+    task.add_done_callback(_sync_batch_card)
     return {"job_id": f"{name}-{step_id}-001"}
 
 
@@ -2268,7 +2323,8 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
             start_step_run as _t_start_step_run,
             set_call_context as _t_set_call_context,
         )
-        _tele_row = _t_start_step_run(user_id, project, step_id, _tele_run_id)
+        _tele_row = await _loop0.run_in_executor(
+            None, _t_start_step_run, user_id, project, step_id, _tele_run_id)
     except Exception as _te:
         print(f"[TELEMETRY] step_run start failed for step {step_id}: {_te}")
 
@@ -2293,7 +2349,9 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
 
         # Archive previous run to _history/ (local + Supabase)
         loop = asyncio.get_event_loop()
-        if step_dir.exists() and any(step_dir.iterdir()):
+        # Internal flag: Auto Run archives the shared Step 1 folder once per pass.
+        _skip_archive = bool(config.pop("_skip_archive", False)) if isinstance(config, dict) else False
+        if not _skip_archive and step_dir.exists() and any(step_dir.iterdir()):
             archive_ts = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
             archive_local = Path(f"/app/output/{user_id}/{project}/_history/step{step_id}/{archive_ts}")
             archive_storage = f"{user_id}/{project}/_history/step{step_id}/{archive_ts}"
@@ -2313,20 +2371,33 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
         # Ensure source.pdf is on local disk before running any step.
         # After a container restart the local FS is wiped; download from Supabase.
         local_pdf = Path(f"/app/output/{user_id}/{project}/source.pdf")
-        if not local_pdf.exists():
+
+        def _restore_pdf():
             storage_pdf = f"{user_id}/{project}/source.pdf"
             try:
                 if file_exists(storage_pdf):
                     local_pdf.parent.mkdir(parents=True, exist_ok=True)
                     local_pdf.write_bytes(read_bytes_file(storage_pdf))
-                    # Also fix project.json so pdf_path points to the local file
+                    # Also fix project.json so pdf_path points to the local file,
+                    # keeping the Auto Run origin/batch link it may carry.
                     pjson_local = local_pdf.parent / "project.json"
-                    pjson_local.write_text(json.dumps({"name": project, "pdf_path": str(local_pdf)}))
+                    try:
+                        _pj = json.loads(pjson_local.read_text(encoding="utf-8"))
+                    except Exception:
+                        try:
+                            _pj = json.loads(read_file(f"{user_id}/{project}/project.json"))
+                        except Exception:
+                            _pj = {}
+                    _pj.update({"name": project, "pdf_path": str(local_pdf)})
+                    pjson_local.write_text(json.dumps(_pj))
                     print(f"[RESTORE] ✅ PDF restored from Supabase to {local_pdf}")
                 else:
                     print(f"[RESTORE] ⚠️ source.pdf not in Supabase at {storage_pdf}")
             except Exception as _e:
                 print(f"[RESTORE] ❌ PDF download failed: {_e}")
+
+        if not local_pdf.exists():
+            await loop.run_in_executor(None, run_env.bind(_restore_pdf))
 
         # Ensure prior-step output folders are on local disk before running.
         # After a container restart the local FS is wiped; Step 2/3/6/7/8 modules
@@ -2336,7 +2407,8 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
         # Supabase Storage. _restore_step_input_from_storage() mirrors the PDF
         # pattern but for step output folders.
         try:
-            _restore_step_input_from_storage(user_id, project, step_id)
+            await loop.run_in_executor(
+                None, run_env.bind(_restore_step_input_from_storage), user_id, project, step_id)
         except Exception as _rie:
             print(f"[RESTORE] ⚠️ step-input restore failed for step {step_id}: {_rie}")
 
@@ -2375,6 +2447,7 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
         step_succeeded = False
         step_outcome = "error"
         auto_build_folders: list = []
+        auto_badge_steps: list = []
 
         # Phase 5: the CPU-heavy middle (_call_step + Step 2's metadata
         # cascade) runs through step_process — in a worker thread
@@ -2384,7 +2457,7 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
             return datetime.now().strftime("%H:%M:%S")
 
         def _on_core_event(ev: dict):
-            nonlocal step_succeeded, step_outcome, auto_build_folders
+            nonlocal step_succeeded, step_outcome, auto_build_folders, auto_badge_steps
             kind = ev.get("type")
             if kind == "costs":
                 # Child process: its AI calls join the API's tracker so the
@@ -2421,12 +2494,7 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
                     job_manager.set_done(_jp, "4")
                     job_manager.set_done(_jp, "5")
                     auto_build_folders = ["step3_metadata", "step4_format", "step5_json"]
-                    for _sid in ("3", "4", "5"):
-                        try:
-                            _b, _s = _compute_step_badge(project, user_id, _sid)
-                            _record_step_history(project, user_id, _sid, _step_start_time.get(f"{_jp}-{_sid}", time.time()), _b, _s)
-                        except Exception as _be:
-                            print(f"[POST-STEP-2] badge record failed for {_sid}: {_be}")
+                    auto_badge_steps = ["3", "4", "5"]   # recorded off the event loop below
                 elif rstatus == "no_qcms":
                     log_callback({"ts": _ts(), "type": "warn", "text": "ℹ️ Auto-enrich skipped: no accepted QCMs after Step 2."})
                 else:
@@ -2474,10 +2542,8 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
             # TELEMETRY: step duration = start → step end (before the
             # post-step Storage upload so the number reflects pure work time).
             try:
-                if step_succeeded:
-                    _tele_status("success")
-                else:
-                    _tele_status(step_outcome)
+                await loop.run_in_executor(
+                    None, _tele_status, "success" if step_succeeded else step_outcome)
             except Exception:
                 pass
 
@@ -2541,44 +2607,57 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
                 # the step's status which was already set above.
                 print(f"[POST-STEP] Output upload failed for step {step_id}: {post_e}")
 
-            # Record history based on the actual step outcome (not post-step I/O outcome)
-            try:
-                start_ts = _step_start_time.get(f"{_jp}-{step_id}", time.time())
-                run_id = datetime.utcfromtimestamp(start_ts).strftime("%Y-%m-%dT%H-%M-%S")
-                if step_succeeded:
-                    badge, stats = _compute_step_badge(project, user_id, step_id)
-                    _record_step_history(project, user_id, step_id, start_ts, badge, stats)
-                else:
-                    badge, stats = step_outcome, {}
-                    _record_step_history(project, user_id, step_id, start_ts, badge, stats)
-                # PERSISTENCE_FIX_PLAN PR-1: also record into the SQL
-                # step_results / step_history / costs tables so the run
-                # survives a container restart even with an empty local FS.
+            # Record history based on the actual step outcome (not post-step I/O
+            # outcome). SQL + Storage work: kept off the event loop.
+            def _do_post_record():
+                for _sid in auto_badge_steps:
+                    try:
+                        _b, _s = _compute_step_badge(project, user_id, _sid)
+                        _record_step_history(project, user_id, _sid, _step_start_time.get(f"{_jp}-{_sid}", time.time()), _b, _s)
+                    except Exception as _be:
+                        print(f"[POST-STEP-2] badge record failed for {_sid}: {_be}")
                 try:
-                    _record_step_result(
-                        project, user_id, step_id, run_id, start_ts,
-                        badge, stats, folder_name, auto_build_folders,
-                    )
-                except Exception as _sr:
-                    print(f"[POST-STEP] step_results record failed for step {step_id}: {_sr}")
-                try:
-                    _record_step_costs(user_id, project, step_id,
-                                       tracker.calls_since(_cost_snap) if _cost_snap is not None else [])
-                except Exception as _sc:
-                    print(f"[POST-STEP] costs record failed for step {step_id}: {_sc}")
-            except Exception as be:
-                print(f"[POST-STEP] Badge recording failed for step {step_id}: {be}")
+                    start_ts = _step_start_time.get(f"{_jp}-{step_id}", time.time())
+                    run_id = datetime.utcfromtimestamp(start_ts).strftime("%Y-%m-%dT%H-%M-%S")
+                    if step_succeeded:
+                        badge, stats = _compute_step_badge(project, user_id, step_id)
+                        _record_step_history(project, user_id, step_id, start_ts, badge, stats)
+                    else:
+                        badge, stats = step_outcome, {}
+                        _record_step_history(project, user_id, step_id, start_ts, badge, stats)
+                    # PERSISTENCE_FIX_PLAN PR-1: also record into the SQL
+                    # step_results / step_history / costs tables so the run
+                    # survives a container restart even with an empty local FS.
+                    try:
+                        _record_step_result(
+                            project, user_id, step_id, run_id, start_ts,
+                            badge, stats, folder_name, auto_build_folders,
+                        )
+                    except Exception as _sr:
+                        print(f"[POST-STEP] step_results record failed for step {step_id}: {_sr}")
+                    try:
+                        _record_step_costs(user_id, project, step_id,
+                                           tracker.calls_since(_cost_snap) if _cost_snap is not None else [])
+                    except Exception as _sc:
+                        print(f"[POST-STEP] costs record failed for step {step_id}: {_sc}")
+                except Exception as be:
+                    print(f"[POST-STEP] Badge recording failed for step {step_id}: {be}")
 
-            # PHASE 5 (step_cache): re-cache the terminal view so the next
-            # /status + /output calls are hits instead of SQL/Storage walks.
+                # PHASE 5 (step_cache): re-cache the terminal view so the next
+                # /status + /output calls are hits instead of SQL/Storage walks.
+                try:
+                    _terminal = "done" if step_succeeded else (
+                        step_outcome if step_outcome in ("error", "stopped", "cancelled")
+                        else "error")
+                    step_cache.put(user_id, project, step_id, status=_terminal,
+                                   output_exists=step_output_exists(project, step_id, user_id))
+                except Exception:
+                    pass
+
             try:
-                _terminal = "done" if step_succeeded else (
-                    step_outcome if step_outcome in ("error", "stopped", "cancelled")
-                    else "error")
-                step_cache.put(user_id, project, step_id, status=_terminal,
-                               output_exists=step_output_exists(project, step_id, user_id))
-            except Exception:
-                pass
+                await loop.run_in_executor(None, run_env.bind(_do_post_record))
+            except Exception as post_e:
+                print(f"[POST-STEP] Recording failed for step {step_id}: {post_e}")
 
     except asyncio.CancelledError:
         # A hard-cancel during setup (archive/PDF restore awaits) must also
@@ -4112,6 +4191,12 @@ def get_result_history(name: str, step_id: str, user: dict = Depends(get_current
     return {"runs": out}
 
 
+def _same_workbook(a: str, b: str) -> bool:
+    """Same result workbook, ignoring the QCM count in `{count}_{kind}_{stem}.xlsx`."""
+    strip = lambda n: re.sub(r"^\d+_(?=(?:qcms|corrections)_)", "", str(n or ""))
+    return bool(a) and strip(a) == strip(b)
+
+
 @app.post("/projects/{name}/steps/{step_id}/open-sheets")
 def open_in_google_sheets(name: str, step_id: str, body: dict, user: dict = Depends(get_current_user)):
     """Upload XLSX to Google Sheets — resolves file from local FS or Supabase Storage."""
@@ -4161,7 +4246,7 @@ def open_in_google_sheets(name: str, step_id: str, body: dict, user: dict = Depe
     except Exception:
         reuse_meta = None
     if reuse_meta and reuse_meta.get("sheet_id") and \
-            str(reuse_meta.get("filename", "")) == str(filename):
+            _same_workbook(reuse_meta.get("filename", ""), filename):
         try:
             from openpyxl import load_workbook as _load_wb
             _wb = _load_wb(str(file_path), data_only=True)
@@ -4184,6 +4269,7 @@ def open_in_google_sheets(name: str, step_id: str, body: dict, user: dict = Depe
                 _meta_path_local = Path(
                     f"/app/output/{user['id']}/{name}/{folder}/_sheets_meta.json")
                 _meta_path_local.parent.mkdir(parents=True, exist_ok=True)
+                reuse_meta["filename"] = filename
                 reuse_meta["opened_at"] = datetime.now().isoformat()
                 _meta_path_local.write_text(json.dumps(reuse_meta), encoding="utf-8")
                 try:
@@ -4237,6 +4323,8 @@ def open_in_google_sheets(name: str, step_id: str, body: dict, user: dict = Depe
         import traceback
         traceback.print_exc()
         print(f"[SHEETS] Upload failed: {e}")
+        if "storageQuotaExceeded" in str(e) or "storage quota" in str(e).lower():
+            raise HTTPException(status_code=507, detail="DRIVE_QUOTA_EXCEEDED")
         raise HTTPException(status_code=500, detail=f"Google Sheets upload failed: {str(e)}")
 
 
@@ -5103,6 +5191,20 @@ async def autorun_batch_retry(batch_id: str, body: dict, user: dict = Depends(ge
         status_code = 404 if reason in ("batch-not-found", "project-not-in-batch") else 409
         raise HTTPException(status_code=status_code, detail=reason)
     return {"queued": True, "project": project}
+
+
+@app.post("/autorun/batches/{batch_id}/retry-failed")
+async def autorun_batch_retry_failed(batch_id: str, user: dict = Depends(get_current_user)):
+    """Re-run every failed PDF from its first failed step, in the batch's queue."""
+    if not autorun_batch_enabled():
+        raise HTTPException(status_code=404, detail="Auto Run batch is not enabled on this server.")
+    uid = user["id"]
+    _check_user_rate_limit(uid, "autorun_retry_failed", limit=10, window_seconds=60)
+    result = autorun_retry_failed(uid, batch_id)
+    if result.get("error"):
+        raise HTTPException(status_code=404 if result["error"] == "batch-not-found" else 409,
+                            detail=result["error"])
+    return result
 
 
 @app.post("/autorun/batches/{batch_id}/resume")

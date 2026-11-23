@@ -74,6 +74,8 @@ export interface BatchProjectEntry {
   drive_file_id?: string
   pdf_display_name?: string
   steps?: BatchSteps
+  /** Step 6 result: QCMs with an answer / all QCMs. */
+  corrections?: { corrected: number; total: number }
 }
 
 export interface BatchManifest {

@@ -332,3 +332,11 @@ def propagate_sheet_edits(output_root: Path, edited_rows: List[Dict],
 
     return {"changed": changed, "pruned": list(pruned_files),
             "files_scanned": len(candidates)}
+
+
+def has_answer(value) -> bool:
+    """True when a `Correct` value is a real answer. Step 5 writes null for
+    unanswered QCMs, and str(None) must never count as one."""
+    if value is None:
+        return False
+    return str(value).strip().lower() not in ("", "none", "null")

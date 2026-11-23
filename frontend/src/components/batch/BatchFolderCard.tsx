@@ -105,6 +105,18 @@ export function BatchFolderCard({ project, steps, cost, selected, onClick }: Bat
 
       <div className="flex items-center gap-2">
         <span className={`${CHIP_BASE} ${chip.cls}`}>{chip.label}</span>
+        {project.corrections && (
+          <span
+            title="QCMs with a correction after Step 6"
+            className={`${CHIP_BASE} tabular-nums ${
+              project.corrections.corrected === project.corrections.total && project.corrections.total > 0
+                ? 'bg-primary/10 text-primary border-primary/30'
+                : 'bg-error-container/10 text-error border-error/30'
+            }`}
+          >
+            {project.corrections.corrected}/{project.corrections.total} corrected
+          </span>
+        )}
         {cost && cost.cost > 0 && (
           <span
             title="Estimated cost so far (Auto Run runs steps 1 · 2 · 6)"
