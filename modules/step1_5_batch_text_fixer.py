@@ -1,6 +1,7 @@
 import json
 from modules.utils import run_env  # per-run config overlay (see run_env.py)
 from modules.openrouter_client import OpenRouterFatalError
+from modules.utils.page_text import is_safe_rewrite
 import re
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
@@ -254,10 +255,10 @@ class Step1_5BatchTextFixer:
                 f"PAIR_{idx}: Pages {page_from}-{page_to}",
                 f"---",
                 f"PAGE_{page_from}:",
-                page_contents[page_from][:1500],  # Limit length
+                page_contents[page_from],
                 f"",
                 f"PAGE_{page_to}:",
-                page_contents[page_to][:1500],
+                page_contents[page_to],
                 f"---",
                 ""
             ])
@@ -329,6 +330,9 @@ class Step1_5BatchTextFixer:
             page_num = int(re.search(r'page_(\d+)', page_file.name).group(1))
             
             if page_num in fixed_pages:
+                if not is_safe_rewrite(page_file.read_text(encoding='utf-8'), fixed_pages[page_num]):
+                    print(f"  [KEEP] Page {page_num}: AI fix was empty or too short, original kept")
+                    continue
                 # Write fixed content
                 page_file.write_text(fixed_pages[page_num], encoding='utf-8')
                 fixes_applied += 1

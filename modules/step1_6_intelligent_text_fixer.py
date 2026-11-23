@@ -1,6 +1,7 @@
 import os
 from modules.utils import run_env  # per-run config overlay (see run_env.py)
 from modules.openrouter_client import OpenRouterFatalError
+import json
 import re
 from pathlib import Path
 from typing import Dict, Any, List
@@ -8,6 +9,7 @@ import concurrent.futures
 
 from modules.openrouter_client import OpenRouterClient
 from modules.utils.cost_tracker import CostTracker
+from modules.utils.page_text import has_text, is_blank_marker, is_safe_rewrite
 
 class Step1_6IntelligentTextFixer:
     """
@@ -38,7 +40,29 @@ class Step1_6IntelligentTextFixer:
         if not txt_files:
             print(f"❌ No text files found in {target_input_dir}")
             return {"status": "error"}
-            
+
+        # After a page repair only the recovered pages need fixing (and paying for).
+        manifest_path = Path(target_input_dir).parent / "_page_manifest.json"
+        manifest = {}
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+        if manifest.get("repair"):
+            only = set(manifest.get("recovered_pages") or [])
+            txt_files = [f for f in txt_files if int(re.search(r'page_(\d+)', f.name).group(1)) in only]
+            manifest["repair"] = False
+            manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+        def _worth_fixing(path: Path) -> bool:
+            text = path.read_text(encoding='utf-8')
+            return has_text(text) and not is_blank_marker(text)
+
+        txt_files = [f for f in txt_files if _worth_fixing(f)]
+        if not txt_files:
+            print("[SKIP] No page needs text fixing.")
+            return {"status": "success", "processed": 0}
+
         # Parse config
         primary_model = run_env.getenv("STEP1_6_MODEL", "meta-llama/llama-3.3-70b-instruct")
         fallback_model = run_env.getenv("STEP1_6_FALLBACK_MODEL", "google/gemini-2.0-flash-lite-001")
@@ -106,6 +130,11 @@ TEXT:
                 cost = response.get('cost', 0.0) or self.client.estimate_cost(used_model, response['usage'])
                 self.cost_tracker.log_api_call("step1_6_text_fix", used_model, response['usage'], cost)
                 
+            # A cut-off or empty reply must never replace a good page.
+            if response.get("finish_reason") == "length" or not is_safe_rewrite(content, fixed_content):
+                print(f"  [KEEP] {txt_file.name}: AI fix was empty or incomplete, original kept")
+                return False
+
             # Write back
             txt_file.write_text(fixed_content, encoding='utf-8')
             print(f"  ✅ Fixed {txt_file.name}")

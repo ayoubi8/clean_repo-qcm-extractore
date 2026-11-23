@@ -1994,6 +1994,9 @@ def _upload_step_folder_to_storage(user_id: str, project: str, folder_name: str,
 # Used by _restore_step_input_from_storage() so that after a container
 # restart (local FS wiped) the step finds its dependencies on disk.
 STEP_INPUT_DEPENDENCIES = {
+    "1:repair":  [("step1_extraction", "accepted")],   # keep good pages, OCR only the rest
+    "1.5":       [("step1_extraction", "accepted")],
+    "1.6":       [("step1_extraction", "accepted")],
     "2":         [("step1_extraction", "accepted")],   # Step 2 reads step1 Extraction accepted
     "3":         [("step2_qcm", "accepted")],            # Step 3 reads step2 QCM accepted
     # Steps 4 & 5 are auto-run after Step 3 — they read step3_metadata/accepted
@@ -2408,7 +2411,8 @@ async def _run_step_task(project: str, user_id: str, step_id: str, config: dict)
         # pattern but for step output folders.
         try:
             await loop.run_in_executor(
-                None, run_env.bind(_restore_step_input_from_storage), user_id, project, step_id)
+                None, run_env.bind(_restore_step_input_from_storage), user_id, project,
+                "1:repair" if step_id == "1" and config.get("repair_missing") else step_id)
         except Exception as _rie:
             print(f"[RESTORE] ⚠️ step-input restore failed for step {step_id}: {_rie}")
 
@@ -2927,6 +2931,7 @@ def _call_step(step_id: str, tracker, context, config: dict, cancel_check=None):
                     ocr_guidance=config.get("ocr_guidance", ""),
                     force_overwrite=bool(config.get("force_overwrite", False)),
                     cancel_check=cancel_check,
+                    repair_missing=bool(config.get("repair_missing", False)),
                ),
         "1.5": lambda: Step1_5BatchTextFixer(tracker, context).run(),
         "1.6": lambda: Step1_6IntelligentTextFixer(tracker, context).run(),

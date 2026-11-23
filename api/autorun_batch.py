@@ -539,6 +539,54 @@ def _step_done_local(uid: str, project: str, step_id: str) -> bool:
         return False
 
 
+def step1_empty_pages(uid: str, project: str) -> list:
+    """Page numbers whose Step 1 text is empty (local files, else Storage sizes)."""
+    accepted = _pdir(uid, project) / "step1_extraction" / "accepted"
+
+    def number(name: str) -> Optional[int]:
+        match = re.fullmatch(r"page_(\d+)\.txt", name)
+        return int(match.group(1)) if match else None
+
+    try:
+        files = list(accepted.glob("page_*.txt"))
+    except OSError:
+        files = []
+    if files:
+        empty = []
+        for path in files:
+            try:
+                if not path.read_text(encoding="utf-8", errors="ignore").strip():
+                    empty.append(number(path.name))
+            except OSError:
+                pass
+        return sorted(n for n in empty if n is not None)
+    try:
+        from storage_client import list_files_recursive
+        items = list_files_recursive(f"{uid}/{project}/step1_extraction/accepted")
+    except Exception as e:
+        print(f"[AUTORUN-BATCH] empty-page check skipped ({project}): {e}")
+        return []
+    empty = [number(i.get("name", "")) for i in items
+             if (i.get("metadata") or {}).get("size") == 0]
+    return sorted(n for n in empty if n is not None)
+
+
+def _step_after_repair(uid: str, project: str) -> Optional[str]:
+    """After a Step 1 repair that recovered no text, later steps are still valid.
+    Returns None to continue normally, else the next step ("" = all done)."""
+    path = _pdir(uid, project) / "step1_extraction" / "_page_manifest.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not data.get("repair") or data.get("recovered_pages"):
+        return None
+    data["repair"] = False
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    _drop_step_cache(uid, [project])
+    return first_not_done_step(uid, project) or ""
+
+
 def first_not_done_step(uid: str, project: str) -> Optional[str]:
     """First step in BATCH_SEQUENCE that is not a completed run.
 
@@ -580,6 +628,8 @@ def first_not_done_step(uid: str, project: str) -> Optional[str]:
                 pass
         return done
 
+    if step1_empty_pages(uid, project):
+        return "1"                 # a 0 KB page: Step 1 repairs only those pages
     for sid in BATCH_SEQUENCE:
         if not _is_done(sid):
             return sid
@@ -700,7 +750,12 @@ async def _run_one_project(uid: str, project_name: str, config: dict, batch_id: 
                          BATCH_SEQUENCE[:BATCH_SEQUENCE.index(entry)])
                 await io(_clear_steps_from, uid, batch_id, project_name, entry)
                 ran_step1 = False
+                jump_to: Optional[str] = None
                 for sid in BATCH_SEQUENCE[BATCH_SEQUENCE.index(entry):]:
+                    if jump_to:
+                        if sid != jump_to:
+                            continue
+                        jump_to = None
                     cur_sid = sid
                     await io(_mutate_project, uid, batch_id, project_name, "running", current_step=sid)
                     await io(_record_step, uid, batch_id, project_name, sid, "running")
@@ -708,6 +763,8 @@ async def _run_one_project(uid: str, project_name: str, config: dict, batch_id: 
                     # 1 / 1.5 / 1.6 share one folder: one archive per pass is enough.
                     if sid in ("1.5", "1.6") and ran_step1:
                         cfg = {**cfg, "_skip_archive": True}
+                    if sid == "1":
+                        cfg = {**cfg, "repair_missing": True}   # keep pages that have text
                     ran_step1 = ran_step1 or sid == "1"
                     task = asyncio.ensure_future(
                         _spawn_runtime_task(project_name, uid, sid, cfg))
@@ -728,6 +785,15 @@ async def _run_one_project(uid: str, project_name: str, config: dict, batch_id: 
                                  error_message=reason)
                         return
                     await io(_record_step, uid, batch_id, project_name, sid, "done")
+                    if sid == "1":
+                        next_sid = await io(_step_after_repair, uid, project_name)
+                        if next_sid is not None:
+                            stop = BATCH_SEQUENCE.index(next_sid) if next_sid else len(BATCH_SEQUENCE)
+                            await io(_record_skipped_steps, uid, batch_id, project_name,
+                                     BATCH_SEQUENCE[1:stop])
+                            if not next_sid:
+                                break
+                            jump_to = next_sid
                 await io(_mutate_project, uid, batch_id, project_name, "done")
             except asyncio.CancelledError:
                 raise

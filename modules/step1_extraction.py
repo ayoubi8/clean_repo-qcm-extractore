@@ -15,6 +15,14 @@ from modules.utils.prompt_helper import PromptHelper
 from modules.utils.file_manager import FileManager
 from modules.utils.ocr_cache import OCRCache
 from modules.model_policy import get_model_pair
+from modules.utils.page_text import (
+    BLANK_INK_RATIO, BLANK_PAGE_MARKER, LIKELY_BLANK_INK_RATIO, has_text, page_ink_ratio,
+)
+
+
+class EmptyOCRReply(RuntimeError):
+    """The model answered, but with no page text."""
+
 
 class Step1Extraction:
     """Text extraction with dual mode: pypdfium2 or Vision OCR"""
@@ -26,7 +34,8 @@ class Step1Extraction:
         self.context = project_context
         self.cache = OCRCache()
     
-    def run(self, pdf_path: str, auto_ocr: bool = False, ocr_guidance: str = "", force_overwrite: bool = False, cancel_check=None) -> Dict:
+    def run(self, pdf_path: str, auto_ocr: bool = False, ocr_guidance: str = "", force_overwrite: bool = False, cancel_check=None,
+            repair_missing: bool = False) -> Dict:
         """
         Main execution
         Returns: {"output_dir": "output/project/step1_extraction", "method": "vision_ocr", "cost": 0.0073}
@@ -52,7 +61,7 @@ class Step1Extraction:
         # Choose method
         if auto_ocr:
             print(f"\n[AUTO] Using Vision OCR (as configured)")
-            return self._extract_with_vision(pdf_path, pages, ocr_guidance, cancel_check)
+            return self._extract_with_vision(pdf_path, pages, ocr_guidance, cancel_check, repair_missing)
         
         print("\nSelect extraction method:")
         print("  1. pypdfium2 (Fast, free, text-based PDFs)")
@@ -60,43 +69,110 @@ class Step1Extraction:
         choice = input("Choice [1-2]: ").strip()
         
         if choice == "1":
-            return self._extract_with_pypdfium2(pdf_path, len(pages))
+            return self._extract_with_pypdfium2(pdf_path, pages, repair_missing)
         else:
-            return self._extract_with_vision(pdf_path, pages, cancel_check=cancel_check)
+            return self._extract_with_vision(pdf_path, pages, cancel_check=cancel_check,
+                                             repair_missing=repair_missing)
     
-    def _extract_with_pypdfium2(self, pdf_path: str, page_count: int) -> Dict:
+    def _page_path(self, page_num: int) -> Path:
+        if self.context:
+            return self.context.get_path("step1_extraction", "accepted") / f"page_{page_num}.txt"
+        path = Path("output/step1_extraction/accepted") / f"page_{page_num}.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _existing_page_text(self, page_num: int) -> str:
+        path = self._page_path(page_num)
+        try:
+            text = path.read_text(encoding="utf-8") if path.exists() else ""
+        except (OSError, UnicodeDecodeError):
+            return ""
+        return text if has_text(text) else ""
+
+    def _write_page_manifest(self, expected: int, missing: List[int], blank: List[int],
+                             recovered: List[int], repair: bool) -> None:
+        """Page outcome of this run. `repair` + `recovered_pages` tell the next
+        steps which pages are new, so good pages are not paid for twice."""
+        if self.context:
+            path = self.context.get_path("step1_extraction") / "_page_manifest.json"
+        else:
+            path = Path("output/step1_extraction/_page_manifest.json")
+            path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "expected_pages": expected,
+            "completed_pages": expected - len(missing),
+            "missing_pages": missing,
+            "blank_pages": blank,
+            "recovered_pages": recovered,
+            "repair": repair,
+        }, indent=2), encoding="utf-8")
+
+    def _record_page_errors(self, expected: int, missing: List[int], reason: str) -> None:
+        """Failed pages get an error note and never stay as a 0 KB page."""
+        error_dir = (self.context.get_path("step1_extraction", "errors")
+                     if self.context else Path("output/step1_extraction/errors"))
+        error_dir.mkdir(parents=True, exist_ok=True)
+        for page_num in range(1, expected + 1):
+            note = error_dir / f"page_{page_num}.txt"
+            if page_num in missing:
+                note.write_text(f"{reason}\n", encoding="utf-8")
+                page = self._page_path(page_num)
+                if page.exists() and not self._existing_page_text(page_num):
+                    page.unlink()
+            elif note.exists():
+                note.unlink()
+
+    def _extract_with_pypdfium2(self, pdf_path: str, pages: List[Image.Image],
+                                repair_missing: bool = False) -> Dict:
         """Free extraction using pypdfium2"""
+        page_count = len(pages)
         print(f"\nExtracting {page_count} pages with pypdfium2...")
-        
+
         pdf = pdfium.PdfDocument(pdf_path)
-        
+        missing, blank, recovered = [], [], []
+
         for i, page in enumerate(pdf, 1):
+            if repair_missing and self._existing_page_text(i):
+                continue
             textpage = page.get_textpage()
             text = textpage.get_text_range()
-            
-            # Save using project context
-            if self.context:
-                path = self.context.get_path("step1_extraction", "accepted") / f"page_{i}.txt"
+            if has_text(text):
+                recovered.append(i)
+            elif page_ink_ratio(pages[i - 1]) < LIKELY_BLANK_INK_RATIO:
+                text = BLANK_PAGE_MARKER
+                blank.append(i)
             else:
-                # Fallback for legacy
-                path = Path("output/step1_extraction/accepted") / f"page_{i}.txt"
-                path.parent.mkdir(parents=True, exist_ok=True)
-                
-            with open(path, "w", encoding="utf-8") as f:
+                missing.append(i)      # an image page: it has no text layer
+                print(f"Page {i}/{page_count}... no text layer")
+                continue
+
+            with open(self._page_path(i), "w", encoding="utf-8") as f:
                 f.write(text)
-                
+
             print(f"Page {i}/{page_count}... ✓ (Free)")
-        
-        output_dir = str(path.parent) if self.context else "output/step1_extraction/accepted"
-        
+
+        self._record_page_errors(page_count, missing, "NO_TEXT_LAYER: this page is an image.")
+        self._write_page_manifest(page_count, missing, blank, recovered, repair_missing)
+        if missing:
+            raise RuntimeError(
+                f"{len(missing)} of {page_count} page(s) have no text layer: "
+                f"{self._page_list(missing)}. Use Vision OCR for this PDF.")
+
         return {
-            "output_dir": output_dir,
+            "output_dir": str(self._page_path(1).parent),
             "method": "pypdfium2",
             "cost": 0.0,
-            "page_count": page_count
+            "page_count": page_count,
+            "blank_pages": blank,
         }
-    
-    def _extract_with_vision(self, pdf_path: str, pages: List[Image.Image], guidance: str = "", cancel_check=None) -> Dict:
+
+    @staticmethod
+    def _page_list(pages: List[int], limit: int = 12) -> str:
+        shown = ", ".join(str(p) for p in pages[:limit])
+        return f"{shown} and {len(pages) - limit} more" if len(pages) > limit else shown
+
+    def _extract_with_vision(self, pdf_path: str, pages: List[Image.Image], guidance: str = "", cancel_check=None,
+                             repair_missing: bool = False) -> Dict:
         """OCR extraction using Vision AI (with caching and parallel processing)"""
         if not guidance:
             guidance = self.prompt_helper.get_user_guidance(
@@ -119,8 +195,13 @@ class Step1Extraction:
         for i in range(len(pages)):
             if cancel_check and cancel_check():
                 break
+            # Repair run: a page that already has text is kept as it is.
+            existing = self._existing_page_text(i + 1) if repair_missing else ""
+            if existing:
+                results[i] = {"text": existing, "cost": 0.0, "source": "existing"}
+                continue
             cached_text = self.cache.get(pdf_path, i+1, pdf_hash)
-            if cached_text:
+            if has_text(cached_text):
                 results[i] = {"text": cached_text, "cost": 0.0, "source": "cache"}
             else:
                 pending_pages.append((i, pages[i]))
@@ -133,20 +214,39 @@ class Step1Extraction:
         def process_page(idx, img):
             if cancel_check and cancel_check():
                 return idx, None, 0.0, {}, "stopped"
+            ink = page_ink_ratio(img)
+            if ink < BLANK_INK_RATIO:
+                print(f"  Page {idx+1} is blank: no OCR call needed.")
+                return idx, BLANK_PAGE_MARKER, 0.0, {}, "blank"
             prompt = self._build_vision_prompt(guidance)
             primary_model, fallback_model = get_model_pair("step1_ocr")
             max_tokens = int(run_env.getenv("STEP1_MAX_TOKENS", "15000"))
 
+            def ocr_call(model):
+                response = client.generate_completion(prompt, [img], model=model, max_tokens=max_tokens)
+                if has_text(response.get("content")):
+                    return response
+                # An empty reply is still billed: keep it in the project cost.
+                empty_usage = response.get("usage") or {}
+                if empty_usage:
+                    self.cost_tracker.log_api_call(
+                        "step1", model,
+                        {"prompt": empty_usage.get("prompt_tokens", 0),
+                         "completion": empty_usage.get("completion_tokens", 0)},
+                        response.get("cost", 0.0) or client.estimate_cost(model, empty_usage),
+                    )
+                raise EmptyOCRReply(f"{model} returned no text (finish_reason={response.get('finish_reason')})")
+
             try:
                 try:
-                    response = client.generate_completion(prompt, [img], model=primary_model, max_tokens=max_tokens)
+                    response = ocr_call(primary_model)
                     used_model = primary_model
                 except OpenRouterFatalError:
                     raise
                 except Exception as e:
                     print(f"  [WARN] Page {idx+1} primary OCR failed: {e}")
                     print(f"  [INFO] Retrying Page {idx+1} with fallback: {fallback_model}")
-                    response = client.generate_completion(prompt, [img], model=fallback_model, max_tokens=max_tokens)
+                    response = ocr_call(fallback_model)
                     used_model = fallback_model
 
                 content = response["content"]
@@ -159,6 +259,12 @@ class Step1Extraction:
                 return idx, content, cost, usage, used_model
             except OpenRouterFatalError:
                 raise   # bad key / no credits → abort Step 1 with a clear error
+            except EmptyOCRReply as e:
+                if ink < LIKELY_BLANK_INK_RATIO:
+                    print(f"  Page {idx+1} treated as blank: almost no ink and no OCR text.")
+                    return idx, BLANK_PAGE_MARKER, 0.0, {}, "blank"
+                print(f"❌ Empty OCR on page {idx+1}: {e}")
+                return idx, None, 0.0, {}, "error"
             except Exception as e:
                 print(f"❌ Error on page {idx+1}: {e}")
                 return idx, None, 0.0, {}, "error"
@@ -173,7 +279,8 @@ class Step1Extraction:
             for future in as_completed(future_to_idx):
                 idx, content, cost, usage, used_model = future.result()
                 if content is not None:
-                    results[idx] = {"text": content, "cost": cost, "source": "api"}
+                    results[idx] = {"text": content, "cost": cost,
+                                    "source": "blank" if used_model == "blank" else "api"}
                     total_cost += cost
                 elif used_model == "error":
                     failed_indices.append(idx)
@@ -206,7 +313,8 @@ class Step1Extraction:
                     break
                 idx, content, cost, usage, used_model = process_page(idx, pages[idx])
                 if content is not None:
-                    results[idx] = {"text": content, "cost": cost, "source": "retry"}
+                    results[idx] = {"text": content, "cost": cost,
+                                    "source": "blank" if used_model == "blank" else "retry"}
                     total_cost += cost
                     if usage:
                         self.cost_tracker.log_api_call(
@@ -221,40 +329,28 @@ class Step1Extraction:
         for i, res in enumerate(results, 1):
             if not res:
                 continue
-            
-            # Save using project context
-            if self.context:
-                save_path = self.context.get_path("step1_extraction", "accepted") / f"page_{i}.txt"
-            else:
-                save_path = Path("output/step1_extraction/accepted") / f"page_{i}.txt"
-                save_path.parent.mkdir(parents=True, exist_ok=True)
-                
+            save_path = self._page_path(i)
             output_dir = str(save_path.parent)
+            if res["source"] == "existing":
+                continue
             with open(save_path, "w", encoding="utf-8") as f:
                 f.write(res["text"])
 
         missing_pages = [i for i, res in enumerate(results, 1) if not res]
-        if missing_pages:
-            error_dir = (self.context.get_path("step1_extraction", "errors")
-                         if self.context else Path("output/step1_extraction/errors"))
-            error_dir.mkdir(parents=True, exist_ok=True)
-            for page_num in missing_pages:
-                (error_dir / f"page_{page_num}.txt").write_text(
-                    "OCR_FAILED: page was not completed after the configured retries.\n",
-                    encoding="utf-8",
-                )
+        blank_pages = [i for i, res in enumerate(results, 1) if res and res["source"] == "blank"]
+        recovered_pages = [i for i, res in enumerate(results, 1)
+                           if res and res["source"] not in ("blank", "existing")]
+        self._record_page_errors(expected_pages, missing_pages,
+                                 "OCR_FAILED: page was not completed after the configured retries.")
+        self._write_page_manifest(expected_pages, missing_pages, blank_pages,
+                                  recovered_pages, repair_missing)
 
-        if self.context:
-            manifest_path = self.context.get_path("step1_extraction") / "_page_manifest.json"
-        else:
-            manifest_path = Path("output/step1_extraction/_page_manifest.json")
-            manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        manifest_path.write_text(json.dumps({
-            "expected_pages": expected_pages,
-            "completed_pages": expected_pages - len(missing_pages),
-            "missing_pages": missing_pages,
-        }, indent=2), encoding="utf-8")
-                
+        # Hold the PDF here: Step 2 must not be paid for on incomplete text.
+        if missing_pages and not (cancel_check and cancel_check()):
+            raise RuntimeError(
+                f"{len(missing_pages)} of {expected_pages} page(s) failed OCR: "
+                f"{self._page_list(missing_pages)}. Retry failed redoes only these pages.")
+
         return {
             "output_dir": output_dir,
             "method": "vision_ocr",
@@ -262,6 +358,7 @@ class Step1Extraction:
             "page_count": expected_pages,
             "completed_pages": expected_pages - len(missing_pages),
             "missing_pages": missing_pages,
+            "blank_pages": blank_pages,
         }
 
     @staticmethod
