@@ -125,8 +125,11 @@ let syncing = false
  * Pull Google Sheets edits back into the step (Steps 2 / 6). `quiet` = the
  * automatic sync on tab return: errors are logged, not shown.
  */
-export async function syncSheets(project: string, step: string, quiet = false): Promise<boolean> {
-  if (syncing) return false
+export async function syncSheets(project: string, step: string, quiet = false, filename = ''): Promise<boolean> {
+  if (syncing) {
+    if (!quiet) toast.info('A Google Sheets sync is already running.')
+    return false
+  }
   syncing = true
   if (!quiet) toast.info('Syncing from Google Sheets…', 2500)
   const run = async (force: boolean) => {
@@ -149,6 +152,11 @@ export async function syncSheets(project: string, step: string, quiet = false): 
       try { await run(true); return true } catch (r: any) { toast.error(r?.message || 'Sync from Sheets failed') }
     } else if (quiet) {
       console.warn('Auto-sync from Sheets failed:', msg)
+    } else if (msg === 'NOT_AUTHORIZED') {
+      toast.error('Connect your Google account to sync this sheet.', 15000, [{
+        label: 'Connect Google',
+        onClick: () => { window.open(googleAuthUrl(project, step, filename), '_blank') },
+      }])
     } else {
       toast.error(msg)
     }

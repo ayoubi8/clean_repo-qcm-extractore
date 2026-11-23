@@ -305,7 +305,7 @@ class Step6Corrections:
         export_mbset_import(corrected_qcms, output_dir, pdf_stem_for_context(self.context))
 
         print(f"📊 Corrections: {corrected_count}/{len(corrected_qcms)} QCMs have an answer.")
-        if auto_mode and corrected_qcms and corrected_count == 0:
+        if auto_mode and choice in ("auto_detect", "2", "3", "4", "6") and corrected_qcms and corrected_count == 0:
             raise RuntimeError(
                 f"No corrections found for any of the {len(corrected_qcms)} QCMs "
                 f"(source: {config.get('source') if config else 'unknown'}). "

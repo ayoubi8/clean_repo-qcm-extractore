@@ -2081,6 +2081,114 @@ def _read_sheets_meta(user_id: str, name: str, folder: str) -> dict:
         return {}
 
 
+def _google_creds_for(user_id: str):
+    """Google tokens are saved under the account's DB id, while an admin's
+    projects live under the "admin" folder: look in both."""
+    ids = []
+    try:
+        ids.append(str(get_db_user_id({"id": user_id})))
+    except Exception as e:
+        print(f"[GOOGLE] DB id lookup failed for {user_id}: {e}")
+    if str(user_id) not in ids:
+        ids.append(str(user_id))
+    for candidate in ids:
+        creds = _get_google_creds(candidate)
+        if creds:
+            return creds
+    return None
+
+
+_SHEET_BASELINE = "_sheets_baseline.json"
+
+
+def _read_sheet_baseline(user_id: str, name: str, folder: str, sheet_id: str) -> dict:
+    """{row key: row} as the Sheet last matched our data; {} when unknown."""
+    local = Path(f"/app/output/{user_id}/{name}/{folder}/{_SHEET_BASELINE}")
+    data = None
+    try:
+        data = json.loads(local.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        try:
+            data = json.loads(read_file(f"{user_id}/{name}/{folder}/{_SHEET_BASELINE}"))
+        except Exception:
+            return {}
+    if not isinstance(data, dict) or data.get("sheet_id") != sheet_id:
+        return {}
+    return data.get("rows") or {}
+
+
+def _write_sheet_baseline(user_id: str, name: str, folder: str, sheet_id: str, rows: list) -> None:
+    from modules.utils.qcm_merge import qcm_key
+    body = json.dumps({"sheet_id": sheet_id,
+                       "rows": {qcm_key(r): r for r in rows if qcm_key(r)}}, ensure_ascii=False)
+    local = Path(f"/app/output/{user_id}/{name}/{folder}/{_SHEET_BASELINE}")
+    try:
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_text(body, encoding="utf-8")
+        write_file(f"{user_id}/{name}/{folder}/{_SHEET_BASELINE}", body)
+    except Exception as e:
+        print(f"[SYNC] baseline save failed: {e}")
+
+
+def _sheet_values_to_rows(values: list) -> list:
+    """Sheet grid -> one dict per non-empty row, using the header row."""
+    if not values:
+        return []
+    header = [(str(c).strip() if c is not None else "") for c in values[0]]
+    out = []
+    for row in values[1:]:
+        if all((v is None or str(v).strip() == "") for v in row):
+            continue
+        out.append({col: (row[i] if i < len(row) and row[i] is not None else "")
+                    for i, col in enumerate(header) if col})
+    return out
+
+
+def _capture_sheet_baseline(creds, user_id: str, name: str, folder: str, sheet_id: str) -> None:
+    """Remember what we put in the Sheet, so a sync can tell the user's edits apart."""
+    try:
+        values = build("sheets", "v4", credentials=creds).spreadsheets().values().get(
+            spreadsheetId=sheet_id, range="A:ZZ").execute().get("values", [])
+        _write_sheet_baseline(user_id, name, folder, sheet_id, _sheet_values_to_rows(values))
+    except Exception as e:
+        print(f"[SHEETS] baseline capture skipped: {e}")
+
+
+def _only_sheet_edits(rows: list, baseline: dict) -> list:
+    """Keep each row's identity + the cells that differ from the baseline.
+    An untouched old cell must never undo a newer run or another sheet's edit."""
+    from modules.utils.qcm_merge import qcm_key
+    out = []
+    for row in rows:
+        base = baseline.get(qcm_key(row))
+        if base is None:
+            out.append(dict(row))
+            continue
+        out.append({k: v for k, v in row.items()
+                    if k in ("uid", "Num", "number") or str(v) != str(base.get(k, ""))})
+    return out
+
+
+def _parse_utc(value):
+    from datetime import timezone
+    text = re.sub(r"\.(\d{1,6})\d*", lambda m: "." + m.group(1).ljust(6, "0"),
+                  str(value or "").replace("Z", "+00:00"))
+    parsed = datetime.fromisoformat(text)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _output_newer_than_sheet(user_id: str, name: str, step_id: str, meta: dict) -> bool:
+    """True when a pipeline run finished after the Sheet was last written."""
+    try:
+        row = _latest_step_result_row(user_id, name, str(step_id))
+        if not row or not row.get("created_at"):
+            return False
+        return _parse_utc(row["created_at"]) > _parse_utc(meta.get("pushed_at") or meta.get("opened_at"))
+    except Exception as e:
+        print(f"[SHEETS] freshness check failed, keeping the Sheet as it is: {e}")
+        return False
+
+
 def _warm_local_from_storage(root: Path, rel: str, storage_path: str) -> bool:
     """Ensure one chain/meta file exists locally, pulling it from Supabase
     Storage on a miss (CLOUD_SYNC F7 — restart-safe sync)."""
@@ -4253,6 +4361,29 @@ def open_in_google_sheets(name: str, step_id: str, body: dict, user: dict = Depe
     if reuse_meta and reuse_meta.get("sheet_id") and \
             _same_workbook(reuse_meta.get("filename", ""), filename):
         try:
+            _sheet_id = reuse_meta["sheet_id"]
+            _existing_url = f"https://docs.google.com/spreadsheets/d/{_sheet_id}/edit"
+            _sheets_service = build("sheets", "v4", credentials=creds)
+            # Deleted, or owned by another Google account: create a new Sheet below.
+            _sheets_service.spreadsheets().get(spreadsheetId=_sheet_id, fields="spreadsheetId").execute()
+
+            # No newer run: the Sheet is current and may hold unsynced edits.
+            if not _output_newer_than_sheet(user["id"], name, step_id, reuse_meta):
+                print(f"[SHEETS] Opening existing sheet unchanged: {_sheet_id}")
+                return {"url": _existing_url, "id": _sheet_id, "reused": True}
+
+            # A newer run exists: save the user's edits first, then refresh the grid.
+            if _read_sheet_baseline(user["id"], name, folder, _sheet_id):
+                try:
+                    _pulled = _sync_step_from_sheets_svc(name, str(step_id), user["id"])
+                    _fresh = Path(f"/app/output/{user['id']}/{name}/"
+                                  f"{_SYNC_STEP_CONFIG[str(step_id)]['json_folder']}/{_pulled['xlsx_file']}")
+                    if _fresh.exists():
+                        file_path = _fresh
+                except HTTPException as _he:
+                    print(f"[SHEETS] Could not save edits first ({_he.status_code}): Sheet left unchanged.")
+                    return {"url": _existing_url, "id": _sheet_id, "reused": True}
+
             from openpyxl import load_workbook as _load_wb
             _wb = _load_wb(str(file_path), data_only=True)
             _rows_out = []
@@ -4262,20 +4393,21 @@ def open_in_google_sheets(name: str, step_id: str, body: dict, user: dict = Depe
                     (v.isoformat() if hasattr(v, "isoformat") else v)
                     for v in _cells
                 ])
-            _sheets_service = build("sheets", "v4", credentials=creds)
             _sheets_service.spreadsheets().values().clear(
-                spreadsheetId=reuse_meta["sheet_id"], range="A:Z").execute()
+                spreadsheetId=_sheet_id, range="A:ZZ").execute()
             if _rows_out:
                 _sheets_service.spreadsheets().values().update(
-                    spreadsheetId=reuse_meta["sheet_id"], range="A1",
+                    spreadsheetId=_sheet_id, range="A1",
                     valueInputOption="RAW",
                     body={"values": _rows_out}).execute()
+            _capture_sheet_baseline(creds, user["id"], name, folder, _sheet_id)
             try:
                 _meta_path_local = Path(
                     f"/app/output/{user['id']}/{name}/{folder}/_sheets_meta.json")
                 _meta_path_local.parent.mkdir(parents=True, exist_ok=True)
-                reuse_meta["filename"] = filename
+                reuse_meta["filename"] = file_path.name if file_path.name.endswith(".xlsx") else filename
                 reuse_meta["opened_at"] = datetime.now().isoformat()
+                reuse_meta["pushed_at"] = datetime.utcnow().isoformat() + "+00:00"
                 _meta_path_local.write_text(json.dumps(reuse_meta), encoding="utf-8")
                 try:
                     write_file(
@@ -4315,6 +4447,7 @@ def open_in_google_sheets(name: str, step_id: str, body: dict, user: dict = Depe
                     "sheet_id": sheet_id,
                     "filename": filename,
                     "opened_at": datetime.now().isoformat(),
+                    "pushed_at": datetime.utcnow().isoformat() + "+00:00",
                 }), encoding="utf-8")
                 try:
                     write_file(f"{user['id']}/{name}/{folder}/_sheets_meta.json", _sheets_meta_path.read_text())
@@ -4322,6 +4455,7 @@ def open_in_google_sheets(name: str, step_id: str, body: dict, user: dict = Depe
                     print(f"[SHEETS] meta upload skipped: {_e}")
             except Exception as _e:
                 print(f"[SHEETS] could not persist sheet meta: {_e}")
+            _capture_sheet_baseline(creds, user["id"], name, folder, sheet_id)
 
         return {"url": sheets_url, "id": sheet_id}
     except Exception as e:
@@ -4415,7 +4549,7 @@ def _sync_step_from_sheets_svc(name: str, step_id: str, user_id: str,
     sheet_id = meta["sheet_id"]
 
     # 2. Load Google credentials
-    creds = _get_google_creds(user_id)
+    creds = _google_creds_for(user_id)
     if not creds:
         raise HTTPException(status_code=401, detail="NOT_AUTHORIZED")
 
@@ -4423,13 +4557,20 @@ def _sync_step_from_sheets_svc(name: str, step_id: str, user_id: str,
     try:
         sheets_service = build("sheets", "v4", credentials=creds)
         result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=sheet_id, range="A:Z"
+            spreadsheetId=sheet_id, range="A:ZZ"
         ).execute()
         rows = result.get("values", [])
     except Exception as e:
         import traceback
         traceback.print_exc()
         print(f"[SYNC{step_id}] Sheets API failed: {e}")
+        status = getattr(getattr(e, "resp", None), "status", None)
+        if "insufficient" in str(e).lower() or "invalid_grant" in str(e).lower():
+            raise HTTPException(status_code=401, detail="NOT_AUTHORIZED")
+        if str(status) in ("403", "404") and "has not been used" not in str(e):
+            raise HTTPException(status_code=409, detail=(
+                "This Google Sheet was deleted or belongs to another Google account. "
+                "Open the file in Google Sheets again, then sync."))
         raise HTTPException(status_code=502, detail=f"Google Sheets read failed: {str(e)}")
 
     if not rows:
@@ -4460,8 +4601,16 @@ def _sync_step_from_sheets_svc(name: str, step_id: str, user_id: str,
     #     matched by ONE key. Legacy sheets without a uid column are bridged
     #     via the Num→uid map built from the current merged_qcms.json.
     project_root = Path(f"/app/output/{user_id}/{name}")
+    # After a restart these exist only in Storage. Without the id bridge every
+    # stored row would look deleted.
+    for _rel in ("step5_json/merged_qcms.json", "project.json"):
+        _warm_local_from_storage(project_root, _rel, f"{user_id}/{name}/{_rel}")
     uid_by_num = build_uid_bridge(project_root)
+    sheet_snapshot = [dict(r) for r in new_qcms]
+    baseline = _read_sheet_baseline(user_id, name, meta_folder, sheet_id)
+    sheet_edits = _only_sheet_edits(new_qcms, baseline)
     attach_bridge_uids(new_qcms, uid_by_num)
+    attach_bridge_uids(sheet_edits, uid_by_num)
 
     # 5. Load the old canonical JSON (local FS first, Storage fallback — the
     #    local tree is wiped after a container restart; CLOUD_SYNC F7).
@@ -4486,13 +4635,23 @@ def _sync_step_from_sheets_svc(name: str, step_id: str, user_id: str,
     #     exist. A stored row whose identity is absent from the sheet is deleted
     #     by the user (CLOUD_SYNC F1/Q2: deletion wins, no Correct-protection).
     sheet_keys = expand_keys_with_bridge(
-        {_qcm_key(r) for r in new_qcms if _qcm_key(r)}, uid_by_num)
-    deleted_qcms = [q for q in old_qcms
-                    if isinstance(q, dict) and _qcm_key(q) not in sheet_keys]
+        {_qcm_key(r) for r in new_qcms if _qcm_key(r)}
+        | {str(r["Num"]) for r in new_qcms if str(r.get("Num", "")).strip()}, uid_by_num)
+    # A row the Sheet never contained (added by a newer run) was not deleted.
+    known_keys = expand_keys_with_bridge(set(baseline), uid_by_num)
+
+    def _was_deleted(q) -> bool:
+        if not isinstance(q, dict):
+            return False
+        ids = {_qcm_key(q), str(q.get("Num", ""))} - {""}
+        return not (ids & sheet_keys) and (not baseline or bool(ids & known_keys))
+
+    deleted_qcms = [q for q in old_qcms if _was_deleted(q)]
     deleted_count = len(deleted_qcms)
     old_count = len(old_qcms)
     # Deletion key-set, re-bridged so both uid-keyed and Num-keyed files prune.
-    deleted_keys = {_qcm_key(d) for d in deleted_qcms if _qcm_key(d)}
+    deleted_keys = {_qcm_key(d) for d in deleted_qcms if _qcm_key(d)} \
+        | {str(d["Num"]) for d in deleted_qcms if str(d.get("Num", "")).strip()}
     prune_idset = expand_keys_with_bridge(deleted_keys, uid_by_num)
     if old_count and deleted_count and (deleted_count / old_count) > 0.30 and not force:
         raise HTTPException(
@@ -4510,16 +4669,31 @@ def _sync_step_from_sheets_svc(name: str, step_id: str, user_id: str,
     #      fields INTO it (Text→text, A..E→propositions) and drop deleted rows
     #      so uid/page/propositions are never destroyed (CLOUD_SYNC F2/F3).
     if deleted_count:
-        old_qcms = [q for q in old_qcms
-                    if not (isinstance(q, dict) and _qcm_key(q) in sheet_keys)]
+        _deleted_ids = {id(q) for q in deleted_qcms}
+        old_qcms = [q for q in old_qcms if id(q) not in _deleted_ids]
 
     if step_id == "6":
-        old_map = {_qcm_key(q): dict(q) for q in old_qcms if isinstance(q, dict)}
+        old_map = {}
+        for q in old_qcms:
+            if isinstance(q, dict):
+                old_map.setdefault(_qcm_key(q), q)
+                if str(q.get("Num", "")).strip():
+                    old_map.setdefault(str(q["Num"]), q)
         new_qcms_final = []
-        for row in new_qcms:
-            base = dict(old_map.get(_qcm_key(row), {}))
-            merge_qcm_fields(base, row)
+        matched = set()
+        for row, edit in zip(new_qcms, sheet_edits):
+            source = old_map.get(_qcm_key(row)) or old_map.get(str(row.get("Num", "")))
+            if source is None:
+                base = {}
+                merge_qcm_fields(base, row)
+            else:
+                matched.add(id(source))
+                base = dict(source)
+                merge_qcm_fields(base, edit)
             new_qcms_final.append(base)
+        # Rows added by a newer run, not in this Sheet yet, stay.
+        new_qcms_final.extend(dict(q) for q in old_qcms
+                              if isinstance(q, dict) and id(q) not in matched)
     else:
         from modules.utils.qcm_merge import translate_row_for_raw
         canonical: list = [dict(q) for q in old_qcms if isinstance(q, dict)]
@@ -4528,7 +4702,7 @@ def _sync_step_from_sheets_svc(name: str, step_id: str, user_id: str,
             k = _qcm_key(q)
             if k:
                 canonical_map.setdefault(k, q)
-        for row in new_qcms:
+        for row, edit in zip(new_qcms, sheet_edits):
             k = _qcm_key(row)
             if not k:
                 continue
@@ -4547,7 +4721,7 @@ def _sync_step_from_sheets_svc(name: str, step_id: str, user_id: str,
                 canonical.append(target)
                 canonical_map[k] = target
             else:
-                merge_qcm_fields(target, translate_row_for_raw(row))
+                merge_qcm_fields(target, translate_row_for_raw(edit))
         new_qcms_final = canonical
     new_qcms = new_qcms_final
 
@@ -4556,14 +4730,15 @@ def _sync_step_from_sheets_svc(name: str, step_id: str, user_id: str,
     newly_corrected = 0
     corrected_count = 0
     if step_id == "6":
+        from modules.utils.qcm_merge import has_answer
         old_correct_map = {
             _qcm_key(q): str(q.get("Correct", "")).strip()
             for q in old_qcms
-            if str(q.get("Correct", "")).strip()
+            if has_answer(q.get("Correct"))
         }
         for q in new_qcms:
             correct_val = str(q.get("Correct", "")).strip()
-            if correct_val:
+            if has_answer(q.get("Correct")):
                 corrected_count += 1
                 if correct_val != old_correct_map.get(_qcm_key(q), ""):
                     newly_corrected += 1
@@ -4606,8 +4781,9 @@ def _sync_step_from_sheets_svc(name: str, step_id: str, user_id: str,
             ).strip("._") or "source"
     except (OSError, json.JSONDecodeError, TypeError):
         pass
+    from modules.utils.qcm_merge import has_answer as _has_answer
     count = len(new_qcms) if xlsx_kind == "qcms" else sum(
-        1 for qcm in new_qcms if str(qcm.get("Correct", "")).strip()
+        1 for qcm in new_qcms if _has_answer(qcm.get("Correct"))
     )
     xlsx_path = local_json_dir / result_xlsx_name(xlsx_kind, count, pdf_stem)
     try:
@@ -4681,7 +4857,7 @@ def _sync_step_from_sheets_svc(name: str, step_id: str, user_id: str,
             except Exception as e:
                 print(f"[SYNC{step_id}] sibling JSON unreadable: {e}")
 
-        if sib_qcms:
+        if not sib_qcms:
             # Restart-safety: warm the sibling JSON from Storage when the local
             # copy is missing (CLOUD_SYNC F7) so edits/deletions always land on
             # the latest Storage version, never an empty local tree.
@@ -4786,6 +4962,9 @@ def _sync_step_from_sheets_svc(name: str, step_id: str, user_id: str,
           + (f", {deleted_count} row(s) deleted" if deleted_count else "")
           + (f", propagated {propagated} field(s) to step {sibling_id}." if propagated else ".")
           + (f", build-chain files updated: {chain_files}." if chain_propagated else ""))
+
+    # The Sheet now matches our data: the next sync only sees newer edits.
+    _write_sheet_baseline(user_id, name, meta_folder, sheet_id, sheet_snapshot)
 
     # PHASE 5 (step_cache): the sync rewrote this step's (and possibly its
     # sibling's) canonical outputs — a cached /output file list is stale now.

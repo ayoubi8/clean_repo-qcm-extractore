@@ -116,7 +116,7 @@ export function ResultFileRow({ project, step, file, runId, canDelete = true, on
               spin={busy === 'sync'}
               title="Pull the latest edits back from Google Sheets"
               disabled={busy === 'sync'}
-              onClick={() => { void act('sync', () => syncSheets(project, step)) }}
+              onClick={() => { void act('sync', () => syncSheets(project, step, false, file.name)) }}
             />
           )}
           {canDelete && !runId && (
